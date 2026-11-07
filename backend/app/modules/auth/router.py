@@ -47,6 +47,7 @@ from app.modules.auth.service import (
     disable_mfa,
     enroll_mfa,
     logout_all_sessions,
+    logout_session,
     refresh_session_tokens,
     register_user,
     switch_organization,
@@ -195,10 +196,14 @@ async def logout(
     settings: Settings = Depends(get_app_settings),
     security_context: SecurityContext = Depends(require_authenticated_user),
 ) -> dict[str, str]:
-    """Revoke the calling session and clear authentication cookies."""
-    # Find active session ID from raw token
-    # Security context contains user_id
-    # We delete cached sessions for caller and clear cookies
+    """Revoke the calling session in PostgreSQL and Redis, and clear authentication cookies."""
+    if security_context.session_id:
+        await logout_session(
+            db=db,
+            redis=redis,
+            user_id=security_context.user_id,
+            session_id=security_context.session_id,
+        )
     clear_auth_cookies(response=response, settings=settings)
     return {"message": "Logged out successfully"}
 

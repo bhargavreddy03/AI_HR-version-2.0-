@@ -104,7 +104,7 @@ def test_mfa_enrollment_and_verification_flow(
     enroll_data = res_enroll.json()
     assert "secret" in enroll_data
     assert "otpauth_uri" in enroll_data
-    assert len(enroll_data["backup_codes"]) == 8
+    assert len(enroll_data["backup_codes"]) == 10
 
     # The user record now has encrypted mfa_secret
     assert user.mfa_secret is not None
@@ -129,7 +129,7 @@ def test_mfa_login_challenge_and_verification(
 
     user_id = uuid4()
     totp_secret = generate_totp_secret()
-    encrypted_secret = encrypt_mfa_secret(totp_secret, settings.JWT_SECRET_KEY)
+    encrypted_secret = encrypt_mfa_secret(totp_secret, settings.MFA_ENCRYPTION_KEY)
     backup_codes = generate_backup_codes(4)
     hashed_backups = [hash_backup_code(b) for b in backup_codes]
 
@@ -184,7 +184,7 @@ def test_mfa_replay_protection(
 
     user_id = uuid4()
     totp_secret = generate_totp_secret()
-    encrypted_secret = encrypt_mfa_secret(totp_secret, settings.JWT_SECRET_KEY)
+    encrypted_secret = encrypt_mfa_secret(totp_secret, settings.MFA_ENCRYPTION_KEY)
 
     user = User(
         id=user_id,
@@ -195,6 +195,7 @@ def test_mfa_replay_protection(
         is_active=True,
         mfa_enabled=True,
         mfa_secret=encrypted_secret,
+        token_version=1,
     )
     mock_res = MagicMock()
     mock_res.scalar_one_or_none.return_value = user
@@ -234,3 +235,96 @@ def test_mfa_replay_protection(
     )
     assert res2.status_code == status.HTTP_401_UNAUTHORIZED
     assert res2.json()["code"] == "MFA_CODE_REPLAYED"
+
+
+def test_backup_code_single_use_and_disable_reuse(
+    mfa_client: tuple[TestClient, AsyncMock, FakeRedis, Settings],
+) -> None:
+    """Verify backup codes are single-use during login verification and cannot be reused in disable-MFA."""
+    client, mock_db, fake_redis, settings = mfa_client
+
+    user_id = uuid4()
+    totp_secret = generate_totp_secret()
+    encrypted_secret = encrypt_mfa_secret(totp_secret, settings.MFA_ENCRYPTION_KEY)
+    backup_codes = generate_backup_codes(10)
+    assert len(backup_codes) == 10
+    hashed_backups = [hash_backup_code(b) for b in backup_codes]
+
+    user = User(
+        id=user_id,
+        email="backup@example.com",
+        password_hash=hash_password("Password123!", settings=settings),
+        first_name="Backup",
+        last_name="Tester",
+        is_active=True,
+        mfa_enabled=True,
+        mfa_secret=encrypted_secret,
+        mfa_backup_codes=hashed_backups,
+        token_version=1,
+    )
+    mock_res = MagicMock()
+    mock_res.scalar_one_or_none.return_value = user
+    mock_res.scalars.return_value.first.return_value = None
+    mock_db.execute.return_value = mock_res
+
+    # 1. First redemption during login challenge: succeeds and consumes code
+    code_to_use = backup_codes[0]
+    challenge_token_1 = "challenge_token_backup_test_1"
+    fake_redis.store[f"mfa_challenge:{challenge_token_1}"] = json.dumps(
+        {"user_id": str(user_id), "organization_slug": None, "token_version": 1}
+    )
+
+    res1 = client.post(
+        "/api/v1/auth/mfa/verify",
+        json={"mfa_token": challenge_token_1, "code": code_to_use},
+    )
+    assert res1.status_code == status.HTTP_200_OK
+    # Code 0 should be consumed; user now has 9 backup codes
+    assert len(user.mfa_backup_codes) == 9
+
+    # 2. Repeated redemption attempt with the same code: fails
+    challenge_token_2 = "challenge_token_backup_test_2"
+    fake_redis.store[f"mfa_challenge:{challenge_token_2}"] = json.dumps(
+        {"user_id": str(user_id), "organization_slug": None, "token_version": 1}
+    )
+
+    res2 = client.post(
+        "/api/v1/auth/mfa/verify",
+        json={"mfa_token": challenge_token_2, "code": code_to_use},
+    )
+    assert res2.status_code == status.HTTP_401_UNAUTHORIZED
+    assert res2.json()["code"] == "MFA_INVALID_CODE"
+
+    # 3. Attempting to reuse the consumed code in disable-MFA flow fails
+    session_id = uuid4()
+    token = create_access_token(
+        user_id=user_id,
+        session_id=session_id,
+        tenant_id=None,
+        role="candidate",
+        permissions=[],
+        token_version=1,
+        role_version=1,
+        is_super_admin=False,
+        settings=settings,
+    )
+    client.cookies.set(COOKIE_ACCESS, token)
+    client.cookies.set(COOKIE_CSRF, "csrf_disable")
+    fake_redis.store[f"session:{user_id}:{session_id}"] = json.dumps(
+        {
+            "token_version": 1,
+            "role_version": 1,
+            "last_db_verified_at": datetime.now(UTC).timestamp(),
+        }
+    )
+    fake_redis.store[f"user_current_token_version:{user_id}"] = "1"
+
+    res_disable_reuse = client.post(
+        "/api/v1/auth/mfa/disable",
+        json={"password": "Password123!", "code": code_to_use},
+        headers={"X-CSRF-Token": "csrf_disable"},
+    )
+    assert res_disable_reuse.status_code == status.HTTP_401_UNAUTHORIZED
+    assert res_disable_reuse.json()["code"] == "MFA_INVALID_CODE"
+    # MFA remains enabled because code was invalid
+    assert user.mfa_enabled is True

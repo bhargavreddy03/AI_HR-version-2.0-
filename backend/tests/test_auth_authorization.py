@@ -287,3 +287,140 @@ def test_switch_organization_protocol(
     assert data["user"]["active_tenant_id"] == str(target_tenant_id)
     assert data["user"]["role"] == "org_admin"
     assert COOKIE_ACCESS in res.cookies
+
+
+def test_missing_redis_version_fence_strictly_rejected(
+    authz_app: tuple[TestClient, AsyncMock, FakeRedis, Settings],
+) -> None:
+    """Verify missing required version fence is NOT accepted as a valid match, failing closed with 401."""
+    client, _, fake_redis, settings = authz_app
+
+    user_id = uuid4()
+    session_id = uuid4()
+
+    token = create_access_token(
+        user_id=user_id,
+        session_id=session_id,
+        tenant_id=None,
+        role="candidate",
+        permissions=[],
+        token_version=1,
+        role_version=1,
+        is_super_admin=False,
+        settings=settings,
+    )
+
+    # Session key exists in Redis
+    fake_redis.store[f"session:{user_id}:{session_id}"] = (
+        f'{{"token_version": 1, "role_version": 1, "last_db_verified_at": {datetime.now(UTC).timestamp()}}}'
+    )
+    # Required fence user_current_token_version is deliberately ABSENT in Redis!
+
+    client.cookies.set(COOKIE_ACCESS, token)
+    res = client.get("/test-protected/tenant-only")
+    assert res.status_code == status.HTTP_401_UNAUTHORIZED
+    assert res.json()["code"] == "TOKEN_VERSION_STALE"
+
+
+@pytest.mark.asyncio
+async def test_monotonic_version_fence_cannot_lower_under_race() -> None:
+    """Verify that monotonic Redis fence update strategy rejects lowering version under races."""
+    from app.modules.auth.redis_session import (
+        get_user_token_version_fence,
+        set_version_fences_if_absent,
+    )
+
+    fake_redis = FakeRedis()
+    user_id = uuid4()
+
+    # Initial login with version 2
+    await set_version_fences_if_absent(fake_redis, user_id=user_id, token_version=2)
+    fence = await get_user_token_version_fence(fake_redis, user_id)
+    assert fence == 2
+
+    # A concurrent or stale operation with version 1 attempts to set/lower the fence
+    await set_version_fences_if_absent(fake_redis, user_id=user_id, token_version=1)
+    fence_after_stale = await get_user_token_version_fence(fake_redis, user_id)
+    # MUST remain at 2 (cannot lower)
+    assert fence_after_stale == 2
+
+    # A valid newer operation with version 3 advances the fence
+    await set_version_fences_if_absent(fake_redis, user_id=user_id, token_version=3)
+    fence_after_advance = await get_user_token_version_fence(fake_redis, user_id)
+    assert fence_after_advance == 3
+
+
+def test_switch_organization_rejects_cross_tenant_role(
+    authz_app: tuple[TestClient, AsyncMock, FakeRedis, Settings],
+) -> None:
+    """Verify tenant-role integrity: membership referencing another tenant's custom role is rejected."""
+    client, mock_db, fake_redis, settings = authz_app
+
+    user_id = uuid4()
+    session_id = uuid4()
+    target_tenant_id = uuid4()
+    foreign_tenant_id = uuid4()
+
+    token = create_access_token(
+        user_id=user_id,
+        session_id=session_id,
+        tenant_id=None,
+        role="candidate",
+        permissions=[],
+        token_version=1,
+        role_version=1,
+        is_super_admin=False,
+        settings=settings,
+    )
+    client.cookies.set(COOKIE_ACCESS, token)
+    client.cookies.set(COOKIE_CSRF, "csrf_cross")
+
+    fake_redis.store[f"session:{user_id}:{session_id}"] = (
+        f'{{"token_version": 1, "role_version": 1, "last_db_verified_at": {datetime.now(UTC).timestamp()}}}'
+    )
+    fake_redis.store[f"user_current_token_version:{user_id}"] = "1"
+
+    # Mock foreign role belonging to another tenant
+    foreign_role = Role(
+        id=uuid4(),
+        name="custom_recruiter",
+        tenant_id=foreign_tenant_id,  # Foreign tenant!
+        is_system=False,
+    )
+    membership = OrganizationMembership(
+        id=uuid4(),
+        tenant_id=target_tenant_id,
+        user_id=user_id,
+        role_id=foreign_role.id,
+        is_active=True,
+        role_version=1,
+    )
+    membership.role = foreign_role
+
+    target_org = Organization(
+        id=target_tenant_id,
+        name="Target Corp",
+        slug="target-corp",
+        status="active",
+    )
+
+    def mock_execute(stmt: Any, *args: Any, **kwargs: Any) -> MagicMock:
+        stmt_str = str(stmt)
+        res = MagicMock()
+        if "organizations" in stmt_str:
+            res.scalar_one_or_none.return_value = target_org
+            return res
+        if "organization_memberships" in stmt_str:
+            res.scalar_one_or_none.return_value = membership
+            return res
+        return res
+
+    mock_db.execute = AsyncMock(side_effect=mock_execute)
+
+    res = client.post(
+        "/api/v1/auth/switch-organization",
+        json={"target_tenant_id": str(target_tenant_id)},
+        headers={"X-CSRF-Token": "csrf_cross"},
+    )
+    assert res.status_code == status.HTTP_403_FORBIDDEN
+    assert res.json()["code"] == "ROLE_TENANT_INTEGRITY_VIOLATION"

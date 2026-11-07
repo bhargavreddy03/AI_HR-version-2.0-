@@ -57,6 +57,23 @@ else
 end
 """
 
+SET_VERSION_FENCE_MONOTONIC_LUA = """
+local current_ver = redis.call('GET', KEYS[1])
+local proposed_ver = tonumber(ARGV[1])
+
+if not current_ver then
+    redis.call('SET', KEYS[1], proposed_ver)
+    return 1
+else
+    local curr_num = tonumber(current_ver)
+    if proposed_ver > curr_num then
+        redis.call('SET', KEYS[1], proposed_ver)
+        return 1
+    end
+    return 0
+end
+"""
+
 
 def get_session_key(user_id: UUID | str, session_id: UUID | str) -> str:
     """Return formatted Redis key for session metadata."""
@@ -198,12 +215,22 @@ async def set_version_fences_if_absent(
     tenant_id: UUID | str | None = None,
     role_version: int = 1,
 ) -> None:
-    """Initialize version fences on login if not yet established."""
+    """Monotonically initialize or advance version fences on login without lowering existing fences."""
     user_key = get_user_token_version_key(user_id)
-    await redis.set(user_key, token_version)
+    await redis.eval(  # type: ignore[no-untyped-call]
+        SET_VERSION_FENCE_MONOTONIC_LUA,
+        1,
+        user_key,
+        token_version,
+    )
     if tenant_id:
         role_key = get_org_role_version_key(tenant_id, user_id)
-        await redis.set(role_key, role_version)
+        await redis.eval(  # type: ignore[no-untyped-call]
+            SET_VERSION_FENCE_MONOTONIC_LUA,
+            1,
+            role_key,
+            role_version,
+        )
 
 
 # ------------------------------------------------------------------------------

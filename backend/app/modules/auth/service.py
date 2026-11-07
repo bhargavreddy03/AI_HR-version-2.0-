@@ -7,7 +7,7 @@ from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -334,7 +334,7 @@ async def create_authenticated_session(
     await set_version_fences_if_absent(
         redis,
         user_id=user.id,
-        token_version=user.token_version,
+        token_version=user.token_version or 1,
         tenant_id=tenant_id,
         role_version=role_version,
     )
@@ -393,30 +393,29 @@ async def verify_mfa_challenge(
     challenge_data = json.loads(challenge_raw)
     user_id = UUID(challenge_data["user_id"])
 
-    stmt = select(User).where(User.id == user_id)
+    stmt = select(User).where(User.id == user_id).with_for_update()
     user = (await db.execute(stmt)).scalar_one_or_none()
     if not user or not user.is_active or not user.mfa_secret:
         raise AuthenticationException("Invalid authentication state", error_code="INVALID_STATE")
 
     # Replay check for code
     clean_code = code.strip().replace("-", "").upper()
-    is_fresh = await check_and_record_totp_code(redis, user.id, clean_code)
-    if not is_fresh:
-        raise AuthenticationException(
-            "MFA code has already been used", error_code="MFA_CODE_REPLAYED"
-        )
-
-    # Decrypt TOTP secret and verify
-    totp_secret = decrypt_mfa_secret(user.mfa_secret, settings.JWT_SECRET_KEY)
+    totp_secret = decrypt_mfa_secret(user.mfa_secret, settings.MFA_ENCRYPTION_KEY)
     totp_valid = verify_totp(totp_secret, clean_code)
 
-    if not totp_valid:
+    if totp_valid:
+        is_fresh = await check_and_record_totp_code(redis, user.id, clean_code)
+        if not is_fresh:
+            raise AuthenticationException(
+                "MFA code has already been used", error_code="MFA_CODE_REPLAYED"
+            )
+    else:
         # Check backup codes if available
         matched_idx = -1
         if user.mfa_backup_codes:
             matched_idx = verify_backup_code(clean_code, user.mfa_backup_codes)
         if matched_idx >= 0:
-            # Consume single-use backup code
+            # Concurrency-safe single-use backup code consumption
             codes = list(user.mfa_backup_codes or [])
             codes.pop(matched_idx)
             user.mfa_backup_codes = codes
@@ -455,7 +454,13 @@ async def refresh_session_tokens(
     stmt = (
         select(UserSession)
         .options(selectinload(UserSession.user))
-        .where(UserSession.refresh_token_hash == token_hash)
+        .where(
+            or_(
+                UserSession.refresh_token_hash == token_hash,
+                UserSession.previous_refresh_token_hash == token_hash,
+            )
+        )
+        .with_for_update()
     )
     session_rec = (await db.execute(stmt)).scalar_one_or_none()
 
@@ -465,10 +470,25 @@ async def refresh_session_tokens(
             error_code="SESSION_INVALID",
         )
 
-    # Reuse Detection: If an already revoked session is presented, invalidate immediately
+    # Token Family Reuse Detection: Check if a previously rotated token was presented
+    if session_rec.previous_refresh_token_hash == token_hash:
+        logger.warning(
+            "Detected rotated refresh token reuse for session %s, user %s. Revoking session family.",
+            session_rec.id,
+            session_rec.user_id,
+        )
+        session_rec.is_revoked = True
+        await db.commit()
+        await delete_session(redis, session_rec.user_id, session_rec.id)
+        raise AuthenticationException(
+            "Rotated refresh token reuse detected; session revoked",
+            error_code="TOKEN_REUSE_DETECTED",
+        )
+
+    # If an already revoked session is presented, invalidate immediately
     if session_rec.is_revoked:
         logger.warning(
-            "Detected refresh token reuse for session %s, user %s",
+            "Attempted use of revoked session %s, user %s",
             session_rec.id,
             session_rec.user_id,
         )
@@ -534,6 +554,7 @@ async def refresh_session_tokens(
     # Rotate refresh token (Generate fresh cryptographic string and update hash)
     new_refresh_token = generate_secure_token(48)
     new_csrf_token = generate_csrf_token()
+    session_rec.previous_refresh_token_hash = session_rec.refresh_token_hash
     session_rec.refresh_token_hash = hash_token(new_refresh_token)
     session_rec.expires_at = now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
     session_rec.ip_address = client_ip[:45] if client_ip else session_rec.ip_address
@@ -597,10 +618,14 @@ async def logout_session(
     user_id: UUID,
     session_id: UUID,
 ) -> None:
-    """Revoke a single active user session."""
-    stmt = select(UserSession).where(UserSession.id == session_id, UserSession.user_id == user_id)
+    """Revoke a single active user session in PostgreSQL and Redis."""
+    stmt = (
+        select(UserSession)
+        .where(UserSession.id == session_id, UserSession.user_id == user_id)
+        .with_for_update()
+    )
     session_rec = (await db.execute(stmt)).scalar_one_or_none()
-    if session_rec:
+    if session_rec and not session_rec.is_revoked:
         session_rec.is_revoked = True
         await db.commit()
 
@@ -617,7 +642,7 @@ async def logout_all_sessions(
     Increments token_version, writes outbox row, sets force_authoritative_check = TRUE,
     and atomically evicts all user sessions from Redis via Lua.
     """
-    stmt = select(User).where(User.id == user_id)
+    stmt = select(User).where(User.id == user_id).with_for_update()
     user = (await db.execute(stmt)).scalar_one_or_none()
     if not user:
         return
@@ -677,6 +702,13 @@ async def switch_organization(
         raise AuthorizationException(
             "You do not possess an active membership in the target organization",
             error_code="MEMBERSHIP_REQUIRED",
+        )
+
+    # Validate tenant-role integrity (must be system role or match active tenant)
+    if not membership.role.is_system and membership.role.tenant_id != target_tenant_id:
+        raise AuthorizationException(
+            "Tenant role integrity violation: role does not belong to target organization",
+            error_code="ROLE_TENANT_INTEGRITY_VIOLATION",
         )
 
     # 3. Load user and role permissions
@@ -751,17 +783,17 @@ async def enroll_mfa(
     settings: Settings,
 ) -> dict[str, Any]:
     """Generate TOTP secret, backup codes, and return enrollment payload."""
-    stmt = select(User).where(User.id == user_id)
+    stmt = select(User).where(User.id == user_id).with_for_update()
     user = (await db.execute(stmt)).scalar_one_or_none()
     if not user:
         raise EntityNotFoundException("User not found")
 
     secret_base32 = generate_totp_secret()
-    backup_codes = generate_backup_codes(count=8)
+    backup_codes = generate_backup_codes(count=10)
     hashed_backup_codes = [hash_backup_code(c) for c in backup_codes]
 
-    # Encrypt secret with AES-256-GCM before saving to PostgreSQL
-    encrypted_secret = encrypt_mfa_secret(secret_base32, settings.JWT_SECRET_KEY)
+    # Encrypt secret with AES-256-GCM before saving to PostgreSQL using dedicated MFA key
+    encrypted_secret = encrypt_mfa_secret(secret_base32, settings.MFA_ENCRYPTION_KEY)
     user.mfa_secret = encrypted_secret
     user.mfa_backup_codes = hashed_backup_codes
     user.mfa_enabled = False  # Not enabled until verified
@@ -782,12 +814,12 @@ async def verify_mfa_enrollment(
     settings: Settings,
 ) -> bool:
     """Verify code and formally activate MFA for account."""
-    stmt = select(User).where(User.id == user_id)
+    stmt = select(User).where(User.id == user_id).with_for_update()
     user = (await db.execute(stmt)).scalar_one_or_none()
     if not user or not user.mfa_secret:
         raise ValidationException("MFA enrollment has not been initiated")
 
-    totp_secret = decrypt_mfa_secret(user.mfa_secret, settings.JWT_SECRET_KEY)
+    totp_secret = decrypt_mfa_secret(user.mfa_secret, settings.MFA_ENCRYPTION_KEY)
     if not verify_totp(totp_secret, code):
         raise AuthenticationException(
             "Invalid TOTP verification code", error_code="MFA_INVALID_CODE"
@@ -806,7 +838,7 @@ async def disable_mfa(
     settings: Settings,
 ) -> bool:
     """Disable MFA after verifying current password and code."""
-    stmt = select(User).where(User.id == user_id)
+    stmt = select(User).where(User.id == user_id).with_for_update()
     user = (await db.execute(stmt)).scalar_one_or_none()
     if not user:
         raise EntityNotFoundException("User not found")
@@ -815,15 +847,20 @@ async def disable_mfa(
         raise AuthenticationException("Invalid password", error_code="INVALID_CREDENTIALS")
 
     if user.mfa_secret:
-        totp_secret = decrypt_mfa_secret(user.mfa_secret, settings.JWT_SECRET_KEY)
-        if not verify_totp(totp_secret, code):
-            # Check backup code
-            clean = code.strip().replace("-", "").upper()
+        totp_secret = decrypt_mfa_secret(user.mfa_secret, settings.MFA_ENCRYPTION_KEY)
+        clean = code.strip().replace("-", "").upper()
+        if not verify_totp(totp_secret, clean):
+            # Check and consume backup code
             idx = verify_backup_code(clean, user.mfa_backup_codes or [])
             if idx < 0:
                 raise AuthenticationException(
                     "Invalid verification code", error_code="MFA_INVALID_CODE"
                 )
+            # Concurrency-safe single-use backup code consumption
+            codes = list(user.mfa_backup_codes or [])
+            codes.pop(idx)
+            user.mfa_backup_codes = codes
+            await db.commit()
 
     user.mfa_enabled = False
     user.mfa_secret = None
@@ -841,7 +878,7 @@ async def change_password(
     settings: Settings,
 ) -> None:
     """Change password, advance token version, and trigger session invalidation."""
-    stmt = select(User).where(User.id == user_id)
+    stmt = select(User).where(User.id == user_id).with_for_update()
     user = (await db.execute(stmt)).scalar_one_or_none()
     if not user:
         raise EntityNotFoundException("User not found")

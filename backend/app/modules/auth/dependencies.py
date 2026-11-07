@@ -199,23 +199,26 @@ async def authenticate_request_pipeline(
         cached_role_version = session_data.get("role_version", 1)
 
         # Invariant 1: jwt.token_version == session.token_version == user_current_token_version
-        if jwt_claims.token_version != cached_token_version or (
-            user_current_fence is not None and jwt_claims.token_version != user_current_fence
+        if (
+            jwt_claims.token_version != cached_token_version
+            or user_current_fence is None
+            or jwt_claims.token_version != user_current_fence
         ):
             await delete_session(redis, user_id, session_id)
             raise AuthenticationException(
-                "Session token epoch version mismatch",
+                "Session token epoch version mismatch or missing version fence",
                 error_code="TOKEN_VERSION_STALE",
             )
 
         # Invariant 2: jwt.role_version == session.role_version == org_current_role_version
         if tenant_id and (
             jwt_claims.role_version != cached_role_version
-            or (org_current_fence is not None and jwt_claims.role_version != org_current_fence)
+            or org_current_fence is None
+            or jwt_claims.role_version != org_current_fence
         ):
             await delete_session(redis, user_id, session_id)
             raise AuthenticationException(
-                "Role version mismatch",
+                "Role version mismatch or missing role fence",
                 error_code="ROLE_VERSION_STALE",
             )
 
@@ -318,8 +321,10 @@ async def authenticate_request_pipeline(
     # Return Authoritative Security Context
     return SecurityContext(
         user_id=UUID(user_id),
+        session_id=UUID(session_id),
         tenant_id=parsed_tenant_id,
         roles=[jwt_claims.role] if jwt_claims.role else [],
+        permissions=jwt_claims.permissions,
         token_version=jwt_claims.token_version,
         role_version=jwt_claims.role_version,
         is_super_admin=jwt_claims.is_super_admin,

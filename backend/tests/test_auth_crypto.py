@@ -21,16 +21,24 @@ from app.modules.auth.crypto import (
 
 
 def test_mfa_secret_aes_256_gcm_round_trip() -> None:
-    """Verify AES-256-GCM encryption and decryption round-trip for Tier 1 MFA secrets."""
-    secret_key = "a_very_secure_and_long_jwt_secret_key_32_chars_min!"
+    """Verify AES-256-GCM encryption and decryption round-trip with dedicated MFA encryption key."""
+    mfa_key = "a_very_secure_and_long_mfa_encryption_key_32_chars!"
+    wrong_key = "another_completely_different_jwt_signing_key_32_ch!"
     plain_secret = generate_totp_secret()
 
-    encrypted = encrypt_mfa_secret(plain_secret, secret_key)
+    encrypted = encrypt_mfa_secret(plain_secret, mfa_key)
     assert encrypted != plain_secret
     assert len(encrypted) > 20
 
-    decrypted = decrypt_mfa_secret(encrypted, secret_key)
+    decrypted = decrypt_mfa_secret(encrypted, mfa_key)
     assert decrypted == plain_secret
+
+    # Wrong key fails decryption (authenticated ciphertext integrity check)
+    import pytest
+    from cryptography.exceptions import InvalidTag
+
+    with pytest.raises(InvalidTag):
+        decrypt_mfa_secret(encrypted, wrong_key)
 
 
 def test_rfc6238_totp_generation_and_drift_verification() -> None:
@@ -76,15 +84,15 @@ def test_totp_uri_formatting() -> None:
 
 
 def test_backup_codes_generation_hashing_and_verification() -> None:
-    """Verify one-time backup codes generation, hashing, and single-use matching."""
-    codes = generate_backup_codes(count=8)
-    assert len(codes) == 8
+    """Verify 10 one-time backup codes generation, hashing, and single-use matching."""
+    codes = generate_backup_codes(count=10)
+    assert len(codes) == 10
     for c in codes:
         assert len(c) == 9  # e.g., '1A2B-3C4D'
         assert "-" in c
 
     hashed = [hash_backup_code(c) for c in codes]
-    assert len(hashed) == 8
+    assert len(hashed) == 10
 
     # Verify first code matches index 0
     idx = verify_backup_code(codes[0], hashed)

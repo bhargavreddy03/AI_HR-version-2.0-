@@ -24,29 +24,34 @@ if TYPE_CHECKING:
 # ------------------------------------------------------------------------------
 
 
-def derive_aes_key(secret_key: str) -> bytes:
-    """Derive 256-bit encryption key using HKDF-SHA256 from JWT secret."""
+def derive_aes_key(mfa_encryption_key: str | bytes) -> bytes:
+    """Derive 256-bit encryption key using HKDF-SHA256 from dedicated MFA encryption key."""
+    raw_key = (
+        mfa_encryption_key.encode("utf-8")
+        if isinstance(mfa_encryption_key, str)
+        else mfa_encryption_key
+    )
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
-        salt=b"aihr_mfa_secret_encryption_salt",
-        info=b"aihr_mfa_aes256gcm",
+        salt=b"aihr_dedicated_mfa_encryption_salt",
+        info=b"aihr_mfa_aes256gcm_isolated",
     )
-    return hkdf.derive(secret_key.encode("utf-8"))
+    return hkdf.derive(raw_key)
 
 
-def encrypt_mfa_secret(secret_base32: str, secret_key: str) -> str:
+def encrypt_mfa_secret(secret_base32: str, mfa_encryption_key: str | bytes) -> str:
     """Encrypt plaintext base32 TOTP secret using AES-256-GCM with a random 96-bit nonce."""
-    key = derive_aes_key(secret_key)
+    key = derive_aes_key(mfa_encryption_key)
     aesgcm = AESGCM(key)
     nonce = os.urandom(12)
     ciphertext = aesgcm.encrypt(nonce, secret_base32.encode("utf-8"), None)
     return base64.b64encode(nonce + ciphertext).decode("utf-8")
 
 
-def decrypt_mfa_secret(encrypted_secret: str, secret_key: str) -> str:
+def decrypt_mfa_secret(encrypted_secret: str, mfa_encryption_key: str | bytes) -> str:
     """Decrypt base64-encoded nonce+ciphertext payload using AES-256-GCM."""
-    key = derive_aes_key(secret_key)
+    key = derive_aes_key(mfa_encryption_key)
     raw = base64.b64decode(encrypted_secret)
     if len(raw) < 12:
         raise ValueError("Invalid encrypted MFA payload length")
@@ -120,7 +125,7 @@ def get_totp_uri(secret_base32: str, email: str, issuer: str = "AI HR Platform")
 # ------------------------------------------------------------------------------
 
 
-def generate_backup_codes(count: int = 8) -> list[str]:
+def generate_backup_codes(count: int = 10) -> list[str]:
     """Generate high-entropy one-time backup codes (e.g., 'A1B2-C3D4')."""
     codes: list[str] = []
     for _ in range(count):

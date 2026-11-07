@@ -91,6 +91,10 @@ class Settings(BaseSettings):
         default="local_development_jwt_secret_key_minimum_32_characters_long_for_security",
         description="HMAC secret key for signing JWT tokens",
     )
+    MFA_ENCRYPTION_KEY: str = Field(
+        default="local_development_mfa_encryption_key_minimum_32_characters_for_security",
+        description="Dedicated cryptographic key for AES-256-GCM encryption of MFA secrets at rest",
+    )
     JWT_ALGORITHM: str = Field(default="HS256", description="JWT algorithm")
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=15, description="Short-lived access token TTL")
     REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7, description="Sliding refresh token TTL")
@@ -146,7 +150,17 @@ class Settings(BaseSettings):
                     "Insecure or default JWT_SECRET_KEY detected for production/staging (minimum 32 chars required)"
                 )
 
-            # 2. POSTGRES_PASSWORD Validation
+            # 2. MFA Encryption Key Validation (Key separation guarantee)
+            if "local_development" in self.MFA_ENCRYPTION_KEY or len(self.MFA_ENCRYPTION_KEY) < 32:
+                raise ValueError(
+                    "Insecure or default MFA_ENCRYPTION_KEY detected for production/staging (minimum 32 chars required)"
+                )
+            if self.MFA_ENCRYPTION_KEY == self.JWT_SECRET_KEY:
+                raise ValueError(
+                    "Security violation: MFA_ENCRYPTION_KEY must be separate and distinct from JWT_SECRET_KEY"
+                )
+
+            # 3. POSTGRES_PASSWORD Validation
             if (
                 "local_development" in self.POSTGRES_PASSWORD
                 or self.POSTGRES_PASSWORD in INSECURE_PASSWORDS

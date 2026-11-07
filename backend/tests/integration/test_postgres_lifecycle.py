@@ -1,22 +1,46 @@
-"""Integration test suite verifying PostgreSQL 16 connection lifecycle, RLS isolation, and migrations."""
+"""Integration test suite verifying PostgreSQL 16 connection lifecycle, RLS isolation, migrations, and concurrency controls."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from app.core.base import generate_uuid7, utc_now
 from app.core.config import Settings
 from app.core.database import create_db_engine, register_pool_cleanup_listener
-from app.core.security import set_tenant_context
+from app.core.errors import AuthenticationException
+from app.core.security import hash_password, set_tenant_context
+from app.modules.auth.crypto import (
+    encrypt_mfa_secret,
+    generate_backup_codes,
+    generate_secure_token,
+    generate_totp_secret,
+    hash_backup_code,
+    hash_token,
+    verify_backup_code,
+)
+from app.modules.auth.models import (
+    User,
+    UserSession,
+)
+from app.modules.auth.service import refresh_session_tokens, verify_mfa_challenge
+from app.modules.organizations.models import (
+    Organization,
+    OrganizationMembership,
+    Role,
+)
 
 # Read test database URLs from environment or standard defaults
 INTEGRATION_DB_URL = os.getenv(
@@ -68,7 +92,19 @@ def integration_settings() -> Settings:
         POSTGRES_PASSWORD="test_password_only",
         DATABASE_URL=INTEGRATION_DB_URL,
         DATABASE_SYNC_URL=INTEGRATION_DB_URL.replace("+asyncpg", ""),
+        MFA_ENCRYPTION_KEY="integration_test_mfa_encryption_key_at_least_32_bytes_long",
     )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def ensure_database_schema(integration_settings: Settings) -> None:
+    """Ensure latest Alembic migrations are applied before running integration tests."""
+    if not POSTGRES_AVAILABLE:
+        return
+    ini_path = Path(__file__).resolve().parent.parent.parent / "alembic.ini"
+    alembic_cfg = Config(str(ini_path))
+    alembic_cfg.set_main_option("sqlalchemy.url", integration_settings.DATABASE_URL)
+    command.upgrade(alembic_cfg, "head")
 
 
 @skip_if_no_postgres
@@ -289,8 +325,263 @@ def test_alembic_upgrade_head_and_revision_state(
         heads = script.get_heads()
         assert len(heads) > 0
     else:
-        # Step 3.2 foundation baseline: no domain migration revisions exist yet.
-        # Verify genuine live database connectivity through Alembic's command runner without error swallowing.
         command.current(alembic_cfg)
-        # Truthful reporting assertion: zero revisions in Step 3.2 foundation
         assert len(available_revisions) == 0
+
+
+@skip_if_no_postgres
+@pytest.mark.asyncio
+async def test_postgres_concurrent_refresh_token_rotation_serializes_and_detects_reuse(
+    integration_settings: Settings,
+) -> None:
+    """Verify that concurrent refresh token rotations serialize via row lock and detect token reuse."""
+    engine = create_db_engine(integration_settings)
+    session_factory = async_sessionmaker(bind=engine, class_=AsyncSession, autoflush=False)
+
+    user_id = generate_uuid7()
+    session_id = generate_uuid7()
+    raw_refresh_token = generate_secure_token(32)
+    initial_hash = hash_token(raw_refresh_token)
+
+    try:
+        async with session_factory() as session:
+            user = User(
+                id=user_id,
+                email=f"concur_refresh_{user_id.hex[:8]}@example.com",
+                password_hash=hash_password("SuperSecretPass123!"),
+                first_name="Concur",
+                last_name="Refresh",
+                is_active=True,
+                token_version=1,
+            )
+            session.add(user)
+            user_session = UserSession(
+                id=session_id,
+                user_id=user_id,
+                refresh_token_hash=initial_hash,
+                expires_at=utc_now() + timedelta(days=7),
+                token_version=1,
+                is_revoked=False,
+            )
+            session.add(user_session)
+            await session.commit()
+
+        class FakeRedisClient:
+            def __init__(self) -> None:
+                self.data: dict[str, str] = {}
+
+            async def delete(self, *keys: str) -> None:
+                for k in keys:
+                    self.data.pop(k, None)
+
+            async def eval(self, script: str, numkeys: int, *args: object) -> int:
+                return 1
+
+        fake_redis = FakeRedisClient()
+
+        async def do_refresh() -> dict[str, object]:
+            async with session_factory() as sess:
+                return await refresh_session_tokens(
+                    db=sess,
+                    redis=fake_redis,  # type: ignore[arg-type]
+                    refresh_token_str=raw_refresh_token,
+                    client_ip="127.0.0.1",
+                    settings=integration_settings,
+                )
+
+        results = await asyncio.gather(do_refresh(), do_refresh(), return_exceptions=True)
+
+        succeeded = [r for r in results if not isinstance(r, Exception)]
+        errors = [r for r in results if isinstance(r, Exception)]
+
+        assert len(succeeded) == 1, f"Expected 1 success, got {len(succeeded)}: {results}"
+        assert len(errors) == 1, f"Expected 1 error, got {len(errors)}: {results}"
+        assert isinstance(errors[0], AuthenticationException)
+        assert errors[0].error_code == "TOKEN_REUSE_DETECTED"
+
+        # Verify session is revoked in database due to reuse detection
+        async with session_factory() as session:
+            stmt = select(UserSession).where(UserSession.id == session_id)
+            db_sess = (await session.execute(stmt)).scalar_one()
+            assert db_sess.is_revoked is True
+            assert db_sess.previous_refresh_token_hash == initial_hash
+    finally:
+        await engine.dispose()
+
+
+@skip_if_no_postgres
+@pytest.mark.asyncio
+async def test_postgres_concurrent_backup_code_redemption_serializes(
+    integration_settings: Settings,
+) -> None:
+    """Verify that concurrent backup code redemptions serialize via row lock and prevent double-consumption."""
+    engine = create_db_engine(integration_settings)
+    session_factory = async_sessionmaker(bind=engine, class_=AsyncSession, autoflush=False)
+
+    user_id = generate_uuid7()
+    backup_codes = generate_backup_codes(count=10)
+    target_code = backup_codes[0]
+    hashed_codes = [hash_backup_code(c) for c in backup_codes]
+
+    totp_secret = generate_totp_secret()
+    encrypted_secret = encrypt_mfa_secret(totp_secret, integration_settings.MFA_ENCRYPTION_KEY)
+
+    try:
+        async with session_factory() as session:
+            user = User(
+                id=user_id,
+                email=f"concur_mfa_{user_id.hex[:8]}@example.com",
+                password_hash=hash_password("SuperSecretPass123!"),
+                first_name="Concur",
+                last_name="MFA",
+                is_active=True,
+                mfa_enabled=True,
+                mfa_secret=encrypted_secret,
+                mfa_backup_codes=hashed_codes,
+                token_version=1,
+            )
+            session.add(user)
+            await session.commit()
+
+        challenge_token_1 = generate_secure_token(32)
+        challenge_token_2 = generate_secure_token(32)
+        challenge_payload = json.dumps(
+            {
+                "user_id": str(user_id),
+                "organization_slug": None,
+                "ip": "127.0.0.1",
+                "user_agent": "test-agent",
+            }
+        )
+
+        class FakeRedisClient:
+            def __init__(self) -> None:
+                self.data: dict[str, str] = {
+                    f"mfa_challenge:{challenge_token_1}": challenge_payload,
+                    f"mfa_challenge:{challenge_token_2}": challenge_payload,
+                }
+
+            async def get(self, key: str) -> str | None:
+                return self.data.get(key)
+
+            async def delete(self, *keys: str) -> None:
+                for k in keys:
+                    self.data.pop(k, None)
+
+            async def set(self, key: str, value: str, ex: int | None = None) -> None:
+                self.data[key] = value
+
+            async def eval(self, script: str, numkeys: int, *args: object) -> int:
+                return 1
+
+        fake_redis = FakeRedisClient()
+
+        async def do_verify(token: str) -> dict[str, object]:
+            async with session_factory() as sess:
+                return await verify_mfa_challenge(
+                    db=sess,
+                    redis=fake_redis,  # type: ignore[arg-type]
+                    challenge_token=token,
+                    code=target_code,
+                    settings=integration_settings,
+                )
+
+        results = await asyncio.gather(
+            do_verify(challenge_token_1),
+            do_verify(challenge_token_2),
+            return_exceptions=True,
+        )
+
+        succeeded = [r for r in results if not isinstance(r, Exception)]
+        errors = [r for r in results if isinstance(r, Exception)]
+
+        assert len(succeeded) == 1, f"Expected exactly 1 redemption, got: {results}"
+        assert len(errors) == 1
+        assert isinstance(errors[0], AuthenticationException)
+        assert errors[0].error_code == "MFA_INVALID_CODE"
+
+        # Verify backup code list in DB now has 9 codes remaining and target code cannot be verified
+        async with session_factory() as session:
+            stmt = select(User).where(User.id == user_id)
+            db_user = (await session.execute(stmt)).scalar_one()
+            assert len(db_user.mfa_backup_codes) == 9
+            assert verify_backup_code(target_code, db_user.mfa_backup_codes) == -1
+    finally:
+        await engine.dispose()
+
+
+@skip_if_no_postgres
+@pytest.mark.asyncio
+async def test_postgres_cross_tenant_role_assignment_trigger_rejection(
+    integration_settings: Settings,
+) -> None:
+    """Verify that PostgreSQL trigger trg_enforce_membership_role_tenant rejects cross-tenant role assignment."""
+    engine = create_db_engine(integration_settings)
+    session_factory = async_sessionmaker(bind=engine, class_=AsyncSession, autoflush=False)
+
+    tenant_a_id = generate_uuid7()
+    tenant_b_id = generate_uuid7()
+    user_id = generate_uuid7()
+    custom_role_b_id = generate_uuid7()
+
+    try:
+        async with session_factory() as session:
+            # Create Tenant A and Tenant B
+            org_a = Organization(
+                id=tenant_a_id,
+                name="Tenant Alpha",
+                slug=f"alpha-{tenant_a_id.hex[:6]}",
+                status="active",
+            )
+            org_b = Organization(
+                id=tenant_b_id,
+                name="Tenant Beta",
+                slug=f"beta-{tenant_b_id.hex[:6]}",
+                status="active",
+            )
+            session.add_all([org_a, org_b])
+
+            # Create User
+            user = User(
+                id=user_id,
+                email=f"user_{user_id.hex[:8]}@example.com",
+                password_hash=hash_password("SuperSecretPass123!"),
+                first_name="Cross",
+                last_name="Tenant",
+                is_active=True,
+            )
+            session.add(user)
+
+            # Create Custom Role belonging to Tenant B (is_system = False)
+            role_b = Role(
+                id=custom_role_b_id,
+                name=f"custom_role_{tenant_b_id.hex[:6]}",
+                description="Custom role for Tenant B",
+                is_system=False,
+                tenant_id=tenant_b_id,
+            )
+            session.add(role_b)
+            await session.commit()
+
+        # Attempt to create an organization_membership linking Tenant A with custom_role_b (from Tenant B)
+        # The database trigger trg_enforce_membership_role_tenant MUST reject this with check_violation
+        with pytest.raises(DBAPIError) as exc_info:
+            async with session_factory() as session:
+                await set_tenant_context(session, tenant_a_id)
+                invalid_membership = OrganizationMembership(
+                    id=generate_uuid7(),
+                    tenant_id=tenant_a_id,
+                    user_id=user_id,
+                    role_id=custom_role_b_id,
+                    is_active=True,
+                )
+                session.add(invalid_membership)
+                await session.commit()
+
+        error_message = str(exc_info.value)
+        assert (
+            "Cross-tenant role assignment prohibited" in error_message
+            or "check_violation" in error_message.lower()
+        )
+    finally:
+        await engine.dispose()

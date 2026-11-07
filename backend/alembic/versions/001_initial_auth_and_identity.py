@@ -288,6 +288,37 @@ def upgrade() -> None:
         END $$;
     """)
 
+    # Enforce Tenant-Role Integrity: A membership cannot reference another tenant's custom role
+    op.execute("""
+        CREATE OR REPLACE FUNCTION fn_enforce_membership_role_tenant()
+        RETURNS trigger AS $$
+        DECLARE
+            v_role_tenant_id uuid;
+            v_is_system boolean;
+        BEGIN
+            SELECT tenant_id, is_system INTO v_role_tenant_id, v_is_system
+            FROM roles WHERE id = NEW.role_id;
+
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'Role % does not exist', NEW.role_id;
+            END IF;
+
+            IF NOT v_is_system AND (v_role_tenant_id IS NULL OR v_role_tenant_id != NEW.tenant_id) THEN
+                RAISE EXCEPTION 'Cross-tenant role assignment prohibited: Role % does not belong to tenant %', NEW.role_id, NEW.tenant_id
+                    USING ERRCODE = 'check_violation';
+            END IF;
+
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        DROP TRIGGER IF EXISTS trg_enforce_membership_role_tenant ON organization_memberships;
+        CREATE TRIGGER trg_enforce_membership_role_tenant
+            BEFORE INSERT OR UPDATE OF tenant_id, role_id ON organization_memberships
+            FOR EACH ROW
+            EXECUTE FUNCTION fn_enforce_membership_role_tenant();
+    """)
+
     # --------------------------------------------------------------------------
     # 8. User Sessions Registry: user_sessions
     # --------------------------------------------------------------------------
@@ -307,6 +338,7 @@ def upgrade() -> None:
             nullable=True,
         ),
         sa.Column("refresh_token_hash", sa.String(255), nullable=False),
+        sa.Column("previous_refresh_token_hash", sa.String(255), nullable=True),
         sa.Column("token_version", sa.Integer(), nullable=False, server_default="1"),
         sa.Column("ip_address", sa.String(45), nullable=True),
         sa.Column("user_agent", sa.String(512), nullable=True),
@@ -328,6 +360,11 @@ def upgrade() -> None:
     op.create_index("ix_user_sessions_user_id", "user_sessions", ["user_id"])
     op.create_index("ix_user_sessions_tenant_id", "user_sessions", ["tenant_id"])
     op.create_index("ix_user_sessions_refresh_token_hash", "user_sessions", ["refresh_token_hash"])
+    op.create_index(
+        "ix_user_sessions_previous_refresh_token_hash",
+        "user_sessions",
+        ["previous_refresh_token_hash"],
+    )
     op.create_index("ix_user_sessions_is_revoked", "user_sessions", ["is_revoked"])
     op.create_index("ix_user_sessions_expires_at", "user_sessions", ["expires_at"])
 
@@ -510,6 +547,10 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     # Drop tables in reverse order
+    op.execute(
+        "DROP TRIGGER IF EXISTS trg_enforce_membership_role_tenant ON organization_memberships;"
+    )
+    op.execute("DROP FUNCTION IF EXISTS fn_enforce_membership_role_tenant();")
     op.drop_table("auth_revocation_outbox")
     op.drop_table("user_sessions")
     op.execute("DROP POLICY IF EXISTS org_mem_tenant_restrict ON organization_memberships;")

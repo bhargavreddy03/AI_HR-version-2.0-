@@ -103,6 +103,9 @@ class UserSession(Base, TimestampMixin):
         index=True,
     )
     refresh_token_hash: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    previous_refresh_token_hash: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, index=True
+    )
     token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)

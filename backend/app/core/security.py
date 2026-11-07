@@ -75,11 +75,15 @@ class SecurityContext(BaseModel):
     """Authoritative security credentials and multi-tenant authorization context."""
 
     user_id: UUID = Field(..., description="Authenticated user UUID")
+    session_id: UUID | None = Field(default=None, description="Active session UUID")
     tenant_id: UUID | None = Field(
         default=None, description="Active tenant UUID (if tenant-scoped request)"
     )
     roles: list[str] = Field(
         default_factory=list, description="Assigned roles within current tenant"
+    )
+    permissions: list[str] = Field(
+        default_factory=list, description="Assigned capability codes within current tenant"
     )
     token_version: int = Field(default=1, description="Current user token epoch version")
     role_version: int = Field(default=1, description="Current organization membership role version")

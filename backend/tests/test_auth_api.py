@@ -66,17 +66,16 @@ class FakeRedis:
         return self.ttls.get(str(key), -1)
 
     async def eval(self, script: str, numkeys: int, *args: Any) -> int:
-        # Simulate monotonic token version script
         key = str(args[0])
         new_ver = int(args[1])
-        user_id = str(args[2])
         current = int(self.store.get(key, "0")) if key in self.store else None
         if current is None or current < new_ver:
             self.store[key] = str(new_ver)
-            # Evict user sessions
-            to_del = [k for k in self.store if k.startswith(f"session:{user_id}:")]
-            for k in to_del:
-                del self.store[k]
+            if len(args) > 2:
+                user_id = str(args[2])
+                to_del = [k for k in self.store if k.startswith(f"session:{user_id}:")]
+                for k in to_del:
+                    del self.store[k]
             return 1
         return 0
 
@@ -331,12 +330,21 @@ def test_refresh_token_rotation_and_reuse_detection(
     assert response.status_code == status.HTTP_200_OK
     assert COOKIE_ACCESS in response.cookies
     assert COOKIE_REFRESH in response.cookies
+    # Verify previous_refresh_token_hash was recorded
+    assert session_rec.previous_refresh_token_hash == hash_token(raw_token)
 
-    # 2. Reuse Detection: Presenting an already revoked token
-    session_rec.is_revoked = True
+    # 2. Rotated Token Reuse Detection: Presenting the previously rotated token
+    # must trigger TOKEN_REUSE_DETECTED and revoke the session
+    session_rec.is_revoked = False
     response_reuse = client.post("/api/v1/auth/refresh")
     assert response_reuse.status_code == status.HTTP_401_UNAUTHORIZED
-    assert response_reuse.json()["code"] == "SESSION_REVOKED"
+    assert response_reuse.json()["code"] == "TOKEN_REUSE_DETECTED"
+    assert session_rec.is_revoked is True
+
+    # 3. Already revoked session is rejected with SESSION_REVOKED
+    response_revoked = client.post("/api/v1/auth/refresh")
+    assert response_revoked.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response_revoked.json()["code"] in ("TOKEN_REUSE_DETECTED", "SESSION_REVOKED")
 
 
 def test_logout_and_revocation(
@@ -365,6 +373,21 @@ def test_logout_and_revocation(
     client.cookies.set(COOKIE_ACCESS, token)
     client.cookies.set(COOKIE_CSRF, "test_csrf")
 
+    # Seed session in DB
+    session_rec = UserSession(
+        id=session_id,
+        user_id=user_id,
+        tenant_id=None,
+        refresh_token_hash="hash123",
+        token_version=1,
+        is_revoked=False,
+        created_at=datetime.now(UTC),
+        expires_at=datetime.now(UTC) + timedelta(days=7),
+    )
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = session_rec
+    mock_db.execute.return_value = mock_result
+
     # Seed session in Redis
     fake_redis.store[f"session:{user_id}:{session_id}"] = (
         f'{{"token_version": 1, "role_version": 1, "last_db_verified_at": {datetime.now(UTC).timestamp()}}}'
@@ -376,6 +399,12 @@ def test_logout_and_revocation(
         headers={"X-CSRF-Token": "test_csrf"},
     )
     assert response.status_code == status.HTTP_200_OK
+
+    # Verify database session was actually marked revoked
+    assert session_rec.is_revoked is True
+
+    # Verify Redis session entry was removed
+    assert f"session:{user_id}:{session_id}" not in fake_redis.store
 
     # Cookies must be cleared
     cookies = response.headers.get_list("set-cookie")
