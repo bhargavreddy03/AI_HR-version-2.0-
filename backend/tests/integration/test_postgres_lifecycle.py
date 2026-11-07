@@ -285,8 +285,9 @@ def test_alembic_upgrade_head_and_revision_state(
     # If revisions exist, execute upgrade directly (NO try/except; any failure immediately fails test)
     if available_revisions:
         command.upgrade(alembic_cfg, "head")
-        heads = command.heads(alembic_cfg)
-        assert heads is not None
+        command.heads(alembic_cfg)
+        heads = script.get_heads()
+        assert len(heads) > 0
     else:
         # Step 3.2 foundation baseline: no domain migration revisions exist yet.
         # Verify genuine live database connectivity through Alembic's command runner without error swallowing.

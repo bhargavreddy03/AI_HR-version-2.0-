@@ -282,7 +282,7 @@ def upgrade() -> None:
                 WHERE tablename = 'organization_memberships' AND policyname = 'org_mem_tenant_restrict'
             ) THEN
                 CREATE POLICY org_mem_tenant_restrict ON organization_memberships
-                AS RESTRICTIVE
+                FOR ALL
                 USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
             END IF;
         END $$;
