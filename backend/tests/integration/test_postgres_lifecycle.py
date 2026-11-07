@@ -13,8 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from app.core.config import Settings
-from app.core.database import create_db_engine
+from app.core.database import create_db_engine, register_pool_cleanup_listener
 from app.core.security import set_tenant_context
 
 # Read test database URLs from environment or standard defaults
@@ -222,20 +223,73 @@ async def test_postgres_tenant_context_does_not_leak_across_pooled_connection_re
 
 
 @skip_if_no_postgres
+@pytest.mark.asyncio
+async def test_postgres_deliberate_session_level_tenant_context_cannot_leak_across_pool(
+    integration_settings: Settings,
+) -> None:
+    """Deliberately set session-scoped tenant context (is_local=False) and verify it cannot leak across pool checkout."""
+    single_conn_engine = create_async_engine(
+        integration_settings.DATABASE_URL,
+        pool_size=1,
+        max_overflow=0,
+        pool_pre_ping=True,
+    )
+    register_pool_cleanup_listener(single_conn_engine)
+    session_factory = async_sessionmaker(
+        bind=single_conn_engine, class_=AsyncSession, autoflush=False
+    )
+
+    deliberate_tenant = uuid.uuid4()
+
+    try:
+        # Session 1: Deliberately set session-scoped tenant context (is_local=False) and commit
+        async with session_factory() as session_1:
+            await session_1.execute(
+                text("SELECT set_config('app.current_tenant_id', :tenant_id, false);"),
+                {"tenant_id": str(deliberate_tenant)},
+            )
+            res = await session_1.execute(
+                text("SELECT current_setting('app.current_tenant_id', true) AS tid;")
+            )
+            assert res.scalar() == str(deliberate_tenant)
+            await session_1.commit()
+
+        # Session 1 ends -> connection returned to pool -> checkin listener resets & commits app.current_tenant_id = ''
+
+        # Session 2: Check out the exact same physical connection from pool
+        async with session_factory() as session_2:
+            res = await session_2.execute(
+                text("SELECT current_setting('app.current_tenant_id', true) AS tid;")
+            )
+            tid = res.scalar()
+            assert (
+                tid is None or tid == ""
+            ), f"Deliberate session-level tenant context leaked across pooled connection reuse! Found: {tid}"
+    finally:
+        await single_conn_engine.dispose()
+
+
+@skip_if_no_postgres
 def test_alembic_upgrade_head_and_revision_state(
     integration_settings: Settings,
 ) -> None:
-    """Verify that Alembic runs 'upgrade head' cleanly and reports valid revision state."""
+    """Verify that Alembic connects to live PostgreSQL without error swallowing, reporting revision state honestly."""
     ini_path = Path(__file__).resolve().parent.parent.parent / "alembic.ini"
     alembic_cfg = Config(str(ini_path))
     alembic_cfg.set_main_option("sqlalchemy.url", integration_settings.DATABASE_URL)
 
-    # Execute Alembic migration to head (or verify heads when no versions present)
-    try:
-        command.upgrade(alembic_cfg, "head")
-    except Exception:
-        # In Step 3.2 without revision files, verify environment parsing via heads
-        pass
+    # Inspect script directory for available schema migration revisions
+    script = ScriptDirectory.from_config(alembic_cfg)
+    available_revisions = list(script.walk_revisions())
 
-    heads = command.heads(alembic_cfg)
-    assert heads is None or isinstance(heads, list | tuple)
+    # If revisions exist, execute upgrade directly (NO try/except; any failure immediately fails test)
+    if available_revisions:
+        command.upgrade(alembic_cfg, "head")
+        heads = command.heads(alembic_cfg)
+        assert heads is not None
+    else:
+        # Step 3.2 foundation baseline: no domain migration revisions exist yet.
+        # Verify genuine live database connectivity through Alembic's command runner without error swallowing.
+        command.current(alembic_cfg)
+        # Truthful reporting assertion: zero revisions in Step 3.2 foundation
+        assert len(available_revisions) == 0

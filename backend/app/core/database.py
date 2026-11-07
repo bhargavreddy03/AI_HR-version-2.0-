@@ -24,23 +24,16 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
-def create_db_engine(settings: Settings) -> AsyncEngine:
-    """Create and configure a new AsyncEngine instance with pool safety listeners."""
-    engine = create_async_engine(
-        settings.DATABASE_URL,
-        echo=settings.DEBUG,
-        pool_size=settings.DB_POOL_SIZE,
-        max_overflow=settings.DB_MAX_OVERFLOW,
-        pool_timeout=settings.DB_POOL_TIMEOUT,
-        pool_recycle=settings.DB_POOL_RECYCLE,
-        pool_pre_ping=True,
-    )
+def register_pool_cleanup_listener(engine: AsyncEngine) -> None:
+    """Register pool checkin defense-in-depth cleanup listener for PostgreSQL connections.
 
-    # Connection Pool Defense-in-Depth Checkin Listener (Architecture 04 Section 4)
-    # Transaction-local settings (is_local=true) are automatically reverted by PostgreSQL
-    # upon transaction commit or rollback. This checkin hook provides defense-in-depth
-    # against accidental session-scoped settings on PostgreSQL connections.
-    # If clearing fails, the connection record is invalidated so tainted connections are never reused.
+    Transaction-local tenant contexts (set_config(..., true)) are naturally and automatically
+    reverted by PostgreSQL at transaction COMMIT or ROLLBACK.
+    As defense-in-depth against deliberate or accidental session-scoped tenant leaks (is_local=false),
+    this listener resets app.current_tenant_id upon connection checkin and commits the reset.
+    If any error occurs during cleanup, the connection is invalidated immediately to prevent reuse.
+    """
+
     @event.listens_for(engine.sync_engine, "checkin")
     def on_connection_checkin(dbapi_connection: Any, connection_record: Any) -> None:
         if engine.dialect.name == "postgresql":
@@ -49,6 +42,8 @@ def create_db_engine(settings: Settings) -> AsyncEngine:
                     cursor = dbapi_connection.cursor()
                     try:
                         cursor.execute("SELECT set_config('app.current_tenant_id', '', false);")
+                        if hasattr(dbapi_connection, "commit"):
+                            dbapi_connection.commit()
                     finally:
                         if hasattr(cursor, "close"):
                             cursor.close()
@@ -60,6 +55,19 @@ def create_db_engine(settings: Settings) -> AsyncEngine:
                 connection_record.invalidate(exc)
                 raise
 
+
+def create_db_engine(settings: Settings) -> AsyncEngine:
+    """Create and configure a new AsyncEngine instance with pool safety listeners."""
+    engine = create_async_engine(
+        settings.DATABASE_URL,
+        echo=settings.DEBUG,
+        pool_size=settings.DB_POOL_SIZE,
+        max_overflow=settings.DB_MAX_OVERFLOW,
+        pool_timeout=settings.DB_POOL_TIMEOUT,
+        pool_recycle=settings.DB_POOL_RECYCLE,
+        pool_pre_ping=True,
+    )
+    register_pool_cleanup_listener(engine)
     return engine
 
 
@@ -74,7 +82,10 @@ def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSessi
 
 
 def get_engine(settings: Settings | None = None) -> AsyncEngine:
-    """Return the global cached AsyncEngine instance or initialize a new one."""
+    """Return the global cached AsyncEngine instance or initialize a new one.
+
+    Preserves simple singleton defaults for standalone CLI and script execution.
+    """
     global _engine
     cfg = settings or get_settings()
 
@@ -114,10 +125,10 @@ async def get_db(
             app_settings = getattr(request.app.state, "settings", None)
             engine = getattr(request.app.state, "engine", None)
             if engine is None and app_settings is not None:
-                engine = get_engine(app_settings)
+                engine = create_db_engine(app_settings)
                 request.app.state.engine = engine
             if engine is not None:
-                factory = get_session_factory(engine=engine, settings=app_settings)
+                factory = create_session_factory(engine)
                 request.app.state.session_factory = factory
 
     if factory is None:
@@ -150,8 +161,17 @@ async def check_database_health(
         return False
 
 
+async def dispose_app_database(app: Any) -> None:
+    """Dispose only the database engine and session factory belonging to the supplied application instance."""
+    engine = getattr(app.state, "engine", None)
+    if engine is not None:
+        await engine.dispose()
+        app.state.engine = None
+        app.state.session_factory = None
+
+
 async def close_database_connections() -> None:
-    """Cleanly dispose of connection pool during application shutdown."""
+    """Cleanly dispose of global connection pool during standalone script shutdown."""
     global _engine, _session_factory
     if _engine is not None:
         await _engine.dispose()

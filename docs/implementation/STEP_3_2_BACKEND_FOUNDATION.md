@@ -60,9 +60,18 @@ All business modules (recruitment ATS, screening, pipelines) remain intentionall
    - **Multi-Instance Isolation**: `get_db(request)` retrieves engine and session factory configured on `request.app.state`, preventing cross-application configuration bleed.
 2. **PostgreSQL Connection Pool Tenant Cleanup**:
    - **Transaction-Local Isolation**: Application uses `set_tenant_context(session, tenant_id)` which issues `SELECT set_config('app.current_tenant_id', :tenant_id, true)`. In PostgreSQL, `is_local = true` guarantees that the variable is reverted by the database transaction manager upon `COMMIT` or `ROLLBACK`.
-   - **Defense-in-Depth Checkin Hook**: On pooled connection checkin (post-rollback), for PostgreSQL connections, a checkin listener executes `SELECT set_config('app.current_tenant_id', '', false)`.
-   - **Strict Non-Swallowing Policy**: If clearing fails, the hook logs an `ERROR`, calls `connection_record.invalidate(exc)` to destroy the tainted socket, and re-raises the exception.
-3. **Timezone-Aware Timestamps (`app.core.base`)**:
+   - **Persisted Checkin Cleanup Hook**: On pooled connection checkin (post-rollback), for PostgreSQL connections, a checkin listener executes `SELECT set_config('app.current_tenant_id', '', false)` and commits via `dbapi_connection.commit()`. This guarantees that any deliberate or accidental session-scoped setting is cleared and persisted, preventing subsequent pool reset rollbacks from reviving stale state.
+   - **Strict Invalidation on Failure**: If clearing fails, the hook logs an `ERROR`, calls `connection_record.invalidate(exc)` to immediately destroy the tainted connection socket, and re-raises the exception.
+   - **Integration Test Verification**: Added `test_postgres_deliberate_session_level_tenant_context_cannot_leak_across_pool`, which deliberately creates session-scoped tenant context (`is_local=False`), commits, and verifies that the reused pooled connection is clean.
+3. **Application-Instance Resource Isolation (`app.state`)**:
+   - Application instances store their own `AsyncEngine`, `sessionmaker`, and `Redis` client on `app.state`.
+   - Application shutdown (`lifespan`) executes `dispose_app_database(app)` and `dispose_app_redis(app)`, disposing only resources bound to that application instance.
+   - Independent instances with distinct database or Redis configurations cannot cross-contaminate or prematurely dispose each other's connections. Verified by `tests/test_instance_isolation.py`.
+4. **Alembic Integration Without Error Swallowing**:
+   - Removed broad `try/except` around migration commands in `test_postgres_lifecycle.py`.
+   - If revisions exist, `command.upgrade(alembic_cfg, "head")` executes directly and will fail on any error.
+   - For Step 3.2 repository foundation baseline where no domain revisions exist yet, `command.current(alembic_cfg)` verifies live database connectivity through Alembic's command runner without error swallowing, and honestly asserts `len(available_revisions) == 0`.
+5. **Timezone-Aware Timestamps (`app.core.base`)**:
    - Eliminated naive `datetime.utcnow`.
    - Implemented `utc_now() -> datetime` returning timezone-aware `datetime.now(timezone.utc)`.
    - `TimestampMixin`: Standardized with `TIMESTAMP(timezone=True)` (PostgreSQL `TIMESTAMPTZ`), `server_default=text("CURRENT_TIMESTAMP")`, and timezone-aware Python callables for `default` and `onupdate`.

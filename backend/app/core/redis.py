@@ -66,8 +66,30 @@ async def check_redis_health(
         return False
 
 
+async def dispose_app_redis(app: Any) -> None:
+    """Dispose only the Redis client and pool belonging to the supplied application instance."""
+    redis_client = getattr(app.state, "redis_client", None)
+    if redis_client is not None:
+        try:
+            if hasattr(redis_client, "aclose"):
+                await redis_client.aclose()
+            elif hasattr(redis_client, "close"):
+                await redis_client.close()
+        except Exception as exc:
+            logger.warning("Error closing application Redis client: %s", exc)
+
+        try:
+            pool = getattr(redis_client, "connection_pool", None)
+            if pool is not None and hasattr(pool, "disconnect"):
+                await pool.disconnect()
+        except Exception as exc:
+            logger.warning("Error disconnecting application Redis pool: %s", exc)
+
+        app.state.redis_client = None
+
+
 async def close_redis_connections() -> None:
-    """Cleanly close Redis connections during application shutdown."""
+    """Cleanly close global Redis connections during standalone script shutdown."""
     global _redis_client, _redis_pool
     if _redis_client is not None:
         await _redis_client.close()

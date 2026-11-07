@@ -166,7 +166,7 @@ The original prototype files and historical training data are preserved in their
 ## 6. Project Roadmap & Recent Updates
 
 ### Latest Activity
-- **Step 3.2 Hardened & Completed**: Production database URL validation, strict credential consistency, connection pool checkin cleanup, timezone-aware UTC timestamps, request correlation ID tracking, RFC 7807 error handling, and PostgreSQL 16 lifecycle integration test suite (docs/implementation/STEP_3_2_BACKEND_FOUNDATION.md).
+- **Step 3.2 Finalized & Audited**: Hardened asynchronous FastAPI backend foundation. Implemented persisted PostgreSQL connection pool tenant reset (`SELECT set_config('app.current_tenant_id', '', false)` + commit) with automatic invalidation on checkin failure, strict application-instance resource isolation across FastAPI lifespans (`app.state`), clean non-swallowing Alembic migration reporting, production database credential validation, RFC 7807 error responses, and 87%+ test coverage ([`docs/implementation/STEP_3_2_BACKEND_FOUNDATION.md`](docs/implementation/STEP_3_2_BACKEND_FOUNDATION.md)).
 - **Step 3.1 Completed**: Repository foundation established. Monorepo folder layout created, FastAPI core initialized, Next.js 14 App Router configured, Docker Compose environment prepared, CI/CD pipeline defined, and architecture documentation synchronized.
 - **Git Repository Connected**: Initialized tracking with remote `https://github.com/bhargavreddy03/AI_HR-version-2.0-.git`.
 

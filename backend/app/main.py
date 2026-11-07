@@ -14,14 +14,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1.router import api_v1_router
 from app.core.config import Settings, get_settings
 from app.core.database import (
-    close_database_connections,
-    get_engine,
-    get_session_factory,
+    create_db_engine,
+    create_session_factory,
+    dispose_app_database,
 )
 from app.core.errors import register_exception_handlers
 from app.core.logging import setup_logging
 from app.core.middleware import CorrelationIdMiddleware
-from app.core.redis import close_redis_connections, get_redis_client
+from app.core.redis import (
+    create_redis_client,
+    dispose_app_redis,
+)
 
 
 @asynccontextmanager
@@ -30,19 +33,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings: Settings = getattr(app.state, "settings", None) or get_settings()
     setup_logging(settings)
 
-    # Initialize connection pools on startup for non-testing environments
+    # Initialize connection pools on startup for non-testing environments if not pre-injected
     if settings.ENVIRONMENT != "testing":
-        engine = get_engine(settings)
-        app.state.engine = engine
-        app.state.session_factory = get_session_factory(engine=engine, settings=settings)
-        redis_client = get_redis_client(settings)
-        app.state.redis_client = redis_client
+        if getattr(app.state, "engine", None) is None:
+            engine = create_db_engine(settings)
+            app.state.engine = engine
+            app.state.session_factory = create_session_factory(engine)
+        if getattr(app.state, "redis_client", None) is None:
+            app.state.redis_client = create_redis_client(settings)
 
     yield
 
-    # Clean teardown of connection pools during shutdown
-    await close_database_connections()
-    await close_redis_connections()
+    # Clean instance-scoped shutdown: dispose ONLY this application's resources
+    await dispose_app_database(app)
+    await dispose_app_redis(app)
 
 
 def create_application(settings: Settings | None = None) -> FastAPI:
