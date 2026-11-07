@@ -60,10 +60,10 @@ SELECT
     o.status AS organization_status
 FROM users u
 LEFT JOIN organization_memberships om
-    ON om.user_id = u.id AND om.tenant_id = :tenant_id
+    ON om.user_id = u.id AND om.tenant_id = :tenant_id::uuid
 LEFT JOIN organizations o
-    ON o.id = :tenant_id
-WHERE u.id = :user_id;
+    ON o.id = :tenant_id::uuid
+WHERE u.id = :user_id::uuid;
 """)
 
 AUTHORITATIVE_USER_ONLY_SQL = text("""
@@ -73,7 +73,7 @@ SELECT
     u.is_active AS user_active,
     u.force_authoritative_check
 FROM users u
-WHERE u.id = :user_id;
+WHERE u.id = :user_id::uuid;
 """)
 
 
@@ -162,7 +162,7 @@ async def execute_authoritative_6_dim_check(
         if tenant_id:
             result = await db.execute(
                 AUTHORITATIVE_6_DIM_SQL,
-                {"user_id": user_id, "tenant_id": tenant_id},
+                {"user_id": str(user_id), "tenant_id": str(tenant_id)},
             )
             row = result.mappings().first()
             if not row:
@@ -171,7 +171,7 @@ async def execute_authoritative_6_dim_check(
         else:
             result = await db.execute(
                 AUTHORITATIVE_USER_ONLY_SQL,
-                {"user_id": user_id},
+                {"user_id": str(user_id)},
             )
             row = result.mappings().first()
             if not row:

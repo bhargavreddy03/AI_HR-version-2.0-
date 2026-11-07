@@ -379,6 +379,9 @@ class FakeIntegrationRedis:
     async def expire(self, key: str, seconds: int) -> bool:
         return True
 
+    async def ttl(self, key: str) -> int:
+        return 3600
+
     async def eval(self, script: str, numkeys: int, *args: object) -> int:
         return 1
 
