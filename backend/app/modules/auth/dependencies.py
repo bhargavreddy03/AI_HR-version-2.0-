@@ -60,10 +60,10 @@ SELECT
     o.status AS organization_status
 FROM users u
 LEFT JOIN organization_memberships om
-    ON om.user_id = u.id AND om.tenant_id = :tenant_id::uuid
+    ON om.user_id = u.id AND om.tenant_id = CAST(:tenant_id AS UUID)
 LEFT JOIN organizations o
-    ON o.id = :tenant_id::uuid
-WHERE u.id = :user_id::uuid;
+    ON o.id = CAST(:tenant_id AS UUID)
+WHERE u.id = CAST(:user_id AS UUID);
 """)
 
 AUTHORITATIVE_USER_ONLY_SQL = text("""
@@ -73,7 +73,7 @@ SELECT
     u.is_active AS user_active,
     u.force_authoritative_check
 FROM users u
-WHERE u.id = :user_id::uuid;
+WHERE u.id = CAST(:user_id AS UUID);
 """)
 
 
