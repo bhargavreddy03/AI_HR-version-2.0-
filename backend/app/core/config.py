@@ -4,6 +4,19 @@ from functools import lru_cache
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
+
+INSECURE_PASSWORDS: frozenset[str] = frozenset(
+    {
+        "local_development_password_only",
+        "postgres",
+        "password",
+        "admin",
+        "root",
+        "123456",
+        "",
+    }
+)
 
 
 class Settings(BaseSettings):
@@ -127,14 +140,74 @@ class Settings(BaseSettings):
     def validate_security_settings(self) -> "Settings":
         """Enforce strict production secret safeguards and prevent insecure defaults."""
         if self.ENVIRONMENT in ("production", "staging"):
+            # 1. JWT Secret Key Validation
             if "local_development" in self.JWT_SECRET_KEY or len(self.JWT_SECRET_KEY) < 32:
                 raise ValueError(
-                    "Insecure or default JWT_SECRET_KEY detected for production/staging"
+                    "Insecure or default JWT_SECRET_KEY detected for production/staging (minimum 32 chars required)"
                 )
-            if "local_development" in self.POSTGRES_PASSWORD:
+
+            # 2. POSTGRES_PASSWORD Validation
+            if (
+                "local_development" in self.POSTGRES_PASSWORD
+                or self.POSTGRES_PASSWORD in INSECURE_PASSWORDS
+            ):
                 raise ValueError(
                     "Insecure default POSTGRES_PASSWORD detected for production/staging"
                 )
+
+            # 3. DATABASE_URL Validation (Asynchronous URI)
+            try:
+                db_url = make_url(self.DATABASE_URL)
+            except Exception as exc:
+                raise ValueError(f"Invalid DATABASE_URL configuration: {exc}") from exc
+
+            db_password = db_url.password or ""
+            if (
+                not db_password
+                or db_password in INSECURE_PASSWORDS
+                or "local_development" in db_password
+            ):
+                raise ValueError(
+                    "Insecure default or development password detected in DATABASE_URL for production/staging"
+                )
+            if db_password != self.POSTGRES_PASSWORD:
+                raise ValueError(
+                    "Database credential mismatch: DATABASE_URL password does not match POSTGRES_PASSWORD"
+                )
+            if self.POSTGRES_USER and db_url.username != self.POSTGRES_USER:
+                raise ValueError(
+                    "Database credential mismatch: DATABASE_URL username does not match POSTGRES_USER"
+                )
+
+            # 4. DATABASE_SYNC_URL Validation (Synchronous URI for Alembic)
+            try:
+                sync_url = make_url(self.DATABASE_SYNC_URL)
+            except Exception as exc:
+                raise ValueError(f"Invalid DATABASE_SYNC_URL configuration: {exc}") from exc
+
+            sync_password = sync_url.password or ""
+            if (
+                not sync_password
+                or sync_password in INSECURE_PASSWORDS
+                or "local_development" in sync_password
+            ):
+                raise ValueError(
+                    "Insecure default or development password detected in DATABASE_SYNC_URL for production/staging"
+                )
+            if sync_password != self.POSTGRES_PASSWORD:
+                raise ValueError(
+                    "Database credential mismatch: DATABASE_SYNC_URL password does not match POSTGRES_PASSWORD"
+                )
+            if sync_password != db_password:
+                raise ValueError(
+                    "Database credential mismatch: DATABASE_URL and DATABASE_SYNC_URL passwords do not match"
+                )
+            if self.POSTGRES_USER and sync_url.username != self.POSTGRES_USER:
+                raise ValueError(
+                    "Database credential mismatch: DATABASE_SYNC_URL username does not match POSTGRES_USER"
+                )
+
+            # 5. Cookie Security
             if not self.COOKIE_SECURE:
                 raise ValueError("COOKIE_SECURE must be True in production/staging environments")
         return self

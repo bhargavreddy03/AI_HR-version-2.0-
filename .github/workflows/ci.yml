@@ -69,6 +69,7 @@ jobs:
           POSTGRES_USER: aihr_app_user
           POSTGRES_PASSWORD: test_password_only
           DATABASE_URL: postgresql+asyncpg://aihr_app_user:test_password_only@localhost:5432/ai_hr_db_test
+          DATABASE_SYNC_URL: postgresql://aihr_app_user:test_password_only@localhost:5432/ai_hr_db_test
         run: |
           cd backend
           pytest -v --cov=app --cov-report=term-missing

@@ -3,6 +3,8 @@
 Follows the Modular Monolith architecture approved in Step 2.
 """
 
+from __future__ import annotations
+
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -11,7 +13,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.router import api_v1_router
 from app.core.config import Settings, get_settings
-from app.core.database import close_database_connections, get_engine
+from app.core.database import (
+    close_database_connections,
+    get_engine,
+    get_session_factory,
+)
 from app.core.errors import register_exception_handlers
 from app.core.logging import setup_logging
 from app.core.middleware import CorrelationIdMiddleware
@@ -21,13 +27,16 @@ from app.core.redis import close_redis_connections, get_redis_client
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan context manager coordinating startup and shutdown events."""
-    setup_logging()
-    settings: Settings = getattr(app.state, "settings", get_settings())
+    settings: Settings = getattr(app.state, "settings", None) or get_settings()
+    setup_logging(settings)
 
-    # Initialize connection pools on startup
+    # Initialize connection pools on startup for non-testing environments
     if settings.ENVIRONMENT != "testing":
-        get_engine(settings)
-        get_redis_client(settings)
+        engine = get_engine(settings)
+        app.state.engine = engine
+        app.state.session_factory = get_session_factory(engine=engine, settings=settings)
+        redis_client = get_redis_client(settings)
+        app.state.redis_client = redis_client
 
     yield
 
@@ -39,6 +48,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 def create_application(settings: Settings | None = None) -> FastAPI:
     """Instantiate and configure the FastAPI modular monolith application."""
     app_settings = settings if settings is not None else get_settings()
+
+    # Configure structured logging for the application instance
+    setup_logging(app_settings)
 
     app = FastAPI(
         title=app_settings.APP_NAME,
@@ -54,7 +66,7 @@ def create_application(settings: Settings | None = None) -> FastAPI:
     app.state.settings = app_settings
 
     # 1. Register Request Correlation ID Middleware (outermost for accurate logging)
-    app.add_middleware(CorrelationIdMiddleware)
+    app.add_middleware(CorrelationIdMiddleware, settings=app_settings)
 
     # 2. Configure CORS Middleware with explicit environment origins
     if app_settings.BACKEND_CORS_ORIGINS:

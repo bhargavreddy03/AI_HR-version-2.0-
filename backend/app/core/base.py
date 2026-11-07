@@ -1,6 +1,6 @@
 """Declarative Base, metadata naming conventions, and common mixins for SQLAlchemy 2.x."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import MetaData, text
@@ -21,6 +21,11 @@ POSTGRES_NAMING_CONVENTION = {
 metadata = MetaData(naming_convention=POSTGRES_NAMING_CONVENTION)
 
 
+def utc_now() -> datetime:
+    """Return timezone-aware current UTC datetime."""
+    return datetime.now(UTC)
+
+
 class Base(AsyncAttrs, DeclarativeBase):
     """Abstract base model declaring standard metadata and naming conventions."""
 
@@ -28,18 +33,24 @@ class Base(AsyncAttrs, DeclarativeBase):
 
 
 class TimestampMixin:
-    """Standardized UTC timestamps using PostgreSQL TIMESTAMPTZ."""
+    """Standardized UTC timestamps using PostgreSQL TIMESTAMPTZ.
+
+    Eliminates naive datetimes by providing timezone-aware Python UTC defaults
+    and relying on PostgreSQL-side CURRENT_TIMESTAMP server defaults.
+    """
 
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         nullable=False,
+        default=utc_now,
         server_default=text("CURRENT_TIMESTAMP"),
     )
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         nullable=False,
+        default=utc_now,
         server_default=text("CURRENT_TIMESTAMP"),
-        onupdate=datetime.utcnow,
+        onupdate=utc_now,
     )
 
 

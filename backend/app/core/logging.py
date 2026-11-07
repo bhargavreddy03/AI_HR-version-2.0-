@@ -1,17 +1,19 @@
 """Structured logging configuration with correlation ID tracking."""
 
+from __future__ import annotations
+
 import logging
 import sys
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.middleware import CorrelationIdFilter
 
 
-def setup_logging() -> None:
+def setup_logging(settings: Settings | None = None) -> None:
     """Configure system-wide structured logging with correlation ID propagation."""
-    settings = get_settings()
+    cfg = settings or get_settings()
 
-    log_level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
+    log_level = getattr(logging, cfg.LOG_LEVEL.upper(), logging.INFO)
 
     log_format = "%(asctime)s | %(levelname)-8s | [%(correlation_id)s] | %(name)s:%(funcName)s:%(lineno)d - %(message)s"
 
@@ -27,7 +29,5 @@ def setup_logging() -> None:
 
     # Silence overly verbose third-party loggers
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-    logging.getLogger("sqlalchemy.engine").setLevel(
-        logging.INFO if settings.DEBUG else logging.WARNING
-    )
+    logging.getLogger("sqlalchemy.engine").setLevel(logging.INFO if cfg.DEBUG else logging.WARNING)
     logging.getLogger("asyncio").setLevel(logging.WARNING)

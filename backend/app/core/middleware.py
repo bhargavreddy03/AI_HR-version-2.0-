@@ -1,14 +1,18 @@
 """Request correlation ID tracking middleware and contextual log filters."""
 
+from __future__ import annotations
+
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
+from typing import Any
 
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 
 # Thread/Task-local context variable preserving the active request's correlation ID
 correlation_id_ctx: ContextVar[str] = ContextVar("correlation_id", default="")
@@ -28,12 +32,19 @@ class CorrelationIdFilter(logging.Filter):
 
 
 class CorrelationIdMiddleware(BaseHTTPMiddleware):
-    """FastAPI middleware tracking and propagating request correlation identifiers."""
+    """FastAPI middleware tracking and propagating request correlation identifiers.
+
+    Accepts an explicit Settings instance or resolves it dynamically from request.app.state.
+    """
+
+    def __init__(self, app: ASGIApp, settings: Settings | None = None, **kwargs: Any) -> None:
+        super().__init__(app, **kwargs)
+        self.settings = settings
 
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        settings = get_settings()
+        settings = self.settings or getattr(request.app.state, "settings", None) or get_settings()
 
         # Extract existing correlation ID from incoming request headers or generate a new UUIDv4
         header_correlation_id = (

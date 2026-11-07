@@ -1,10 +1,13 @@
 """SQLAlchemy 2.x asynchronous database engine, session lifecycle, and pool safety."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from fastapi import Request
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -21,31 +24,58 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
+def create_db_engine(settings: Settings) -> AsyncEngine:
+    """Create and configure a new AsyncEngine instance with pool safety listeners."""
+    engine = create_async_engine(
+        settings.DATABASE_URL,
+        echo=settings.DEBUG,
+        pool_size=settings.DB_POOL_SIZE,
+        max_overflow=settings.DB_MAX_OVERFLOW,
+        pool_timeout=settings.DB_POOL_TIMEOUT,
+        pool_recycle=settings.DB_POOL_RECYCLE,
+        pool_pre_ping=True,
+    )
+
+    # Connection Pool Defense-in-Depth Checkin Listener (Architecture 04 Section 4)
+    # Transaction-local settings (is_local=true) are automatically reverted by PostgreSQL
+    # upon transaction commit or rollback. This checkin hook provides defense-in-depth
+    # against accidental session-scoped settings on PostgreSQL connections.
+    # If clearing fails, the connection record is invalidated so tainted connections are never reused.
+    @event.listens_for(engine.sync_engine, "checkin")
+    def on_connection_checkin(dbapi_connection: Any, connection_record: Any) -> None:
+        if engine.dialect.name == "postgresql":
+            try:
+                if hasattr(dbapi_connection, "cursor"):
+                    with dbapi_connection.cursor() as cursor:
+                        cursor.execute("SELECT set_config('app.current_tenant_id', '', false);")
+            except Exception as exc:
+                logger.error(
+                    "Failed to reset tenant context on connection checkin: %s. Invalidating connection.",
+                    exc,
+                )
+                connection_record.invalidate(exc)
+                raise
+
+    return engine
+
+
+def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    """Create a new async_sessionmaker bound to the supplied engine."""
+    return async_sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+
+
 def get_engine(settings: Settings | None = None) -> AsyncEngine:
     """Return the global cached AsyncEngine instance or initialize a new one."""
     global _engine
-    if _engine is None:
-        cfg = settings or get_settings()
-        _engine = create_async_engine(
-            cfg.DATABASE_URL,
-            echo=cfg.DEBUG,
-            pool_size=cfg.DB_POOL_SIZE,
-            max_overflow=cfg.DB_MAX_OVERFLOW,
-            pool_timeout=cfg.DB_POOL_TIMEOUT,
-            pool_recycle=cfg.DB_POOL_RECYCLE,
-            pool_pre_ping=True,
-        )
+    cfg = settings or get_settings()
 
-        # Connection Pool Defense-in-Depth Reset Listener (Architecture 04 Section 4)
-        # Prevents cross-tenant context bleeding when reusing pooled connections
-        @event.listens_for(_engine.sync_engine, "reset")
-        def on_connection_reset(dbapi_connection: Any, connection_record: Any) -> None:
-            try:
-                with dbapi_connection.cursor() as cursor:
-                    cursor.execute("SELECT set_config('app.current_tenant_id', '', false);")
-            except Exception:
-                # SQLite or non-Postgres test engines may not support set_config
-                pass
+    if _engine is None or str(_engine.url) != cfg.DATABASE_URL:
+        _engine = create_db_engine(cfg)
 
     return _engine
 
@@ -55,23 +85,40 @@ def get_session_factory(
 ) -> async_sessionmaker[AsyncSession]:
     """Return the global cached async_sessionmaker factory."""
     global _session_factory
-    if _session_factory is None:
-        eng = engine or get_engine(settings=settings)
-        _session_factory = async_sessionmaker(
-            bind=eng,
-            class_=AsyncSession,
-            autoflush=False,
-            expire_on_commit=False,
-        )
+    eng = engine or get_engine(settings=settings)
+
+    if _session_factory is None or _session_factory.kw.get("bind") != eng:
+        _session_factory = create_session_factory(eng)
+
     return _session_factory
 
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
+async def get_db(
+    request: Request | None = None,
+) -> AsyncGenerator[AsyncSession, None]:
     """FastAPI dependency yielding an isolated, transaction-managed AsyncSession.
 
+    Prefers the session factory configured on the active application instance (request.app.state)
+    to prevent cross-application configuration leakage, falling back to the global factory.
     Commits on success; automatically rolls back on any exception before closing.
     """
-    factory = get_session_factory()
+    factory: async_sessionmaker[AsyncSession] | None = None
+
+    if request is not None and hasattr(request, "app"):
+        factory = getattr(request.app.state, "session_factory", None)
+        if factory is None:
+            app_settings = getattr(request.app.state, "settings", None)
+            engine = getattr(request.app.state, "engine", None)
+            if engine is None and app_settings is not None:
+                engine = get_engine(app_settings)
+                request.app.state.engine = engine
+            if engine is not None:
+                factory = get_session_factory(engine=engine, settings=app_settings)
+                request.app.state.session_factory = factory
+
+    if factory is None:
+        factory = get_session_factory()
+
     async with factory() as session:
         try:
             yield session
@@ -83,9 +130,12 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
-async def check_database_health(engine: AsyncEngine | None = None) -> bool:
+async def check_database_health(
+    engine: AsyncEngine | None = None,
+    settings: Settings | None = None,
+) -> bool:
     """Perform a live database probe (SELECT 1) with timeout protection."""
-    eng = engine or get_engine()
+    eng = engine or get_engine(settings=settings)
     try:
         async with asyncio.timeout(3.0):
             async with eng.connect() as conn:
