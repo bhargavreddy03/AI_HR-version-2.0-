@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -88,6 +88,23 @@ class Settings(BaseSettings):
     COOKIE_SAMESITE: str = Field(default="lax", description="SameSite cookie policy")
     COOKIE_DOMAIN: str = Field(default="localhost", description="Cookie domain boundary")
 
+    # Tracking & Correlation Headers
+    CORRELATION_ID_HEADER: str = Field(
+        default="X-Correlation-ID", description="Correlation tracking header"
+    )
+    REQUEST_ID_HEADER: str = Field(
+        default="X-Request-ID", description="Alternative request ID header"
+    )
+
+    # Argon2id Hashing Configuration (OWASP / AC-SEC-03 compliant: memory_cost >= 64MB)
+    ARGON2_TIME_COST: int = Field(default=3, description="Argon2id iteration count")
+    ARGON2_MEMORY_COST: int = Field(
+        default=65536, description="Argon2id memory cost in KiB (64 MB)"
+    )
+    ARGON2_PARALLELISM: int = Field(default=4, description="Argon2id parallelism lanes")
+    ARGON2_HASH_LEN: int = Field(default=32, description="Argon2id hash length")
+    ARGON2_SALT_LEN: int = Field(default=16, description="Argon2id salt length")
+
     # 6. Storage (AWS S3)
     AWS_REGION: str = Field(default="us-east-1", description="AWS Region")
     AWS_ACCESS_KEY_ID: str = Field(default="", description="AWS Access Key")
@@ -105,6 +122,22 @@ class Settings(BaseSettings):
     )
     EMBEDDING_DIMENSION: int = Field(default=1536, description="Vector dimension size")
     LLM_MODEL_NAME: str = Field(default="gpt-4o-mini", description="Default LLM model")
+
+    @model_validator(mode="after")
+    def validate_security_settings(self) -> "Settings":
+        """Enforce strict production secret safeguards and prevent insecure defaults."""
+        if self.ENVIRONMENT in ("production", "staging"):
+            if "local_development" in self.JWT_SECRET_KEY or len(self.JWT_SECRET_KEY) < 32:
+                raise ValueError(
+                    "Insecure or default JWT_SECRET_KEY detected for production/staging"
+                )
+            if "local_development" in self.POSTGRES_PASSWORD:
+                raise ValueError(
+                    "Insecure default POSTGRES_PASSWORD detected for production/staging"
+                )
+            if not self.COOKIE_SECURE:
+                raise ValueError("COOKIE_SECURE must be True in production/staging environments")
+        return self
 
 
 @lru_cache

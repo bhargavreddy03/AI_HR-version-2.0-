@@ -1,26 +1,39 @@
-"""FastAPI application factory and lifecycle entry point.
+"""FastAPI application factory, lifespan management, and middleware initialization.
 
 Follows the Modular Monolith architecture approved in Step 2.
 """
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any
 
-from fastapi import FastAPI, status
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.v1.router import api_v1_router
 from app.core.config import Settings, get_settings
+from app.core.database import close_database_connections, get_engine
+from app.core.errors import register_exception_handlers
 from app.core.logging import setup_logging
+from app.core.middleware import CorrelationIdMiddleware
+from app.core.redis import close_redis_connections, get_redis_client
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Application lifespan context manager for startup and shutdown events."""
+    """Application lifespan context manager coordinating startup and shutdown events."""
     setup_logging()
-    # Startup: Database engine and Redis connection pool verification will be initialized in Step 3.2+
+    settings: Settings = getattr(app.state, "settings", get_settings())
+
+    # Initialize connection pools on startup
+    if settings.ENVIRONMENT != "testing":
+        get_engine(settings)
+        get_redis_client(settings)
+
     yield
-    # Shutdown: Clean teardown of connection pools
+
+    # Clean teardown of connection pools during shutdown
+    await close_database_connections()
+    await close_redis_connections()
 
 
 def create_application(settings: Settings | None = None) -> FastAPI:
@@ -40,52 +53,24 @@ def create_application(settings: Settings | None = None) -> FastAPI:
     # Attach settings to application state
     app.state.settings = app_settings
 
-    # Configure CORS Middleware
+    # 1. Register Request Correlation ID Middleware (outermost for accurate logging)
+    app.add_middleware(CorrelationIdMiddleware)
+
+    # 2. Configure CORS Middleware with explicit environment origins
     if app_settings.BACKEND_CORS_ORIGINS:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=[str(origin) for origin in app_settings.BACKEND_CORS_ORIGINS],
             allow_credentials=True,
-            allow_methods=["*"],
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
             allow_headers=["*"],
         )
 
-    # System Health & Liveness Probes
-    @app.get(
-        "/api/v1/health",
-        tags=["System"],
-        summary="Service Liveness Probe",
-        status_code=status.HTTP_200_OK,
-    )
-    async def liveness_check() -> dict[str, Any]:
-        """Verify that the FastAPI service process is active and accepting requests."""
-        return {
-            "status": "healthy",
-            "environment": app_settings.ENVIRONMENT,
-            "version": app_settings.APP_VERSION,
-        }
+    # 3. Register Centralized RFC 7807 Exception Handlers
+    register_exception_handlers(app)
 
-    @app.get(
-        "/api/v1/health/ready",
-        tags=["System"],
-        summary="Service Readiness Probe",
-        status_code=status.HTTP_200_OK,
-    )
-    async def readiness_check() -> dict[str, Any]:
-        """Placeholder readiness probe distinguishing process readiness from infrastructure dependencies.
-
-        Real database and Redis connectivity probes will be implemented in Step 3.2.
-        Until Step 3.2 is reached, downstream dependencies are explicitly flagged as unverified/pending.
-        """
-        return {
-            "status": "not_ready",
-            "stage": "step_3_1_foundation",
-            "dependencies": {
-                "database": "pending_step_3_2_initialization",
-                "redis": "pending_step_3_2_initialization",
-            },
-            "message": "Service foundation online; downstream dependency health checks will be enabled in Step 3.2.",
-        }
+    # 4. Mount Versioned API Structure under /api/v1
+    app.include_router(api_v1_router)
 
     return app
 
