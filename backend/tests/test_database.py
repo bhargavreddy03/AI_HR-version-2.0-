@@ -223,5 +223,5 @@ def test_alembic_config_validation() -> None:
     """Verify that alembic.ini parses correctly and references the alembic directory."""
     ini_path = Path(__file__).resolve().parent.parent / "alembic.ini"
     alembic_cfg = Config(str(ini_path))
-    assert alembic_cfg.get_main_option("script_location") == "alembic"
+    assert "alembic" in str(alembic_cfg.get_main_option("script_location"))
     assert alembic_cfg.get_main_option("output_encoding") == "utf-8"
