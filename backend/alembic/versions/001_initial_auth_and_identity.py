@@ -311,8 +311,11 @@ def upgrade() -> None:
             RETURN NEW;
         END;
         $$ LANGUAGE plpgsql;
-
-        DROP TRIGGER IF EXISTS trg_enforce_membership_role_tenant ON organization_memberships;
+    """)
+    op.execute(
+        "DROP TRIGGER IF EXISTS trg_enforce_membership_role_tenant ON organization_memberships;"
+    )
+    op.execute("""
         CREATE TRIGGER trg_enforce_membership_role_tenant
             BEFORE INSERT OR UPDATE OF tenant_id, role_id ON organization_memberships
             FOR EACH ROW

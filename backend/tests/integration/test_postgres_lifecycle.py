@@ -329,6 +329,47 @@ def test_alembic_upgrade_head_and_revision_state(
         assert len(available_revisions) == 0
 
 
+class FakeIntegrationRedis:
+    """Mock Redis client providing set, get, delete, eval, incr, and expire for integration tests."""
+
+    def __init__(self, initial_data: dict[str, str] | None = None) -> None:
+        self.data: dict[str, str] = dict(initial_data or {})
+
+    async def get(self, key: str) -> str | None:
+        return self.data.get(key)
+
+    async def set(
+        self,
+        key: str,
+        value: str,
+        ex: int | None = None,
+        nx: bool = False,
+        **kwargs: object,
+    ) -> bool:
+        if nx and key in self.data:
+            return False
+        self.data[key] = str(value)
+        return True
+
+    async def delete(self, *keys: str) -> int:
+        count = 0
+        for k in keys:
+            if self.data.pop(k, None) is not None:
+                count += 1
+        return count
+
+    async def incr(self, key: str) -> int:
+        val = int(self.data.get(key, "0")) + 1
+        self.data[key] = str(val)
+        return val
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        return True
+
+    async def eval(self, script: str, numkeys: int, *args: object) -> int:
+        return 1
+
+
 @skip_if_no_postgres
 @pytest.mark.asyncio
 async def test_postgres_concurrent_refresh_token_rotation_serializes_and_detects_reuse(
@@ -366,18 +407,7 @@ async def test_postgres_concurrent_refresh_token_rotation_serializes_and_detects
             session.add(user_session)
             await session.commit()
 
-        class FakeRedisClient:
-            def __init__(self) -> None:
-                self.data: dict[str, str] = {}
-
-            async def delete(self, *keys: str) -> None:
-                for k in keys:
-                    self.data.pop(k, None)
-
-            async def eval(self, script: str, numkeys: int, *args: object) -> int:
-                return 1
-
-        fake_redis = FakeRedisClient()
+        fake_redis = FakeIntegrationRedis()
 
         async def do_refresh() -> dict[str, object]:
             async with session_factory() as sess:
@@ -454,27 +484,12 @@ async def test_postgres_concurrent_backup_code_redemption_serializes(
             }
         )
 
-        class FakeRedisClient:
-            def __init__(self) -> None:
-                self.data: dict[str, str] = {
-                    f"mfa_challenge:{challenge_token_1}": challenge_payload,
-                    f"mfa_challenge:{challenge_token_2}": challenge_payload,
-                }
-
-            async def get(self, key: str) -> str | None:
-                return self.data.get(key)
-
-            async def delete(self, *keys: str) -> None:
-                for k in keys:
-                    self.data.pop(k, None)
-
-            async def set(self, key: str, value: str, ex: int | None = None) -> None:
-                self.data[key] = value
-
-            async def eval(self, script: str, numkeys: int, *args: object) -> int:
-                return 1
-
-        fake_redis = FakeRedisClient()
+        fake_redis = FakeIntegrationRedis(
+            {
+                f"mfa_challenge:{challenge_token_1}": challenge_payload,
+                f"mfa_challenge:{challenge_token_2}": challenge_payload,
+            }
+        )
 
         async def do_verify(token: str) -> dict[str, object]:
             async with session_factory() as sess:
