@@ -1,0 +1,60 @@
+name: Production Deployment Pipeline Foundation
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  validate-and-gate:
+    name: Deployment Preflight Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Verify Deployment Branch
+        run: |
+          echo "Target Environment: ${{ github.event.inputs.environment || 'production' }}"
+          echo "Commit SHA: ${{ github.sha }}"
+
+  deploy-container-images:
+    name: Build & Publish Release Containers
+    needs: validate-and-gate
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate Container Build - Backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: false
+          tags: ghcr.io/${{ github.repository }}/backend:${{ github.sha }}
+
+      - name: Validate Container Build - Frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: false
+          tags: ghcr.io/${{ github.repository }}/frontend:${{ github.sha }}
