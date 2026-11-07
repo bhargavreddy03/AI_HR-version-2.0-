@@ -120,6 +120,7 @@ jobs:
 
       - name: Validate Docker Compose Configuration
         run: |
+          cp .env.example .env
           docker compose -f infrastructure/docker/docker-compose.yml config --quiet
 
       - name: Set up Docker Buildx
