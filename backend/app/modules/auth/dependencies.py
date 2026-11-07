@@ -263,6 +263,19 @@ async def authenticate_request_pipeline(
         # Micro-Validation: Check if 30s elapsed since last DB verification
         last_db_verified_at = session_data.get("last_db_verified_at", 0)
         if now_ts - last_db_verified_at > 30:
+            # 1. Authoritative UserSession verification against PostgreSQL
+            try:
+                await execute_authoritative_session_check(
+                    db=db,
+                    session_id=session_id,
+                    user_id=user_id,
+                    token_version=jwt_claims.token_version,
+                )
+            except AuthenticationException:
+                await delete_session(redis, user_id, session_id)
+                raise
+
+            # 2. Authoritative 6-dimension user, membership, role, and organization verification
             db_state = await execute_authoritative_6_dim_check(db, user_id, tenant_id)
 
             # Invalidation Barrier Check

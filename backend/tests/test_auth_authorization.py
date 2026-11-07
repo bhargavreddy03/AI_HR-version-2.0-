@@ -1,6 +1,6 @@
 """Unit tests for multi-tenant authorization, version fences, RBAC dependencies, and fail-closed behaviors."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -486,3 +486,66 @@ async def test_monotonic_role_version_fence_and_targeted_session_eviction() -> N
     )
     assert res_higher is True
     assert fake_redis.store[f"org_current_role_version:{tenant_id}:{u1}"] == "3"
+
+
+def test_state_a_micro_validation_rejects_revoked_session_and_evicts_redis(
+    authz_app: tuple[TestClient, AsyncMock, FakeRedis, Settings],
+) -> None:
+    """Verify that State A micro-validation (>30s) validates session against PostgreSQL and evicts Redis on revocation."""
+    client, mock_db, fake_redis, settings = authz_app
+
+    user_id = uuid4()
+    session_id = uuid4()
+    tenant_id = uuid4()
+
+    token = create_access_token(
+        user_id=user_id,
+        session_id=session_id,
+        tenant_id=tenant_id,
+        role="recruiter",
+        permissions=["jobs:create"],
+        token_version=1,
+        role_version=1,
+        is_super_admin=False,
+        settings=settings,
+    )
+    client.cookies.set(COOKIE_ACCESS, token)
+
+    # Prepopulate Redis session where last_db_verified_at was 45s ago (> 30s threshold)
+    import time
+
+    elapsed = time.time() - 45.0
+    fake_redis.store[f"session:{user_id}:{session_id}"] = (
+        f'{{"token_version": 1, "role_version": 1, "last_db_verified_at": {elapsed}}}'
+    )
+    fake_redis.store[f"user_current_token_version:{user_id}"] = "1"
+    fake_redis.store[f"org_current_role_version:{tenant_id}:{user_id}"] = "1"
+
+    # Mock DB query for user_sessions returning revoked session
+    from app.modules.auth.models import UserSession
+
+    revoked_session = UserSession(
+        id=session_id,
+        user_id=user_id,
+        tenant_id=tenant_id,
+        refresh_token_hash="dummy_hash",
+        token_version=1,
+        is_revoked=True,  # Revoked in DB!
+        expires_at=datetime.now(UTC) + timedelta(days=7),
+    )
+
+    def mock_execute(stmt: Any, *args: Any, **kwargs: Any) -> MagicMock:
+        stmt_str = str(stmt)
+        res = MagicMock()
+        if "user_sessions" in stmt_str:
+            res.scalar_one_or_none.return_value = revoked_session
+            return res
+        return res
+
+    mock_db.execute = AsyncMock(side_effect=mock_execute)
+
+    res = client.get("/test-protected/permission-jobs-create")
+    assert res.status_code == status.HTTP_401_UNAUTHORIZED
+    assert res.json()["code"] == "SESSION_REVOKED"
+    # Redis session must be evicted
+    assert f"session:{user_id}:{session_id}" not in fake_redis.store

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from starlette.requests import Request
 
 from alembic import command
 from alembic.config import Config
@@ -35,7 +37,11 @@ from app.modules.auth.crypto import (
     hash_token,
     verify_backup_code,
 )
-from app.modules.auth.dependencies import execute_authoritative_session_check
+from app.modules.auth.dependencies import (
+    authenticate_request_pipeline,
+    execute_authoritative_session_check,
+)
+from app.modules.auth.jwt import COOKIE_ACCESS, create_access_token
 from app.modules.auth.models import (
     SessionTokenHistory,
     User,
@@ -845,5 +851,184 @@ async def test_postgres_token_history_multi_rotation_and_old_token_reuse_detecte
                 .all()
             )
             assert len(remaining_history) == 0
+    finally:
+        await engine.dispose()
+
+
+@skip_if_no_postgres
+@pytest.mark.asyncio
+async def test_postgres_state_a_micro_validation_rejects_revoked_and_expired_session(
+    integration_settings: Settings,
+) -> None:
+    """Verify State A micro-validation (>30s) validates session against PostgreSQL, rejecting revoked/expired sessions and evicting Redis."""
+    engine = create_db_engine(integration_settings)
+    session_factory = create_session_factory(engine)
+
+    user_id = generate_uuid7()
+    session_id_revoked = generate_uuid7()
+    session_id_expired = generate_uuid7()
+    session_id_valid = generate_uuid7()
+
+    token_str = generate_secure_token(32)
+    token_h = hash_token(token_str)
+
+    fake_redis = FakeIntegrationRedis()
+
+    try:
+        async with session_factory() as session:
+            user = User(
+                id=user_id,
+                email=f"state_a_{user_id.hex[:8]}@example.com",
+                password_hash=hash_password("SuperSecretPass123!"),
+                first_name="StateA",
+                last_name="Tester",
+                is_active=True,
+                token_version=1,
+            )
+            # Session 1: Revoked in DB
+            sess_revoked = UserSession(
+                id=session_id_revoked,
+                user_id=user_id,
+                refresh_token_hash=token_h,
+                token_version=1,
+                is_revoked=True,
+                expires_at=utc_now() + timedelta(days=7),
+            )
+            # Session 2: Expired in DB
+            sess_expired = UserSession(
+                id=session_id_expired,
+                user_id=user_id,
+                refresh_token_hash=token_h,
+                token_version=1,
+                is_revoked=False,
+                expires_at=utc_now() - timedelta(days=1),
+            )
+            # Session 3: Valid in DB
+            sess_valid = UserSession(
+                id=session_id_valid,
+                user_id=user_id,
+                refresh_token_hash=token_h,
+                token_version=1,
+                is_revoked=False,
+                expires_at=utc_now() + timedelta(days=7),
+            )
+            session.add_all([user, sess_revoked, sess_expired, sess_valid])
+            await session.commit()
+
+        # Prepopulate Redis with cached sessions where last_db_verified_at was 35s ago (> 30s micro-validation threshold)
+        now_ts = time.time()
+        elapsed_ts = now_ts - 35.0
+
+        fake_redis.data[f"session:{user_id}:{session_id_revoked}"] = json.dumps(
+            {"token_version": 1, "role_version": 1, "last_db_verified_at": elapsed_ts}
+        )
+        fake_redis.data[f"session:{user_id}:{session_id_expired}"] = json.dumps(
+            {"token_version": 1, "role_version": 1, "last_db_verified_at": elapsed_ts}
+        )
+        fake_redis.data[f"session:{user_id}:{session_id_valid}"] = json.dumps(
+            {"token_version": 1, "role_version": 1, "last_db_verified_at": elapsed_ts}
+        )
+        fake_redis.data[f"user_current_token_version:{user_id}"] = "1"
+
+        # 1. Test Revoked Session: Cache hit in Redis, but micro-validation finds is_revoked = True in PostgreSQL
+        jwt_revoked = create_access_token(
+            user_id=user_id,
+            session_id=session_id_revoked,
+            tenant_id=None,
+            role="candidate",
+            permissions=[],
+            token_version=1,
+            role_version=1,
+            is_super_admin=False,
+            settings=integration_settings,
+        )
+        req_revoked = Request(
+            scope={
+                "type": "http",
+                "method": "GET",
+                "path": "/api/v1/auth/me",
+                "headers": [(b"cookie", f"{COOKIE_ACCESS}={jwt_revoked}".encode())],
+            }
+        )
+
+        async with session_factory() as session:
+            with pytest.raises(AuthenticationException) as exc_info:
+                await authenticate_request_pipeline(
+                    request=req_revoked,
+                    db=session,
+                    redis=fake_redis,  # type: ignore[arg-type]
+                    settings=integration_settings,
+                )
+            assert exc_info.value.code == "SESSION_REVOKED"
+            # Redis session must be evicted
+            assert f"session:{user_id}:{session_id_revoked}" not in fake_redis.data
+
+        # 2. Test Expired Session: Cache hit in Redis, but micro-validation finds expires_at < now in PostgreSQL
+        jwt_expired = create_access_token(
+            user_id=user_id,
+            session_id=session_id_expired,
+            tenant_id=None,
+            role="candidate",
+            permissions=[],
+            token_version=1,
+            role_version=1,
+            is_super_admin=False,
+            settings=integration_settings,
+        )
+        req_expired = Request(
+            scope={
+                "type": "http",
+                "method": "GET",
+                "path": "/api/v1/auth/me",
+                "headers": [(b"cookie", f"{COOKIE_ACCESS}={jwt_expired}".encode())],
+            }
+        )
+
+        async with session_factory() as session:
+            with pytest.raises(AuthenticationException) as exc_info:
+                await authenticate_request_pipeline(
+                    request=req_expired,
+                    db=session,
+                    redis=fake_redis,  # type: ignore[arg-type]
+                    settings=integration_settings,
+                )
+            assert exc_info.value.code == "SESSION_EXPIRED"
+            # Redis session must be evicted
+            assert f"session:{user_id}:{session_id_expired}" not in fake_redis.data
+
+        # 3. Test Valid Session: Passes micro-validation and updates last_db_verified_at in Redis
+        jwt_valid = create_access_token(
+            user_id=user_id,
+            session_id=session_id_valid,
+            tenant_id=None,
+            role="candidate",
+            permissions=[],
+            token_version=1,
+            role_version=1,
+            is_super_admin=False,
+            settings=integration_settings,
+        )
+        req_valid = Request(
+            scope={
+                "type": "http",
+                "method": "GET",
+                "path": "/api/v1/auth/me",
+                "headers": [(b"cookie", f"{COOKIE_ACCESS}={jwt_valid}".encode())],
+            }
+        )
+
+        async with session_factory() as session:
+            sec_ctx = await authenticate_request_pipeline(
+                request=req_valid,
+                db=session,
+                redis=fake_redis,  # type: ignore[arg-type]
+                settings=integration_settings,
+            )
+            assert sec_ctx.user_id == user_id
+            assert sec_ctx.session_id == session_id_valid
+            # Redis session still present and touched
+            assert f"session:{user_id}:{session_id_valid}" in fake_redis.data
+            updated_data = json.loads(fake_redis.data[f"session:{user_id}:{session_id_valid}"])
+            assert updated_data["last_db_verified_at"] > elapsed_ts
     finally:
         await engine.dispose()

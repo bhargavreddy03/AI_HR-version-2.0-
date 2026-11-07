@@ -111,14 +111,23 @@ Layer 2: Server-Side Session & Exact Version Fence Check (Redis)
         │
         ▼
 Layer 3: Bounded Micro-Validation (>30s) or State C (Redis Outage) Fallback
-        ├─► Authoritative Session Validation in PostgreSQL:
-        │     1. user_sessions.id == token.session_id AND user_sessions.user_id == token.user_id
-        │     2. NOT user_sessions.is_revoked (Rejects revoked sessions during Redis outage)
-        │     3. user_sessions.expires_at >= NOW() (Rejects expired sessions)
-        │     4. user_sessions.token_version == token.token_version
-        │     5. users.is_active AND users.token_version == token.token_version
-        │     6. organization_memberships.is_active AND role_version == token.role_version
-        │     7. organizations.status == 'active'
+        ├─► State A (Interval > 30s elapsed since last DB verification):
+        │     1. execute_authoritative_session_check(db, session_id, user_id, token_version):
+        │        - Validates user_sessions.id == session_id AND user_sessions.user_id == user_id
+        │        - Rejects missing, revoked (is_revoked = True), expired (expires_at < now), or version-stale sessions
+        │        - On failure: Immediately evicts cached Redis session (delete_session) and raises 401
+        │     2. execute_authoritative_6_dim_check(db, user_id, tenant_id):
+        │        - Validates user.is_active, user.token_version, force_authoritative_check barrier
+        │        - Validates membership.is_active, role_version, organization.status == 'active'
+        │        - On failure: Evicts cached Redis session and raises 401 / 403
+        │     3. On all checks passing: Touches last_db_verified_at timestamp in Redis
+        │
+        ├─► State C (Redis Unavailable / Timeout Fallback):
+        │     1. execute_authoritative_session_check(db, session_id, user_id, token_version):
+        │        - Direct PostgreSQL validation against user_sessions
+        │        - Rejects missing, revoked, expired, or version-mismatched sessions
+        │     2. execute_authoritative_6_dim_check(db, user_id, tenant_id):
+        │        - Authoritative validation of user, membership, role, and organization status
         │
         ▼
 Layer 4: Tenant Scope & RLS Context Binding
@@ -204,7 +213,7 @@ A comprehensive test suite of 85 security unit and integration tests:
    - Refresh token rotation and reuse detection invalidating sessions (`TOKEN_REUSE_DETECTED`).
    - Single-session logout revoking database session and deleting Redis cache.
 
-5. **`backend/tests/test_auth_authorization.py`** (8 tests):
+5. **`backend/tests/test_auth_authorization.py`** (9 tests):
    - Capability-based permission checks (`require_permission`).
    - Exact version fence rejection of stale tokens (`TOKEN_VERSION_STALE`).
    - State-B negative assertion: cache miss rejects with 401 without querying PostgreSQL.
@@ -213,6 +222,7 @@ A comprehensive test suite of 85 security unit and integration tests:
    - Monotonic version fence cannot regress under concurrent race conditions.
    - Cross-tenant role assignment rejection during organization switch.
    - Targeted user session eviction via corrected Lua script leaving unrelated users untouched.
+   - State A micro-validation (>30s) session check against PostgreSQL rejecting revoked sessions and evicting Redis.
 
 6. **`backend/tests/test_config.py`** (8 tests):
    - Rejection of default secrets in production.
@@ -220,7 +230,7 @@ A comprehensive test suite of 85 security unit and integration tests:
    - Independent validation of `MFA_ENCRYPTION_KEY` preventing reuse of `JWT_SECRET_KEY`.
    - Independent validation of `BACKUP_CODE_PEPPER` (length >= 32 chars, distinct from JWT and MFA keys).
 
-7. **`backend/tests/integration/test_postgres_lifecycle.py`** (11 tests):
+7. **`backend/tests/integration/test_postgres_lifecycle.py`** (12 tests):
    - PostgreSQL connection and session lifecycle.
    - Commit and rollback mechanics.
    - Transaction-local tenant context isolation (`is_local=True`).
@@ -231,10 +241,11 @@ A comprehensive test suite of 85 security unit and integration tests:
    - Cross-tenant role assignment database trigger rejection.
    - State C Redis outage: authoritative `user_sessions` validation rejects revoked, expired, or version-mismatched sessions.
    - Multi-generation token rotation (A → B → C) and full-lifetime reuse detection of Token A with CASCADE history cleanup.
+   - State A micro-validation (>30s): validates session against live PostgreSQL, rejects revoked and expired sessions with immediate Redis cache eviction, and touches valid sessions.
 
 ### Verification Summary
 - **Python Compilation**: 0 errors (`compileall`).
 - **Code Linter**: `ruff check` passed with 0 errors.
 - **Code Formatter**: `ruff format --check` passed across 54 files.
 - **Static Type Safety**: `mypy --config-file backend/pyproject.toml backend/app` passed with 0 errors across 36 source files.
-- **Pytest Suite**: 74 passed, 11 skipped (container PostgreSQL integration tests skip locally without host DB, execute in GitHub Actions CI), 0 failures. Backend statement coverage: 81%.
+- **Pytest Suite**: 75 passed, 12 skipped (container PostgreSQL integration tests skip locally without host DB, execute in GitHub Actions CI), 0 failures. Backend statement coverage: 81%.
