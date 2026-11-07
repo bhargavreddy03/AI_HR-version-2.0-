@@ -19,7 +19,11 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from app.core.base import generate_uuid7, utc_now
 from app.core.config import Settings
-from app.core.database import create_db_engine, register_pool_cleanup_listener
+from app.core.database import (
+    create_db_engine,
+    create_session_factory,
+    register_pool_cleanup_listener,
+)
 from app.core.errors import AuthenticationException
 from app.core.security import hash_password, set_tenant_context
 from app.modules.auth.crypto import (
@@ -114,7 +118,7 @@ async def test_postgres_connection_and_session_lifecycle(
 ) -> None:
     """Verify live database connectivity, session creation, query execution, and clean teardown."""
     engine = create_db_engine(integration_settings)
-    session_factory = async_sessionmaker(bind=engine, class_=AsyncSession, autoflush=False)
+    session_factory = create_session_factory(engine)
 
     try:
         async with session_factory() as session:
@@ -133,7 +137,7 @@ async def test_postgres_commit_and_rollback_behavior(
 ) -> None:
     """Verify transaction commit and rollback mechanics against PostgreSQL."""
     engine = create_db_engine(integration_settings)
-    session_factory = async_sessionmaker(bind=engine, class_=AsyncSession, autoflush=False)
+    session_factory = create_session_factory(engine)
 
     try:
         # Step 1: Create a temporary table and commit row A
@@ -171,7 +175,7 @@ async def test_postgres_transaction_local_tenant_context(
 ) -> None:
     """Verify that set_tenant_context sets app.current_tenant_id locally and clears on commit."""
     engine = create_db_engine(integration_settings)
-    session_factory = async_sessionmaker(bind=engine, class_=AsyncSession, autoflush=False)
+    session_factory = create_session_factory(engine)
 
     tenant_id = uuid.uuid4()
 
@@ -377,7 +381,7 @@ async def test_postgres_concurrent_refresh_token_rotation_serializes_and_detects
 ) -> None:
     """Verify that concurrent refresh token rotations serialize via row lock and detect token reuse."""
     engine = create_db_engine(integration_settings)
-    session_factory = async_sessionmaker(bind=engine, class_=AsyncSession, autoflush=False)
+    session_factory = create_session_factory(engine)
 
     user_id = generate_uuid7()
     session_id = generate_uuid7()
@@ -446,7 +450,7 @@ async def test_postgres_concurrent_backup_code_redemption_serializes(
 ) -> None:
     """Verify that concurrent backup code redemptions serialize via row lock and prevent double-consumption."""
     engine = create_db_engine(integration_settings)
-    session_factory = async_sessionmaker(bind=engine, class_=AsyncSession, autoflush=False)
+    session_factory = create_session_factory(engine)
 
     user_id = generate_uuid7()
     backup_codes = generate_backup_codes(count=10)
@@ -532,7 +536,7 @@ async def test_postgres_cross_tenant_role_assignment_trigger_rejection(
 ) -> None:
     """Verify that PostgreSQL trigger trg_enforce_membership_role_tenant rejects cross-tenant role assignment."""
     engine = create_db_engine(integration_settings)
-    session_factory = async_sessionmaker(bind=engine, class_=AsyncSession, autoflush=False)
+    session_factory = create_session_factory(engine)
 
     tenant_a_id = generate_uuid7()
     tenant_b_id = generate_uuid7()

@@ -300,13 +300,23 @@ async def create_authenticated_session(
     now = utc_now()
     refresh_expires_at = now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
 
+    # Capture attributes before commit to prevent lazy-load MissingGreenlet across commit
+    u_id = user.id
+    u_token_ver = user.token_version or 1
+    u_is_active = bool(user.is_active)
+    u_is_super = bool(user.is_super_admin)
+    u_email = user.email
+    u_first = user.first_name
+    u_last = user.last_name
+    u_mfa_enabled = bool(user.mfa_enabled)
+
     # 1. Persist UserSession in PostgreSQL
     db_session = UserSession(
         id=session_id,
-        user_id=user.id,
+        user_id=u_id,
         tenant_id=tenant_id,
         refresh_token_hash=refresh_token_hash,
-        token_version=user.token_version,
+        token_version=u_token_ver,
         ip_address=client_ip[:45] if client_ip else None,
         user_agent=user_agent[:512] if user_agent else None,
         is_revoked=False,
@@ -319,49 +329,49 @@ async def create_authenticated_session(
     # 2. Persist Session & Version Fences in Redis (Architecture Document 07)
     session_data = {
         "session_id": str(session_id),
-        "user_id": str(user.id),
+        "user_id": str(u_id),
         "tenant_id": str(tenant_id) if tenant_id else None,
         "role": role_name,
-        "token_version": user.token_version,
+        "token_version": u_token_ver,
         "role_version": role_version,
-        "user_status": user.is_active,
+        "user_status": u_is_active,
         "membership_active": True,
         "last_db_verified_at": now.timestamp(),
         "created_at": now.timestamp(),
     }
     ttl_seconds = settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400
-    await store_session(redis, user.id, session_id, session_data, ttl_seconds=ttl_seconds)
+    await store_session(redis, u_id, session_id, session_data, ttl_seconds=ttl_seconds)
     await set_version_fences_if_absent(
         redis,
-        user_id=user.id,
-        token_version=user.token_version or 1,
+        user_id=u_id,
+        token_version=u_token_ver,
         tenant_id=tenant_id,
         role_version=role_version,
     )
 
     # 3. Create short-lived JWT Access Token
     access_token = create_access_token(
-        user_id=user.id,
+        user_id=u_id,
         session_id=session_id,
         tenant_id=tenant_id,
         role=role_name,
         permissions=permissions,
-        token_version=user.token_version,
+        token_version=u_token_ver,
         role_version=role_version,
-        is_super_admin=user.is_super_admin,
+        is_super_admin=u_is_super,
         settings=settings,
     )
 
     user_response = UserResponse(
-        id=user.id,
-        email=user.email,
-        first_name=user.first_name,
-        last_name=user.last_name,
+        id=u_id,
+        email=u_email,
+        first_name=u_first,
+        last_name=u_last,
         active_tenant_id=tenant_id,
         role=role_name,
         permissions=permissions,
-        mfa_enabled=bool(user.mfa_enabled),
-        is_active=bool(user.is_active),
+        mfa_enabled=u_mfa_enabled,
+        is_active=u_is_active,
     )
 
     return {
@@ -558,49 +568,62 @@ async def refresh_session_tokens(
     session_rec.refresh_token_hash = hash_token(new_refresh_token)
     session_rec.expires_at = now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
     session_rec.ip_address = client_ip[:45] if client_ip else session_rec.ip_address
+
+    # Capture attributes before commit to prevent lazy-load MissingGreenlet across commit
+    sess_id = session_rec.id
+    u_id = user.id
+    u_token_ver = user.token_version or 1
+    u_is_active = bool(user.is_active)
+    u_is_super = bool(user.is_super_admin)
+    u_email = user.email
+    u_first = user.first_name
+    u_last = user.last_name
+    u_mfa_enabled = bool(user.mfa_enabled)
+    sess_created_at_ts = (
+        session_rec.created_at.timestamp() if session_rec.created_at else now.timestamp()
+    )
+
     await db.commit()
 
     # Update session in Redis
     session_data = {
-        "session_id": str(session_rec.id),
-        "user_id": str(user.id),
+        "session_id": str(sess_id),
+        "user_id": str(u_id),
         "tenant_id": str(tenant_id) if tenant_id else None,
         "role": role_name,
-        "token_version": user.token_version,
+        "token_version": u_token_ver,
         "role_version": role_version,
-        "user_status": user.is_active,
+        "user_status": u_is_active,
         "membership_active": True,
         "last_db_verified_at": now.timestamp(),
-        "created_at": (
-            session_rec.created_at.timestamp() if session_rec.created_at else now.timestamp()
-        ),
+        "created_at": sess_created_at_ts,
     }
     ttl_seconds = settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400
-    await store_session(redis, user.id, session_rec.id, session_data, ttl_seconds=ttl_seconds)
+    await store_session(redis, u_id, sess_id, session_data, ttl_seconds=ttl_seconds)
 
     # Issue fresh short-lived JWT Access Token
     access_token = create_access_token(
-        user_id=user.id,
-        session_id=session_rec.id,
+        user_id=u_id,
+        session_id=sess_id,
         tenant_id=tenant_id,
         role=role_name,
         permissions=permissions,
-        token_version=user.token_version,
+        token_version=u_token_ver,
         role_version=role_version,
-        is_super_admin=user.is_super_admin,
+        is_super_admin=u_is_super,
         settings=settings,
     )
 
     user_response = UserResponse(
-        id=user.id,
-        email=user.email,
-        first_name=user.first_name,
-        last_name=user.last_name,
+        id=u_id,
+        email=u_email,
+        first_name=u_first,
+        last_name=u_last,
         active_tenant_id=tenant_id,
         role=role_name,
         permissions=permissions,
-        mfa_enabled=bool(user.mfa_enabled),
-        is_active=bool(user.is_active),
+        mfa_enabled=u_mfa_enabled,
+        is_active=u_is_active,
     )
 
     return {
