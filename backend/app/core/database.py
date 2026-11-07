@@ -46,8 +46,12 @@ def create_db_engine(settings: Settings) -> AsyncEngine:
         if engine.dialect.name == "postgresql":
             try:
                 if hasattr(dbapi_connection, "cursor"):
-                    with dbapi_connection.cursor() as cursor:
+                    cursor = dbapi_connection.cursor()
+                    try:
                         cursor.execute("SELECT set_config('app.current_tenant_id', '', false);")
+                    finally:
+                        if hasattr(cursor, "close"):
+                            cursor.close()
             except Exception as exc:
                 logger.error(
                     "Failed to reset tenant context on connection checkin: %s. Invalidating connection.",

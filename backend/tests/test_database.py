@@ -207,7 +207,7 @@ def test_pool_checkin_listener_failure_invalidates_connection(test_settings: Set
     mock_conn = MagicMock()
     mock_cursor = MagicMock()
     mock_cursor.execute.side_effect = RuntimeError("Connection dropped during reset")
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.cursor.return_value = mock_cursor
 
     mock_record = MagicMock()
 
