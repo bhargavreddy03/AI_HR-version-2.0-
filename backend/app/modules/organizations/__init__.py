@@ -1,4 +1,17 @@
-"""Domain Module: Organizations
+"""Organizations, memberships, and RBAC module exports."""
 
-Multi-tenant organizations, departments, roles, and membership management.
-"""
+from app.modules.organizations.models import (
+    Organization,
+    OrganizationMembership,
+    Permission,
+    Role,
+    RolePermission,
+)
+
+__all__ = [
+    "Organization",
+    "Role",
+    "Permission",
+    "RolePermission",
+    "OrganizationMembership",
+]

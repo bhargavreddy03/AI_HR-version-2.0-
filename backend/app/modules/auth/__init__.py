@@ -1,4 +1,15 @@
-"""Domain Module: Auth
+"""Authentication and identity module exports."""
 
-Identity, credentials, session management, and JWT token issuance.
-"""
+from app.modules.auth.models import (
+    AuthRevocationOutbox,
+    CandidateUserProfile,
+    User,
+    UserSession,
+)
+
+__all__ = [
+    "User",
+    "CandidateUserProfile",
+    "UserSession",
+    "AuthRevocationOutbox",
+]

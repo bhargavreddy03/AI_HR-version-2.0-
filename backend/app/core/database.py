@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, cast
 
 from fastapi import Request
 from sqlalchemy import event, text
@@ -109,7 +109,7 @@ def get_session_factory(
 
 
 async def get_db(
-    request: Request | None = None,
+    request: Request = cast(Request, None),
 ) -> AsyncGenerator[AsyncSession, None]:
     """FastAPI dependency yielding an isolated, transaction-managed AsyncSession.
 

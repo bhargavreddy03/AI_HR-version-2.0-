@@ -64,11 +64,12 @@ class AppException(Exception):
         detail: str | None = None,
         invalid_params: list[InvalidParam] | None = None,
         error_type: str = "https://api.ai-hr.com/v1/errors/INTERNAL_ERROR",
+        error_code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
-        self.code = code
+        self.code = error_code or code
         self.detail = detail or message
         self.invalid_params = invalid_params
         self.error_type = error_type
@@ -95,11 +96,16 @@ class EntityNotFoundException(AppException):
 class ConflictException(AppException):
     """Raised when an operation conflicts with existing entity state."""
 
-    def __init__(self, message: str, code: str = "ERR_CONFLICT") -> None:
+    def __init__(
+        self,
+        message: str,
+        code: str = "ERR_CONFLICT",
+        error_code: str | None = None,
+    ) -> None:
         super().__init__(
             message=message,
             status_code=status.HTTP_409_CONFLICT,
-            code=code,
+            code=error_code or code,
             detail=message,
             error_type="https://api.ai-hr.com/v1/errors/CONFLICT",
         )
@@ -112,11 +118,12 @@ class AuthenticationException(AppException):
         self,
         message: str = "Authentication credentials missing or invalid",
         code: str = "ERR_UNAUTHORIZED",
+        error_code: str | None = None,
     ) -> None:
         super().__init__(
             message=message,
             status_code=status.HTTP_401_UNAUTHORIZED,
-            code=code,
+            code=error_code or code,
             detail=message,
             error_type="https://api.ai-hr.com/v1/errors/UNAUTHORIZED",
         )
@@ -129,11 +136,12 @@ class AuthorizationException(AppException):
         self,
         message: str = "Forbidden: Insufficient privileges for requested operation",
         code: str = "ERR_FORBIDDEN",
+        error_code: str | None = None,
     ) -> None:
         super().__init__(
             message=message,
             status_code=status.HTTP_403_FORBIDDEN,
-            code=code,
+            code=error_code or code,
             detail=message,
             error_type="https://api.ai-hr.com/v1/errors/FORBIDDEN",
         )
@@ -149,14 +157,73 @@ class TenantAccessForbiddenException(AuthorizationException):
         )
 
 
+class ValidationException(AppException):
+    """Raised when domain business validation fails."""
+
+    def __init__(
+        self,
+        message: str = "Validation failed",
+        code: str = "ERR_VALIDATION",
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(
+            message=message,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code=error_code or code,
+            detail=message,
+            error_type="https://api.ai-hr.com/v1/errors/VALIDATION_ERROR",
+        )
+
+
+class RateLimitException(AppException):
+    """Raised when request frequency exceeds rate limiting thresholds."""
+
+    def __init__(
+        self,
+        message: str = "Too many requests",
+        code: str = "ERR_RATE_LIMIT_EXCEEDED",
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(
+            message=message,
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            code=error_code or code,
+            detail=message,
+            error_type="https://api.ai-hr.com/v1/errors/RATE_LIMIT_EXCEEDED",
+        )
+
+
+class CsrfException(AppException):
+    """Raised when Cross-Site Request Forgery validation fails."""
+
+    def __init__(
+        self,
+        message: str = "CSRF verification failed",
+        code: str = "ERR_CSRF_INVALID",
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(
+            message=message,
+            status_code=status.HTTP_403_FORBIDDEN,
+            code=error_code or code,
+            detail=message,
+            error_type="https://api.ai-hr.com/v1/errors/CSRF_ERROR",
+        )
+
+
 class ServiceUnavailableException(AppException):
     """Raised when a downstream dependency (Database, Redis) is unreachable."""
 
-    def __init__(self, service_name: str = "Dependency service") -> None:
+    def __init__(
+        self,
+        service_name: str = "Dependency service",
+        code: str = "ERR_SERVICE_UNAVAILABLE",
+        error_code: str | None = None,
+    ) -> None:
         super().__init__(
             message=f"{service_name} is currently unavailable.",
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            code="ERR_SERVICE_UNAVAILABLE",
+            code=error_code or code,
             detail=f"{service_name} connection failed or timed out.",
             error_type="https://api.ai-hr.com/v1/errors/SERVICE_UNAVAILABLE",
         )

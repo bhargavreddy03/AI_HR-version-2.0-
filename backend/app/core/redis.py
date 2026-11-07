@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from redis.asyncio import ConnectionPool, Redis
 
 from app.core.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    RedisClient = Redis[Any]
+else:
+    RedisClient = Any
 
 _redis_pool: ConnectionPool[Any] | None = None
 _redis_client: Redis[Any] | None = None
