@@ -431,7 +431,7 @@ async def test_postgres_concurrent_refresh_token_rotation_serializes_and_detects
         assert len(succeeded) == 1, f"Expected 1 success, got {len(succeeded)}: {results}"
         assert len(errors) == 1, f"Expected 1 error, got {len(errors)}: {results}"
         assert isinstance(errors[0], AuthenticationException)
-        assert errors[0].error_code == "TOKEN_REUSE_DETECTED"
+        assert errors[0].code == "TOKEN_REUSE_DETECTED"
 
         # Verify session is revoked in database due to reuse detection
         async with session_factory() as session:
@@ -517,7 +517,7 @@ async def test_postgres_concurrent_backup_code_redemption_serializes(
         assert len(succeeded) == 1, f"Expected exactly 1 redemption, got: {results}"
         assert len(errors) == 1
         assert isinstance(errors[0], AuthenticationException)
-        assert errors[0].error_code == "MFA_INVALID_CODE"
+        assert errors[0].code == "MFA_INVALID_CODE"
 
         # Verify backup code list in DB now has 9 codes remaining and target code cannot be verified
         async with session_factory() as session:

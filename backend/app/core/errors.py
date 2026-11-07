@@ -70,6 +70,7 @@ class AppException(Exception):
         self.message = message
         self.status_code = status_code
         self.code = error_code or code
+        self.error_code = self.code
         self.detail = detail or message
         self.invalid_params = invalid_params
         self.error_type = error_type
