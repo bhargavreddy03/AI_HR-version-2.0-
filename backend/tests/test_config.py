@@ -28,6 +28,7 @@ def test_production_settings_reject_default_secrets() -> None:
             ENVIRONMENT="production",
             JWT_SECRET_KEY="local_development_jwt_secret_key_minimum_32_characters_long_for_security",
             MFA_ENCRYPTION_KEY="a_very_secure_production_mfa_signing_key_here_32_chars!",
+            BACKUP_CODE_PEPPER="a_very_secure_production_backup_pepper_key_32_chars!",
             POSTGRES_PASSWORD="secure_production_password_xyz123!",
             DATABASE_URL="postgresql+asyncpg://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
             DATABASE_SYNC_URL="postgresql://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
@@ -39,6 +40,7 @@ def test_production_settings_reject_default_secrets() -> None:
             ENVIRONMENT="production",
             JWT_SECRET_KEY="a_very_secure_production_jwt_signing_key_here_32_chars!",
             MFA_ENCRYPTION_KEY="a_very_secure_production_mfa_signing_key_here_32_chars!",
+            BACKUP_CODE_PEPPER="a_very_secure_production_backup_pepper_key_32_chars!",
             POSTGRES_PASSWORD="local_development_password_only",
             DATABASE_URL="postgresql+asyncpg://aihr_app_user:local_development_password_only@localhost:5432/ai_hr_db",
             DATABASE_SYNC_URL="postgresql://aihr_app_user:local_development_password_only@localhost:5432/ai_hr_db",
@@ -50,6 +52,7 @@ def test_production_settings_reject_default_secrets() -> None:
             ENVIRONMENT="production",
             JWT_SECRET_KEY="a_very_secure_production_jwt_signing_key_here_32_chars!",
             MFA_ENCRYPTION_KEY="local_development_mfa_encryption_key_minimum_32_characters_for_security",
+            BACKUP_CODE_PEPPER="a_very_secure_production_backup_pepper_key_32_chars!",
             POSTGRES_PASSWORD="secure_production_password_xyz123!",
             DATABASE_URL="postgresql+asyncpg://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
             DATABASE_SYNC_URL="postgresql://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
@@ -61,6 +64,43 @@ def test_production_settings_reject_default_secrets() -> None:
             ENVIRONMENT="production",
             JWT_SECRET_KEY="a_very_secure_production_jwt_signing_key_here_32_chars!",
             MFA_ENCRYPTION_KEY="a_very_secure_production_jwt_signing_key_here_32_chars!",
+            BACKUP_CODE_PEPPER="a_very_secure_production_backup_pepper_key_32_chars!",
+            POSTGRES_PASSWORD="secure_production_password_xyz123!",
+            DATABASE_URL="postgresql+asyncpg://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
+            DATABASE_SYNC_URL="postgresql://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
+            COOKIE_SECURE=True,
+        )
+
+    with pytest.raises(ValueError, match="Insecure or default BACKUP_CODE_PEPPER"):
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY="a_very_secure_production_jwt_signing_key_here_32_chars!",
+            MFA_ENCRYPTION_KEY="a_very_secure_production_mfa_signing_key_here_32_chars!",
+            BACKUP_CODE_PEPPER="local_development_backup_code_pepper_minimum_32_chars_long",
+            POSTGRES_PASSWORD="secure_production_password_xyz123!",
+            DATABASE_URL="postgresql+asyncpg://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
+            DATABASE_SYNC_URL="postgresql://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
+            COOKIE_SECURE=True,
+        )
+
+    with pytest.raises(ValueError, match="Insecure or default BACKUP_CODE_PEPPER"):
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY="a_very_secure_production_jwt_signing_key_here_32_chars!",
+            MFA_ENCRYPTION_KEY="a_very_secure_production_mfa_signing_key_here_32_chars!",
+            BACKUP_CODE_PEPPER="short_pepper",
+            POSTGRES_PASSWORD="secure_production_password_xyz123!",
+            DATABASE_URL="postgresql+asyncpg://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
+            DATABASE_SYNC_URL="postgresql://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
+            COOKIE_SECURE=True,
+        )
+
+    with pytest.raises(ValueError, match="BACKUP_CODE_PEPPER must be separate and distinct"):
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY="a_very_secure_production_jwt_signing_key_here_32_chars!",
+            MFA_ENCRYPTION_KEY="a_very_secure_production_mfa_signing_key_here_32_chars!",
+            BACKUP_CODE_PEPPER="a_very_secure_production_jwt_signing_key_here_32_chars!",
             POSTGRES_PASSWORD="secure_production_password_xyz123!",
             DATABASE_URL="postgresql+asyncpg://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
             DATABASE_SYNC_URL="postgresql://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
@@ -72,6 +112,7 @@ def test_production_settings_reject_default_secrets() -> None:
             ENVIRONMENT="production",
             JWT_SECRET_KEY="a_very_secure_production_jwt_signing_key_here_32_chars!",
             MFA_ENCRYPTION_KEY="a_very_secure_production_mfa_signing_key_here_32_chars!",
+            BACKUP_CODE_PEPPER="a_very_secure_production_backup_pepper_key_32_chars!",
             POSTGRES_PASSWORD="secure_production_password_xyz123!",
             DATABASE_URL="postgresql+asyncpg://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
             DATABASE_SYNC_URL="postgresql://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
@@ -91,6 +132,7 @@ def test_production_rejects_default_database_url_when_postgres_password_is_secur
                 ENVIRONMENT="production",
                 JWT_SECRET_KEY="a_very_secure_production_jwt_signing_key_here_32_chars!",
                 MFA_ENCRYPTION_KEY="a_very_secure_production_mfa_signing_key_here_32_chars!",
+                BACKUP_CODE_PEPPER="a_very_secure_production_backup_pepper_key_32_chars!",
                 POSTGRES_PASSWORD="secure_production_password_xyz123!",
                 # DATABASE_URL not supplied: retains default with 'local_development_password_only'
                 DATABASE_SYNC_URL="postgresql://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
@@ -110,6 +152,7 @@ def test_production_rejects_default_sync_url_when_async_url_is_secure() -> None:
                 ENVIRONMENT="production",
                 JWT_SECRET_KEY="a_very_secure_production_jwt_signing_key_here_32_chars!",
                 MFA_ENCRYPTION_KEY="a_very_secure_production_mfa_signing_key_here_32_chars!",
+                BACKUP_CODE_PEPPER="a_very_secure_production_backup_pepper_key_32_chars!",
                 POSTGRES_PASSWORD="secure_production_password_xyz123!",
                 DATABASE_URL="postgresql+asyncpg://aihr_app_user:secure_production_password_xyz123!@localhost:5432/ai_hr_db",
                 # DATABASE_SYNC_URL not supplied: retains default with 'local_development_password_only'
@@ -124,6 +167,7 @@ def test_production_rejects_inconsistent_database_credentials() -> None:
             ENVIRONMENT="production",
             JWT_SECRET_KEY="a_very_secure_production_jwt_signing_key_here_32_chars!",
             MFA_ENCRYPTION_KEY="a_very_secure_production_mfa_signing_key_here_32_chars!",
+            BACKUP_CODE_PEPPER="a_very_secure_production_backup_pepper_key_32_chars!",
             POSTGRES_PASSWORD="secure_password_A_1234567890!",
             DATABASE_URL="postgresql+asyncpg://aihr_app_user:different_password_B_12345!@localhost:5432/ai_hr_db",
             DATABASE_SYNC_URL="postgresql://aihr_app_user:secure_password_A_1234567890!@localhost:5432/ai_hr_db",
@@ -140,6 +184,7 @@ def test_production_rejects_inconsistent_sync_and_async_passwords() -> None:
             ENVIRONMENT="production",
             JWT_SECRET_KEY="a_very_secure_production_jwt_signing_key_here_32_chars!",
             MFA_ENCRYPTION_KEY="a_very_secure_production_mfa_signing_key_here_32_chars!",
+            BACKUP_CODE_PEPPER="a_very_secure_production_backup_pepper_key_32_chars!",
             POSTGRES_PASSWORD="secure_password_A_1234567890!",
             DATABASE_URL="postgresql+asyncpg://aihr_app_user:secure_password_A_1234567890!@localhost:5432/ai_hr_db",
             DATABASE_SYNC_URL="postgresql://aihr_app_user:different_sync_pass_98765!@localhost:5432/ai_hr_db",
@@ -158,6 +203,7 @@ def test_production_rejects_inconsistent_database_username() -> None:
             DATABASE_SYNC_URL="postgresql://expected_db_user:secure_password_A_1234567890!@localhost:5432/ai_hr_db",
             JWT_SECRET_KEY="a_very_secure_production_jwt_signing_key_here_32_chars!",
             MFA_ENCRYPTION_KEY="a_very_secure_production_mfa_signing_key_here_32_chars!",
+            BACKUP_CODE_PEPPER="a_very_secure_production_backup_pepper_key_32_chars!",
             COOKIE_SECURE=True,
         )
 
@@ -169,6 +215,7 @@ def test_production_settings_accept_consistent_secure_credentials() -> None:
         ENVIRONMENT="production",
         JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
         MFA_ENCRYPTION_KEY="production_ultra_secure_mfa_encryption_key_32_bytes_long!",
+        BACKUP_CODE_PEPPER="production_ultra_secure_backup_pepper_32_bytes_long!",
         POSTGRES_USER="prod_app_user",
         POSTGRES_PASSWORD=secure_pass,
         DATABASE_URL=f"postgresql+asyncpg://prod_app_user:{secure_pass}@db.prod.internal:5432/ai_hr_db",

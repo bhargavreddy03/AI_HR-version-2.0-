@@ -10,6 +10,7 @@ import secrets
 import struct
 import time
 from typing import TYPE_CHECKING
+from uuid import UUID
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -135,21 +136,51 @@ def generate_backup_codes(count: int = 10) -> list[str]:
     return codes
 
 
-def hash_backup_code(code: str) -> str:
-    """Hash single backup code using SHA-256 with platform salt for verification."""
+def hash_backup_code(
+    code: str,
+    secret_key: str | bytes,
+    user_id: UUID | str | None = None,
+) -> str:
+    """Hash single backup code using HMAC-SHA256 with dedicated server secret and user salt.
+
+    Never stores the pepper/key in PostgreSQL.
+    """
     clean = code.strip().upper().replace("-", "")
-    return hashlib.sha256(f"aihr_backup_{clean}".encode()).hexdigest()
+    key_bytes = secret_key.encode("utf-8") if isinstance(secret_key, str) else secret_key
+    msg = f"{user_id}:{clean}".encode() if user_id else clean.encode("utf-8")
+    return hmac.new(key_bytes, msg, hashlib.sha256).hexdigest()
 
 
-def verify_backup_code(code: str, hashed_codes: list[str]) -> int:
+def verify_backup_code(
+    code: str,
+    hashed_codes: list[str],
+    secret_key: str | bytes,
+    user_id: UUID | str | None = None,
+) -> int:
     """Verify backup code against list of stored hashes in constant time.
 
+    Supports modern per-user keyed HMAC hashes and falls back to legacy fixed-salt SHA-256 for migration.
     Returns the index of the matching code, or -1 if not found.
     """
-    clean_hash = hash_backup_code(code)
+    clean = code.strip().upper().replace("-", "")
+    modern_hash = hash_backup_code(clean, secret_key=secret_key, user_id=user_id)
+
+    # 1. Constant-time check against modern keyed HMAC
+    matched_idx = -1
     for idx, stored in enumerate(hashed_codes):
-        if hmac.compare_digest(clean_hash, stored):
+        if hmac.compare_digest(modern_hash, stored):
+            matched_idx = idx
+            break
+
+    if matched_idx != -1:
+        return matched_idx
+
+    # 2. Migration fallback: check legacy fixed-salt hash for backward compatibility
+    legacy_hash = hashlib.sha256(f"aihr_backup_{clean}".encode()).hexdigest()
+    for idx, stored in enumerate(hashed_codes):
+        if hmac.compare_digest(legacy_hash, stored):
             return idx
+
     return -1
 
 

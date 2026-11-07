@@ -424,3 +424,65 @@ def test_switch_organization_rejects_cross_tenant_role(
     )
     assert res.status_code == status.HTTP_403_FORBIDDEN
     assert res.json()["code"] == "ROLE_TENANT_INTEGRITY_VIOLATION"
+
+
+@pytest.mark.asyncio
+async def test_monotonic_role_version_fence_and_targeted_session_eviction() -> None:
+    """Verify monotonic role-version fencing: evicts target user sessions, leaves peers untouched."""
+    from app.modules.auth.redis_session import update_org_role_version_fence_monotonic
+
+    fake_redis = FakeRedis()
+    tenant_id = uuid4()
+    u1 = uuid4()
+    u2 = uuid4()
+    s1 = uuid4()
+    s2 = uuid4()
+    s3 = uuid4()
+
+    # Prepopulate sessions for u1 and u2
+    fake_redis.store[f"session:{u1}:{s1}"] = '{"role_version": 1}'
+    fake_redis.store[f"session:{u1}:{s2}"] = '{"role_version": 1}'
+    fake_redis.store[f"session:{u2}:{s3}"] = '{"role_version": 1}'
+
+    # 1. Update u1 role version from initial to 2
+    res = await update_org_role_version_fence_monotonic(
+        redis=fake_redis,  # type: ignore[arg-type]
+        tenant_id=tenant_id,
+        user_id=u1,
+        new_version=2,
+    )
+    assert res is True
+    # u1 sessions must be evicted
+    assert f"session:{u1}:{s1}" not in fake_redis.store
+    assert f"session:{u1}:{s2}" not in fake_redis.store
+    # u2 session must remain untouched
+    assert f"session:{u2}:{s3}" in fake_redis.store
+    # Fence key must be set to 2
+    assert fake_redis.store[f"org_current_role_version:{tenant_id}:{u1}"] == "2"
+
+    # 2. Monotonicity: equal or lower version must fail and not modify anything
+    res_lower = await update_org_role_version_fence_monotonic(
+        redis=fake_redis,  # type: ignore[arg-type]
+        tenant_id=tenant_id,
+        user_id=u1,
+        new_version=2,
+    )
+    assert res_lower is False
+
+    res_stale = await update_org_role_version_fence_monotonic(
+        redis=fake_redis,  # type: ignore[arg-type]
+        tenant_id=tenant_id,
+        user_id=u1,
+        new_version=1,
+    )
+    assert res_stale is False
+
+    # 3. Higher version succeeds
+    res_higher = await update_org_role_version_fence_monotonic(
+        redis=fake_redis,  # type: ignore[arg-type]
+        tenant_id=tenant_id,
+        user_id=u1,
+        new_version=3,
+    )
+    assert res_higher is True
+    assert fake_redis.store[f"org_current_role_version:{tenant_id}:{u1}"] == "3"

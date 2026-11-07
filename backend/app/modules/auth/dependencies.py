@@ -12,9 +12,10 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import Depends, Request
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.base import utc_now
 from app.core.config import Settings, get_settings
 from app.core.database import get_db
 from app.core.errors import (
@@ -32,6 +33,7 @@ from app.modules.auth.jwt import (
     TokenPayload,
     decode_access_token,
 )
+from app.modules.auth.models import UserSession
 from app.modules.auth.redis_session import (
     delete_session,
     get_org_role_version_fence,
@@ -112,6 +114,42 @@ async def validate_csrf(request: Request) -> None:
                 "CSRF token verification failed",
                 error_code="CSRF_TOKEN_INVALID",
             )
+
+
+async def execute_authoritative_session_check(
+    db: AsyncSession,
+    session_id: str | UUID,
+    user_id: str | UUID,
+    token_version: int,
+) -> UserSession:
+    """Validate session directly against authoritative PostgreSQL state (State C fallback)."""
+    try:
+        sess_uuid = UUID(str(session_id))
+        user_uuid = UUID(str(user_id))
+    except (ValueError, TypeError) as exc:
+        raise AuthenticationException(
+            "Malformed session or user identifier", error_code="SESSION_INVALID"
+        ) from exc
+
+    stmt = select(UserSession).where(
+        UserSession.id == sess_uuid,
+        UserSession.user_id == user_uuid,
+    )
+    session_rec = (await db.execute(stmt)).scalar_one_or_none()
+
+    if not session_rec:
+        raise AuthenticationException("Session not found or invalid", error_code="SESSION_INVALID")
+
+    if session_rec.is_revoked:
+        raise AuthenticationException("Session has been revoked", error_code="SESSION_REVOKED")
+
+    if session_rec.expires_at < utc_now():
+        raise AuthenticationException("Session has expired", error_code="SESSION_EXPIRED")
+
+    if session_rec.token_version != token_version:
+        raise AuthenticationException("Token version stale", error_code="TOKEN_VERSION_STALE")
+
+    return session_rec
 
 
 async def execute_authoritative_6_dim_check(
@@ -275,6 +313,15 @@ async def authenticate_request_pipeline(
 
     else:
         # State C: Redis Unavailable / Timeout -> Fallback to Authoritative PostgreSQL
+        # 1. Authoritative UserSession verification against PostgreSQL
+        await execute_authoritative_session_check(
+            db=db,
+            session_id=session_id,
+            user_id=user_id,
+            token_version=jwt_claims.token_version,
+        )
+
+        # 2. Authoritative 6-dimension user, membership, role, and organization verification
         db_state = await execute_authoritative_6_dim_check(db, user_id, tenant_id)
 
         if not db_state.get("user_active"):

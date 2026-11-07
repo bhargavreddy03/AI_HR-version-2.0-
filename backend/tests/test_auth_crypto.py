@@ -1,6 +1,8 @@
 """Unit tests for cryptographic foundations: AES-256-GCM, RFC 6238 TOTP, and token security."""
 
+import hashlib
 import time
+import uuid
 
 from app.modules.auth.crypto import (
     decrypt_mfa_secret,
@@ -84,28 +86,55 @@ def test_totp_uri_formatting() -> None:
 
 
 def test_backup_codes_generation_hashing_and_verification() -> None:
-    """Verify 10 one-time backup codes generation, hashing, and single-use matching."""
+    """Verify 10 one-time backup codes generation, keyed HMAC hashing, and single-use matching."""
+    pepper = "a_very_secure_test_backup_code_pepper_32_chars!"
+    user_id = uuid.uuid4()
     codes = generate_backup_codes(count=10)
     assert len(codes) == 10
     for c in codes:
         assert len(c) == 9  # e.g., '1A2B-3C4D'
         assert "-" in c
 
-    hashed = [hash_backup_code(c) for c in codes]
+    hashed = [hash_backup_code(c, secret_key=pepper, user_id=user_id) for c in codes]
     assert len(hashed) == 10
 
     # Verify first code matches index 0
-    idx = verify_backup_code(codes[0], hashed)
+    idx = verify_backup_code(codes[0], hashed, secret_key=pepper, user_id=user_id)
     assert idx == 0
 
     # Case-insensitivity and hyphen-insensitivity
     no_hyphen = codes[1].replace("-", "").lower()
-    idx2 = verify_backup_code(no_hyphen, hashed)
+    idx2 = verify_backup_code(no_hyphen, hashed, secret_key=pepper, user_id=user_id)
     assert idx2 == 1
 
     # Non-existent code returns -1
-    idx_fake = verify_backup_code("ZZZZ-9999", hashed)
+    idx_fake = verify_backup_code("ZZZZ-9999", hashed, secret_key=pepper, user_id=user_id)
     assert idx_fake == -1
+
+    # Wrong user_id or secret_key fails matching
+    idx_wrong_user = verify_backup_code(codes[0], hashed, secret_key=pepper, user_id=uuid.uuid4())
+    assert idx_wrong_user == -1
+
+    idx_wrong_secret = verify_backup_code(
+        codes[0], hashed, secret_key="wrong_pepper_key_that_is_32_characters_long!", user_id=user_id
+    )
+    assert idx_wrong_secret == -1
+
+
+def test_backup_codes_legacy_hash_migration_fallback() -> None:
+    """Verify backward compatibility: legacy unkeyed SHA-256 backup codes are successfully matched."""
+    pepper = "a_very_secure_test_backup_code_pepper_32_chars!"
+    user_id = uuid.uuid4()
+    code = "ABCD-1234"
+    clean = "ABCD1234"
+    # Legacy hashing scheme using fixed application salt: f"aihr_backup_{clean}"
+    legacy_hash = hashlib.sha256(f"aihr_backup_{clean}".encode()).hexdigest()
+
+    hashed_list = ["dummy_hash_0", legacy_hash, "dummy_hash_2"]
+
+    # Verify that verify_backup_code matches legacy hash
+    idx = verify_backup_code(code, hashed_list, secret_key=pepper, user_id=user_id)
+    assert idx == 1
 
 
 def test_secure_tokens_and_csrf() -> None:

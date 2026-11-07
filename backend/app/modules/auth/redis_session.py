@@ -42,9 +42,14 @@ local new_ver = tonumber(ARGV[1])
 
 if not current_ver or tonumber(current_ver) < new_ver then
     redis.call('SET', KEYS[1], new_ver)
+    -- Target user ID for session key prefix matching 'session:{user_id}:*'
+    local target_user_id = ARGV[2]
+    if ARGV[3] then
+        target_user_id = ARGV[3]
+    end
     local cursor = "0"
     repeat
-        local result = redis.call('SCAN', cursor, 'MATCH', 'session:' .. ARGV[3] .. ':*', 'COUNT', 100)
+        local result = redis.call('SCAN', cursor, 'MATCH', 'session:' .. target_user_id .. ':*', 'COUNT', 100)
         cursor = result[1]
         local keys = result[2]
         if #keys > 0 then
@@ -186,7 +191,6 @@ async def update_org_role_version_fence_monotonic(
         1,
         fence_key,
         new_version,
-        str(tenant_id),
         str(user_id),
     )
     return bool(res == 1)

@@ -95,6 +95,10 @@ class Settings(BaseSettings):
         default="local_development_mfa_encryption_key_minimum_32_characters_for_security",
         description="Dedicated cryptographic key for AES-256-GCM encryption of MFA secrets at rest",
     )
+    BACKUP_CODE_PEPPER: str = Field(
+        default="local_development_backup_code_pepper_minimum_32_characters_for_security",
+        description="Dedicated server-side secret key for HMAC-SHA256 backup-code hashing (never stored in DB)",
+    )
     JWT_ALGORITHM: str = Field(default="HS256", description="JWT algorithm")
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=15, description="Short-lived access token TTL")
     REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7, description="Sliding refresh token TTL")
@@ -158,6 +162,16 @@ class Settings(BaseSettings):
             if self.MFA_ENCRYPTION_KEY == self.JWT_SECRET_KEY:
                 raise ValueError(
                     "Security violation: MFA_ENCRYPTION_KEY must be separate and distinct from JWT_SECRET_KEY"
+                )
+
+            # 2b. Backup Code Pepper Validation (Key separation guarantee)
+            if "local_development" in self.BACKUP_CODE_PEPPER or len(self.BACKUP_CODE_PEPPER) < 32:
+                raise ValueError(
+                    "Insecure or default BACKUP_CODE_PEPPER detected for production/staging (minimum 32 chars required)"
+                )
+            if self.BACKUP_CODE_PEPPER in (self.JWT_SECRET_KEY, self.MFA_ENCRYPTION_KEY):
+                raise ValueError(
+                    "Security violation: BACKUP_CODE_PEPPER must be separate and distinct from JWT_SECRET_KEY and MFA_ENCRYPTION_KEY"
                 )
 
             # 3. POSTGRES_PASSWORD Validation

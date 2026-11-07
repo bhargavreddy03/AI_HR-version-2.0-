@@ -372,6 +372,29 @@ def upgrade() -> None:
     op.create_index("ix_user_sessions_expires_at", "user_sessions", ["expires_at"])
 
     # --------------------------------------------------------------------------
+    # 8b. Session Token History (Full Session Lifetime Reuse Detection)
+    # --------------------------------------------------------------------------
+    op.create_table(
+        "session_token_history",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column(
+            "session_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("user_sessions.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column("token_hash", sa.String(255), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.TIMESTAMP(timezone=True),
+            nullable=False,
+            server_default=sa.text("CURRENT_TIMESTAMP"),
+        ),
+    )
+    op.create_index("ix_session_token_history_session_id", "session_token_history", ["session_id"])
+    op.create_index("ix_session_token_history_token_hash", "session_token_history", ["token_hash"])
+
+    # --------------------------------------------------------------------------
     # 9. Transactional Invalidation Outbox: auth_revocation_outbox
     # --------------------------------------------------------------------------
     op.create_table(
@@ -555,6 +578,7 @@ def downgrade() -> None:
     )
     op.execute("DROP FUNCTION IF EXISTS fn_enforce_membership_role_tenant();")
     op.drop_table("auth_revocation_outbox")
+    op.drop_table("session_token_history")
     op.drop_table("user_sessions")
     op.execute("DROP POLICY IF EXISTS org_mem_tenant_restrict ON organization_memberships;")
     op.drop_table("organization_memberships")

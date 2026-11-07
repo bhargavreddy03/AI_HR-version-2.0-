@@ -131,7 +131,10 @@ def test_mfa_login_challenge_and_verification(
     totp_secret = generate_totp_secret()
     encrypted_secret = encrypt_mfa_secret(totp_secret, settings.MFA_ENCRYPTION_KEY)
     backup_codes = generate_backup_codes(4)
-    hashed_backups = [hash_backup_code(b) for b in backup_codes]
+    hashed_backups = [
+        hash_backup_code(b, secret_key=settings.BACKUP_CODE_PEPPER, user_id=user_id)
+        for b in backup_codes
+    ]
 
     raw_password = "SecurePassword123!"
     user = User(
@@ -248,7 +251,10 @@ def test_backup_code_single_use_and_disable_reuse(
     encrypted_secret = encrypt_mfa_secret(totp_secret, settings.MFA_ENCRYPTION_KEY)
     backup_codes = generate_backup_codes(10)
     assert len(backup_codes) == 10
-    hashed_backups = [hash_backup_code(b) for b in backup_codes]
+    hashed_backups = [
+        hash_backup_code(b, secret_key=settings.BACKUP_CODE_PEPPER, user_id=user_id)
+        for b in backup_codes
+    ]
 
     user = User(
         id=user_id,

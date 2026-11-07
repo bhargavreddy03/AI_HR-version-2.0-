@@ -35,7 +35,9 @@ from app.modules.auth.crypto import (
     hash_token,
     verify_backup_code,
 )
+from app.modules.auth.dependencies import execute_authoritative_session_check
 from app.modules.auth.models import (
+    SessionTokenHistory,
     User,
     UserSession,
 )
@@ -97,6 +99,7 @@ def integration_settings() -> Settings:
         DATABASE_URL=INTEGRATION_DB_URL,
         DATABASE_SYNC_URL=INTEGRATION_DB_URL.replace("+asyncpg", ""),
         MFA_ENCRYPTION_KEY="integration_test_mfa_encryption_key_at_least_32_bytes_long",
+        BACKUP_CODE_PEPPER="integration_test_backup_code_pepper_32_bytes_long",
     )
 
 
@@ -455,7 +458,10 @@ async def test_postgres_concurrent_backup_code_redemption_serializes(
     user_id = generate_uuid7()
     backup_codes = generate_backup_codes(count=10)
     target_code = backup_codes[0]
-    hashed_codes = [hash_backup_code(c) for c in backup_codes]
+    hashed_codes = [
+        hash_backup_code(c, secret_key=integration_settings.BACKUP_CODE_PEPPER, user_id=user_id)
+        for c in backup_codes
+    ]
 
     totp_secret = generate_totp_secret()
     encrypted_secret = encrypt_mfa_secret(totp_secret, integration_settings.MFA_ENCRYPTION_KEY)
@@ -524,7 +530,15 @@ async def test_postgres_concurrent_backup_code_redemption_serializes(
             stmt = select(User).where(User.id == user_id)
             db_user = (await session.execute(stmt)).scalar_one()
             assert len(db_user.mfa_backup_codes) == 9
-            assert verify_backup_code(target_code, db_user.mfa_backup_codes) == -1
+            assert (
+                verify_backup_code(
+                    target_code,
+                    db_user.mfa_backup_codes,
+                    secret_key=integration_settings.BACKUP_CODE_PEPPER,
+                    user_id=user_id,
+                )
+                == -1
+            )
     finally:
         await engine.dispose()
 
@@ -602,5 +616,237 @@ async def test_postgres_cross_tenant_role_assignment_trigger_rejection(
             "Cross-tenant role assignment prohibited" in error_message
             or "check_violation" in error_message.lower()
         )
+    finally:
+        await engine.dispose()
+
+
+@skip_if_no_postgres
+@pytest.mark.asyncio
+async def test_postgres_state_c_redis_outage_authoritative_session_validation(
+    integration_settings: Settings,
+) -> None:
+    """Verify that State C (Redis outage) directly validates session against authoritative PostgreSQL state."""
+    engine = create_db_engine(integration_settings)
+    session_factory = create_session_factory(engine)
+
+    user_id = generate_uuid7()
+    session_id = generate_uuid7()
+    token = generate_secure_token(32)
+    token_h = hash_token(token)
+
+    try:
+        async with session_factory() as session:
+            user = User(
+                id=user_id,
+                email=f"state_c_{user_id.hex[:8]}@example.com",
+                password_hash=hash_password("SuperSecretPass123!"),
+                first_name="StateC",
+                last_name="Tester",
+                is_active=True,
+                token_version=1,
+            )
+            sess_rec = UserSession(
+                id=session_id,
+                user_id=user_id,
+                refresh_token_hash=token_h,
+                token_version=1,
+                is_revoked=False,
+                expires_at=utc_now() + timedelta(days=7),
+            )
+            session.add_all([user, sess_rec])
+            await session.commit()
+
+        # 1. Active session succeeds
+        async with session_factory() as session:
+            validated = await execute_authoritative_session_check(
+                db=session,
+                session_id=session_id,
+                user_id=user_id,
+                token_version=1,
+            )
+            assert validated.id == session_id
+
+        # 2. Token version mismatch raises TOKEN_VERSION_STALE
+        async with session_factory() as session:
+            with pytest.raises(AuthenticationException) as exc_info:
+                await execute_authoritative_session_check(
+                    db=session,
+                    session_id=session_id,
+                    user_id=user_id,
+                    token_version=2,  # Stale
+                )
+            assert exc_info.value.code == "TOKEN_VERSION_STALE"
+
+        # 3. Revoked session in PostgreSQL raises SESSION_REVOKED
+        async with session_factory() as session:
+            sess_to_revoke = (
+                await session.execute(select(UserSession).where(UserSession.id == session_id))
+            ).scalar_one()
+            sess_to_revoke.is_revoked = True
+            await session.commit()
+
+        async with session_factory() as session:
+            with pytest.raises(AuthenticationException) as exc_info:
+                await execute_authoritative_session_check(
+                    db=session,
+                    session_id=session_id,
+                    user_id=user_id,
+                    token_version=1,
+                )
+            assert exc_info.value.code == "SESSION_REVOKED"
+
+        # 4. Non-existent session raises SESSION_INVALID
+        async with session_factory() as session:
+            with pytest.raises(AuthenticationException) as exc_info:
+                await execute_authoritative_session_check(
+                    db=session,
+                    session_id=generate_uuid7(),
+                    user_id=user_id,
+                    token_version=1,
+                )
+            assert exc_info.value.code == "SESSION_INVALID"
+    finally:
+        await engine.dispose()
+
+
+@skip_if_no_postgres
+@pytest.mark.asyncio
+async def test_postgres_token_history_multi_rotation_and_old_token_reuse_detected(
+    integration_settings: Settings,
+) -> None:
+    """Verify persistent token reuse history across multi-generation rotations and automatic cascade cleanup."""
+    engine = create_db_engine(integration_settings)
+    session_factory = create_session_factory(engine)
+
+    user_id = generate_uuid7()
+    session_id = generate_uuid7()
+    token_a = generate_secure_token(32)
+    token_a_hash = hash_token(token_a)
+
+    fake_redis = FakeIntegrationRedis()
+
+    try:
+        # Create user and initial session with Token A
+        async with session_factory() as session:
+            user = User(
+                id=user_id,
+                email=f"history_{user_id.hex[:8]}@example.com",
+                password_hash=hash_password("SuperSecretPass123!"),
+                first_name="History",
+                last_name="Tester",
+                is_active=True,
+                token_version=1,
+            )
+            sess_rec = UserSession(
+                id=session_id,
+                user_id=user_id,
+                refresh_token_hash=token_a_hash,
+                token_version=1,
+                is_revoked=False,
+                expires_at=utc_now() + timedelta(days=7),
+            )
+            session.add_all([user, sess_rec])
+            await session.commit()
+
+        # Rotation 1: Token A -> Token B
+        async with session_factory() as session:
+            res_1 = await refresh_session_tokens(
+                db=session,
+                redis=fake_redis,  # type: ignore[arg-type]
+                current_refresh_token=token_a,
+                user_agent="TestAgent/1.0",
+                ip="127.0.0.1",
+                settings=integration_settings,
+            )
+            token_b = str(res_1["refresh_token"])
+
+        # Verify SessionTokenHistory has recorded Token A
+        async with session_factory() as session:
+            history_rows = (
+                (
+                    await session.execute(
+                        select(SessionTokenHistory).where(
+                            SessionTokenHistory.session_id == session_id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(history_rows) == 1
+            assert history_rows[0].token_hash == token_a_hash
+
+        # Rotation 2: Token B -> Token C
+        async with session_factory() as session:
+            res_2 = await refresh_session_tokens(
+                db=session,
+                redis=fake_redis,  # type: ignore[arg-type]
+                current_refresh_token=token_b,
+                user_agent="TestAgent/1.0",
+                ip="127.0.0.1",
+                settings=integration_settings,
+            )
+            token_c = str(res_2["refresh_token"])
+            assert len(token_c) > 0
+
+        # Verify SessionTokenHistory now has 2 recorded tokens (Token A and Token B)
+        async with session_factory() as session:
+            history_rows = (
+                (
+                    await session.execute(
+                        select(SessionTokenHistory).where(
+                            SessionTokenHistory.session_id == session_id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(history_rows) == 2
+            recorded_hashes = {h.token_hash for h in history_rows}
+            assert token_a_hash in recorded_hashes
+            assert hash_token(token_b) in recorded_hashes
+
+        # Attack: Replay Token A (2 generations old)
+        async with session_factory() as session:
+            with pytest.raises(AuthenticationException) as exc_info:
+                await refresh_session_tokens(
+                    db=session,
+                    redis=fake_redis,  # type: ignore[arg-type]
+                    current_refresh_token=token_a,  # REUSE OF TOKEN A!
+                    user_agent="Attacker/1.0",
+                    ip="10.0.0.1",
+                    settings=integration_settings,
+                )
+            assert exc_info.value.code == "TOKEN_REUSE_DETECTED"
+
+        # Authoritative DB verification: Entire session family is revoked
+        async with session_factory() as session:
+            revoked_sess = (
+                await session.execute(select(UserSession).where(UserSession.id == session_id))
+            ).scalar_one()
+            assert revoked_sess.is_revoked is True
+
+        # Verify CASCADE cleanup on session deletion
+        async with session_factory() as session:
+            sess_to_delete = (
+                await session.execute(select(UserSession).where(UserSession.id == session_id))
+            ).scalar_one()
+            await session.delete(sess_to_delete)
+            await session.commit()
+
+        async with session_factory() as session:
+            remaining_history = (
+                (
+                    await session.execute(
+                        select(SessionTokenHistory).where(
+                            SessionTokenHistory.session_id == session_id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(remaining_history) == 0
     finally:
         await engine.dispose()

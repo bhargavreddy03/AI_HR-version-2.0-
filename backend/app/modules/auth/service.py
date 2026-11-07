@@ -7,7 +7,7 @@ from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -42,6 +42,7 @@ from app.modules.auth.jwt import (
 from app.modules.auth.models import (
     AuthRevocationOutbox,
     CandidateUserProfile,
+    SessionTokenHistory,
     User,
     UserSession,
 )
@@ -423,7 +424,12 @@ async def verify_mfa_challenge(
         # Check backup codes if available
         matched_idx = -1
         if user.mfa_backup_codes:
-            matched_idx = verify_backup_code(clean_code, user.mfa_backup_codes)
+            matched_idx = verify_backup_code(
+                clean_code,
+                user.mfa_backup_codes,
+                secret_key=settings.BACKUP_CODE_PEPPER,
+                user_id=user.id,
+            )
         if matched_idx >= 0:
             # Concurrency-safe single-use backup code consumption
             codes = list(user.mfa_backup_codes or [])
@@ -461,38 +467,70 @@ async def refresh_session_tokens(
     Enforces refresh token reuse detection and session validation.
     """
     token_hash = hash_token(refresh_token_str)
+
+    # 1. Query for active session matching this refresh token hash with row lock
     stmt = (
         select(UserSession)
         .options(selectinload(UserSession.user))
-        .where(
-            or_(
-                UserSession.refresh_token_hash == token_hash,
-                UserSession.previous_refresh_token_hash == token_hash,
-            )
-        )
+        .where(UserSession.refresh_token_hash == token_hash)
         .with_for_update()
     )
     session_rec = (await db.execute(stmt)).scalar_one_or_none()
 
+    # If session was retrieved but matches previous rotated hash or hash does not match:
+    if session_rec:
+        if session_rec.previous_refresh_token_hash == token_hash:
+            logger.warning(
+                "Detected rotated refresh token reuse for session %s. Revoking session family.",
+                session_rec.id,
+            )
+            session_rec.is_revoked = True
+            await db.commit()
+            await delete_session(redis, session_rec.user_id, session_rec.id)
+            raise AuthenticationException(
+                "Rotated refresh token reuse detected; session revoked",
+                error_code="TOKEN_REUSE_DETECTED",
+            )
+        if session_rec.refresh_token_hash != token_hash:
+            session_rec = None
+
+    # 2. If not found in current token hashes, check token history across full session lifetime
     if not session_rec:
+        # Check historical token records
+        hist_stmt = select(SessionTokenHistory).where(SessionTokenHistory.token_hash == token_hash)
+        history_entry = (await db.execute(hist_stmt)).scalar_one_or_none()
+
+        target_session_id = None
+        if history_entry:
+            target_session_id = history_entry.session_id
+        else:
+            # Fallback check previous_refresh_token_hash column for backward compatibility
+            prev_stmt = select(UserSession.id).where(
+                UserSession.previous_refresh_token_hash == token_hash
+            )
+            target_session_id = (await db.execute(prev_stmt)).scalar_one_or_none()
+
+        if target_session_id:
+            logger.warning(
+                "Detected rotated refresh token reuse across session lifetime for session %s. Revoking session family.",
+                target_session_id,
+            )
+            lock_stmt = (
+                select(UserSession).where(UserSession.id == target_session_id).with_for_update()
+            )
+            reused_sess = (await db.execute(lock_stmt)).scalar_one_or_none()
+            if reused_sess:
+                reused_sess.is_revoked = True
+                await db.commit()
+                await delete_session(redis, reused_sess.user_id, reused_sess.id)
+            raise AuthenticationException(
+                "Rotated refresh token reuse detected; session revoked",
+                error_code="TOKEN_REUSE_DETECTED",
+            )
+
         raise AuthenticationException(
             "Session not found or invalid refresh token",
             error_code="SESSION_INVALID",
-        )
-
-    # Token Family Reuse Detection: Check if a previously rotated token was presented
-    if session_rec.previous_refresh_token_hash == token_hash:
-        logger.warning(
-            "Detected rotated refresh token reuse for session %s, user %s. Revoking session family.",
-            session_rec.id,
-            session_rec.user_id,
-        )
-        session_rec.is_revoked = True
-        await db.commit()
-        await delete_session(redis, session_rec.user_id, session_rec.id)
-        raise AuthenticationException(
-            "Rotated refresh token reuse detected; session revoked",
-            error_code="TOKEN_REUSE_DETECTED",
         )
 
     # If an already revoked session is presented, invalidate immediately
@@ -562,6 +600,14 @@ async def refresh_session_tokens(
             permissions = await resolve_user_permissions(db, membership.role_id)
 
     # Rotate refresh token (Generate fresh cryptographic string and update hash)
+    # Record old token hash in persistent history for lifetime reuse detection
+    db.add(
+        SessionTokenHistory(
+            id=generate_uuid7(),
+            session_id=session_rec.id,
+            token_hash=session_rec.refresh_token_hash,
+        )
+    )
     new_refresh_token = generate_secure_token(48)
     new_csrf_token = generate_csrf_token()
     session_rec.previous_refresh_token_hash = session_rec.refresh_token_hash
@@ -813,7 +859,10 @@ async def enroll_mfa(
 
     secret_base32 = generate_totp_secret()
     backup_codes = generate_backup_codes(count=10)
-    hashed_backup_codes = [hash_backup_code(c) for c in backup_codes]
+    hashed_backup_codes = [
+        hash_backup_code(c, secret_key=settings.BACKUP_CODE_PEPPER, user_id=user.id)
+        for c in backup_codes
+    ]
 
     # Encrypt secret with AES-256-GCM before saving to PostgreSQL using dedicated MFA key
     encrypted_secret = encrypt_mfa_secret(secret_base32, settings.MFA_ENCRYPTION_KEY)
@@ -874,7 +923,12 @@ async def disable_mfa(
         clean = code.strip().replace("-", "").upper()
         if not verify_totp(totp_secret, clean):
             # Check and consume backup code
-            idx = verify_backup_code(clean, user.mfa_backup_codes or [])
+            idx = verify_backup_code(
+                clean,
+                user.mfa_backup_codes or [],
+                secret_key=settings.BACKUP_CODE_PEPPER,
+                user_id=user.id,
+            )
             if idx < 0:
                 raise AuthenticationException(
                     "Invalid verification code", error_code="MFA_INVALID_CODE"

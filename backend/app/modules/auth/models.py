@@ -116,6 +116,36 @@ class UserSession(Base, TimestampMixin):
 
     # Relationships
     user: Mapped[User] = relationship(User, back_populates="sessions")
+    token_history: Mapped[list["SessionTokenHistory"]] = relationship(
+        "SessionTokenHistory", back_populates="session", cascade="all, delete-orphan"
+    )
+
+
+class SessionTokenHistory(Base):
+    """Historical refresh token hashes for session-lifetime reuse detection."""
+
+    __tablename__ = "session_token_history"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        default=generate_uuid7,
+    )
+    session_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("user_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    token_hash: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=utc_now,
+    )
+
+    # Relationships
+    session: Mapped[UserSession] = relationship("UserSession", back_populates="token_history")
 
 
 class AuthRevocationOutbox(Base):
