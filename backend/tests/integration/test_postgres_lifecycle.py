@@ -753,9 +753,8 @@ async def test_postgres_token_history_multi_rotation_and_old_token_reuse_detecte
             res_1 = await refresh_session_tokens(
                 db=session,
                 redis=fake_redis,  # type: ignore[arg-type]
-                current_refresh_token=token_a,
-                user_agent="TestAgent/1.0",
-                ip="127.0.0.1",
+                refresh_token_str=token_a,
+                client_ip="127.0.0.1",
                 settings=integration_settings,
             )
             token_b = str(res_1["refresh_token"])
@@ -781,9 +780,8 @@ async def test_postgres_token_history_multi_rotation_and_old_token_reuse_detecte
             res_2 = await refresh_session_tokens(
                 db=session,
                 redis=fake_redis,  # type: ignore[arg-type]
-                current_refresh_token=token_b,
-                user_agent="TestAgent/1.0",
-                ip="127.0.0.1",
+                refresh_token_str=token_b,
+                client_ip="127.0.0.1",
                 settings=integration_settings,
             )
             token_c = str(res_2["refresh_token"])
@@ -813,9 +811,8 @@ async def test_postgres_token_history_multi_rotation_and_old_token_reuse_detecte
                 await refresh_session_tokens(
                     db=session,
                     redis=fake_redis,  # type: ignore[arg-type]
-                    current_refresh_token=token_a,  # REUSE OF TOKEN A!
-                    user_agent="Attacker/1.0",
-                    ip="10.0.0.1",
+                    refresh_token_str=token_a,  # REUSE OF TOKEN A!
+                    client_ip="10.0.0.1",
                     settings=integration_settings,
                 )
             assert exc_info.value.code == "TOKEN_REUSE_DETECTED"
