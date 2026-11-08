@@ -1,23 +1,29 @@
 version: "3.9"
 
 services:
+  # ----------------------------------------------------------------------------
+  # Development PostgreSQL Override (Published to 127.0.0.1 host loopback only)
+  # ----------------------------------------------------------------------------
   postgres:
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     environment:
-      - ENVIRONMENT=development
-      - POSTGRES_SUPERUSER=postgres
-      - POSTGRES_SUPERUSER_PASSWORD=local_development_super_password_only
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=local_development_super_password_only
-      - POSTGRES_MIGRATION_USER=aihr_migration_user
-      - POSTGRES_MIGRATION_PASSWORD=local_development_migration_password_only
-      - POSTGRES_APP_USER=aihr_app_user
-      - POSTGRES_APP_PASSWORD=local_development_password_only
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      POSTGRES_SUPERUSER: ${POSTGRES_SUPERUSER:-postgres}
+      POSTGRES_SUPERUSER_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-local_development_super_password_only}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-local_development_super_password_only}
+      POSTGRES_MIGRATION_USER: ${POSTGRES_MIGRATION_USER:-aihr_migration_user}
+      POSTGRES_MIGRATION_PASSWORD: ${POSTGRES_MIGRATION_PASSWORD:-local_development_migration_password_only}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-aihr_app_user}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:-local_development_password_only}
 
+  # ----------------------------------------------------------------------------
+  # Development Redis Override (Published to 127.0.0.1 host loopback only)
+  # ----------------------------------------------------------------------------
   redis:
     environment:
-      - REDIS_PASSWORD=local_development_redis_secret_only
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-local_development_redis_secret_only}
     command: >-
       sh -c "exec redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD:-local_development_redis_secret_only}\""
     healthcheck:
@@ -25,26 +31,43 @@ services:
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
 
+  # ----------------------------------------------------------------------------
+  # Development Backend Override (Source mounting, auto-reload, auto-migrations)
+  # ----------------------------------------------------------------------------
   backend:
     volumes:
       - ../../backend:/app
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     environment:
-      - ENVIRONMENT=development
-      - DEBUG=true
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DEBUG: "true"
+      RUN_MIGRATIONS: "true"
 
+  # ----------------------------------------------------------------------------
+  # Development Celery Worker Override (Source mounting, responsive worker healthcheck)
+  # ----------------------------------------------------------------------------
   celery_worker:
     volumes:
       - ../../backend:/app
     environment:
-      - ENVIRONMENT=development
-      - DEBUG=true
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DEBUG: "true"
+      CELERY_HEALTH_CHECK_WORKERS: "true"
 
+  # ----------------------------------------------------------------------------
+  # Development Frontend Override (Target dev stage, hot reload, isolated node_modules)
+  # ----------------------------------------------------------------------------
   frontend:
+    build:
+      context: ../../frontend
+      dockerfile: Dockerfile
+      target: dev
     volumes:
       - ../../frontend:/app
       - /app/node_modules
       - /app/.next
     command: ["npm", "run", "dev"]
     environment:
-      - NODE_ENV=development
+      NODE_ENV: development
+      INTERNAL_API_URL: http://backend:8000/api/v1
+      NEXT_PUBLIC_API_URL: http://localhost:8000/api/v1
