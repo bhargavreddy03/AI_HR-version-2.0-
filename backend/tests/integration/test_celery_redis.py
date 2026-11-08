@@ -24,7 +24,11 @@ from app.core.config import Settings
 from app.core.errors import ServiceUnavailableException
 from app.core.redis import create_redis_client, get_sync_redis_client
 from app.core.security import SecurityContext
-from app.core.tasks.idempotency import LUA_RECONCILE_DISPATCH, IdempotencyManager
+from app.core.tasks.idempotency import (
+    LUA_RECONCILE_DISPATCH,
+    IdempotencyManager,
+    format_scoped_key,
+)
 from app.core.tasks.system import system_ping
 from app.main import create_application
 from app.modules.auth.dependencies import require_authenticated_user
@@ -619,7 +623,7 @@ async def test_live_redis_started_race_preserves_dispatch_unknown_and_worker_com
 
     test_key = "live-started-race-" + uuid.uuid4().hex
     task_id = "live-task-" + uuid.uuid4().hex
-    scoped_key = f"idempotency:task:{TENANT_A}:anon:system_ping:{test_key}"
+    scoped_key = format_scoped_key(key=test_key, tenant_id=TENANT_A, task_type="system_ping")
 
     try:
         # Step 1: Initial submission registered in live Redis
@@ -679,7 +683,7 @@ async def test_live_redis_started_race_preserves_dispatch_unknown_and_worker_com
         lua_invalid_res = await async_redis.eval(
             LUA_RECONCILE_DISPATCH,
             1,
-            f"idempotency:task:{scoped_key}",
+            scoped_key,
             task_id,
             "STARTED",
             "360",
