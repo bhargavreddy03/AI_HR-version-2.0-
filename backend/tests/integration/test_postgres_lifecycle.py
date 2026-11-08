@@ -1979,14 +1979,13 @@ def test_postgres_vector_downgrade_preserves_external_dependent_objects_and_exte
         sync_engine.dispose()
 
 
+@skip_if_no_postgres
 @pytest.mark.asyncio
-@pytest.mark.skipif(
-    not postgres_is_live(),
-    reason="PostgreSQL service not reachable at INTEGRATION_DB_URL",
-)
-async def test_sole_admin_concurrency_serialization() -> None:
+async def test_sole_admin_concurrency_serialization(
+    integration_settings: Settings,
+) -> None:
     """Verify that concurrent operations cannot demote or remove the last active administrator (Finding 2)."""
-    engine = create_db_engine(INTEGRATION_DB_URL, pool_size=5, max_overflow=5)
+    engine = create_db_engine(integration_settings)
     session_factory = create_session_factory(engine)
 
     tenant_id = generate_uuid7()
