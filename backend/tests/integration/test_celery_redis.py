@@ -609,12 +609,14 @@ async def test_live_redis_full_state_transition_matrix() -> None:
 @skip_if_no_redis
 @pytest.mark.asyncio
 async def test_live_redis_started_race_preserves_dispatch_unknown_and_worker_completes() -> None:
-    """DEFECT 1 & 2 LIVE REDIS TEST:
+    """Verifies Redis atomic Lua state transitions and state-machine isolation under simulated Celery STARTED race.
 
-    1. Celery reports STARTED before worker acquires lock; API retry preserves DISPATCH_UNKNOWN in live Redis.
-    2. Worker subsequently acquires lock from DISPATCH_UNKNOWN and completes successfully.
+    Specifically tests:
+    1. Celery reports STARTED before worker acquires lock; API retry preserves DISPATCH_UNKNOWN in live Redis without mutating it.
+    2. Atomic Lua acquisition transitions DISPATCH_UNKNOWN -> PROCESSING strictly when matching task ID arrives.
     3. Live Lua rejects mismatched task ID and 'standalone' task ID against existing record.
     4. Live Lua rejects reconciliation with non-PENDING target status.
+    5. Real worker subprocess execution from DISPATCH_UNKNOWN is verified end-to-end in test_live_celery_worker_recovers_and_executes_from_dispatch_unknown.
     """
     settings = Settings()
     sync_redis = get_sync_redis_client(settings)
@@ -714,5 +716,82 @@ async def test_live_redis_started_race_preserves_dispatch_unknown_and_worker_com
         assert final_d["result"]["message"] == "race-check-completed"
 
     finally:
+        manager.force_delete(scoped_key)
+        await async_redis.aclose()
+
+
+@pytest.mark.integration
+@skip_if_no_redis
+@pytest.mark.asyncio
+async def test_live_celery_worker_recovers_and_executes_from_dispatch_unknown(
+    live_celery_worker: Any,
+) -> None:
+    """Verify an actual running Celery worker subprocess recovers and executes an idempotent task starting in DISPATCH_UNKNOWN.
+
+    Proves with an actual separate worker process:
+    1. Idempotency submission begins in DISPATCH_UNKNOWN (simulating uncertain publish).
+    2. Message is enqueued to Celery broker with matching task ID.
+    3. Live Celery worker picks up task, transitions DISPATCH_UNKNOWN -> PROCESSING via Lua, and completes.
+    4. Task result is stored in Celery backend and Redis idempotency record becomes COMPLETED.
+    """
+    settings = Settings()
+    async_redis = create_redis_client(settings)
+    task_name = getattr(system_ping, "name", "system_ping")
+    test_key = "live-real-worker-unknown-" + uuid.uuid4().hex
+    task_id = "real-worker-task-" + uuid.uuid4().hex
+    scoped_key = format_scoped_key(key=test_key, tenant_id=TENANT_A, task_type=task_name)
+
+    try:
+        # Step 1: Register submission in Redis
+        reg_ok, _ = await IdempotencyManager.register_submission_async(
+            client=async_redis,
+            key=scoped_key,
+            task_id=task_id,
+            tenant_id=TENANT_A,
+            task_type=task_name,
+        )
+        assert reg_ok is True
+
+        # Step 2: Record DISPATCH_UNKNOWN to simulate broker uncertainty
+        rec_ok, _, _ = await IdempotencyManager.record_dispatch_unknown_async(
+            client=async_redis,
+            key=scoped_key,
+            expected_task_id=task_id,
+            error_msg="Simulated broker uncertain dispatch",
+        )
+        assert rec_ok is True
+
+        # Step 3: Dispatch message to live Celery broker using the exact same task_id
+        async_res = system_ping.apply_async(
+            args=("real-worker-dispatch-unknown",),
+            kwargs={"idempotency_key": test_key, "tenant_id": str(TENANT_A)},
+            queue="default",
+            task_id=task_id,
+            headers={"idempotency_scoped_key": scoped_key},
+        )
+        assert async_res.id == task_id
+
+        # Step 4: Real separate Celery worker picks up and executes the task
+        start_time = time.time()
+        while time.time() - start_time < 12.0:
+            if async_res.ready():
+                break
+            time.sleep(0.3)
+
+        assert async_res.ready() is True
+        assert async_res.successful() is True
+        res_payload = async_res.result
+        assert res_payload["status"] == "pong"
+        assert res_payload["message"] == "real-worker-dispatch-unknown"
+
+        # Step 5: Verify live Redis record transitioned to COMPLETED
+        final_d = await IdempotencyManager.get_async(async_redis, scoped_key)
+        assert final_d is not None
+        assert final_d["status"] == "COMPLETED"
+        assert final_d["result"]["status"] == "pong"
+
+    finally:
+        sync_redis = get_sync_redis_client(settings)
+        manager = IdempotencyManager(sync_client=sync_redis, settings=settings)
         manager.force_delete(scoped_key)
         await async_redis.aclose()

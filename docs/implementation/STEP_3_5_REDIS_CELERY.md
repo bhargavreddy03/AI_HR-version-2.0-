@@ -264,3 +264,29 @@ cd backend
 # Run Celery and Redis integration tests (with Redis running on 6379)
 .venv/Scripts/pytest tests/integration/test_celery_redis.py -v
 ```
+
+---
+
+## 8. Verification Results & Testing Matrix
+
+### 8.1 Quality Gates & Verification Matrix
+All quality gates and CI pipelines are fully passing across backend, frontend, and container orchestration:
+
+| Gate / Suite | Scope & Coverage | Status | Result / Metric |
+|---|---|---|---|
+| **Ruff Check & Formatting** | Backend linting, style, formatting | Passed | 75 files formatted, 0 errors |
+| **Mypy Type Checking** | Static type analysis under strict config | Passed | 54 source files, 0 type errors |
+| **Backend Pytest (Unit)** | Isolated task lifecycle, failure policies, sanitization | Passed | 177 unit tests passed |
+| **Backend Pytest (CI Full)** | Live PostgreSQL 16 + pgvector + Redis DB 0/1/2 | Passed | 206 integration & unit tests passed |
+| **Frontend CI** | ESLint, TypeScript compilation, Next.js build | Passed | Next.js 14 production build passed |
+| **Container & Compose CI** | Docker Compose validation, multi-stage images | Passed | Development & production Compose valid |
+
+### 8.2 Real Celery Worker vs. State-Machine Verification
+Testing distinguishes between two complementary verification boundaries:
+1. **Live Redis State Machine & Lua Script Verification** (`test_live_redis_*`):
+   - Validates atomic Lua state transitions (`LUA_ACQUIRE`, `LUA_COMPLETE`, `LUA_FAIL`, `LUA_RENEW_LOCK`, `LUA_RECORD_DISPATCH_UNKNOWN`, `LUA_RECONCILE_DISPATCH`) directly against Redis.
+   - Proves state-machine isolation against simulated race conditions (e.g., Celery reporting `STARTED` while Redis is `DISPATCH_UNKNOWN`), stale lock token rejections, and invalid target status rejections.
+2. **Actual Separate Celery Worker Process Execution** (`test_live_celery_worker_*`):
+   - Starts an independent Celery worker subprocess (`sys.executable -m celery -A app.worker.celery_app worker`) connected to Redis DB 1 (broker) and DB 2 (result backend).
+   - Proves end-to-end task pickup, `@idempotent_task` lock acquisition with `self.request.id`, task execution, result storage, and safe recovery from `DISPATCH_UNKNOWN`.
+   - Proves authenticated task submission, tenant isolation enforcement, and duplicate execution suppression in production worker conditions.
