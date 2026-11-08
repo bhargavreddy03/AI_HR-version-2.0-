@@ -65,8 +65,13 @@ jobs:
       - name: Initialize PostgreSQL Roles and Extensions
         env:
           PGPASSWORD: test_super_password_only
+          POSTGRES_MIGRATION_USER: aihr_migration_user
+          POSTGRES_MIGRATION_PASSWORD: local_development_migration_password_only
+          POSTGRES_USER: aihr_app_user
+          POSTGRES_PASSWORD: local_development_password_only
+          POSTGRES_DB: ai_hr_db_test
         run: |
-          psql -h localhost -U postgres -d ai_hr_db_test -f infrastructure/scripts/init-db.sql
+          bash infrastructure/scripts/init-db.sh
 
       - name: Run Pytest Test Suite
         env:

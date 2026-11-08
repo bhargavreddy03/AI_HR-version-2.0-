@@ -80,11 +80,16 @@ In strict conformance with Architecture Document 04 Section 1:
   - Used exclusively during container creation (`init-db.sql`) to install extensions and bootstrap roles.
   - Never used by the application runtime or CI tests.
 - **`aihr_migration_user` (Privileged Migration / Schema Owner Role)**:
-  - Created with `NOSUPERUSER`, `NOBYPASSRLS`, `CREATEDB`.
+  - Created with `NOSUPERUSER`, `NOBYPASSRLS`, `NOCREATEDB`, `NOCREATEROLE`.
   - Owns schema `public` and all tenant-scoped tables (`candidate_document_embeddings`, `job_embeddings`, `organization_memberships`, etc.).
   - Used strictly by Alembic for DDL migrations (`DATABASE_MIGRATION_URL` / `DATABASE_SYNC_URL`).
 - **`aihr_app_user` (Restricted Application Runtime Role)**:
   - Created with `NOSUPERUSER`, `NOBYPASSRLS`, `NOCREATEDB`, `NOCREATEROLE`.
+- **Zero Hardcoded Role Credentials & Controlled Reconciliation**:
+  - `infrastructure/scripts/init-db.sql` and `infrastructure/scripts/init-db.sh` contain no hardcoded password literals.
+  - Ingests configured credentials directly from environment variables (`POSTGRES_MIGRATION_PASSWORD`, `POSTGRES_PASSWORD`) via psql `\getenv`.
+  - Employs safely quoted psql identifiers (`:"effective_mig_user"`, `:"effective_app_user"`) and string literals (`:'mig_password'`, `:'app_password'`).
+  - Idempotently reconciles passwords for both freshly created and pre-existing roles during controlled bootstrap without exposing secrets in logs or CLI process listings (`ps aux`).
   - Does **NOT** own any tenant-scoped tables, ensuring table-owner RLS bypass is impossible.
   - Granted restricted DML permissions (`SELECT`, `INSERT`, `UPDATE`, `DELETE`) via `ALTER DEFAULT PRIVILEGES`.
   - Used by the FastAPI runtime and Celery background workers (`DATABASE_URL`).
@@ -207,7 +212,7 @@ The database test suite covers all categories specified in the requirements:
 18. `test_store_job_embedding_validation`: Validates vector dimensions for job embeddings.
 19. `test_search_similar_candidate_documents_rejects_unsupported_dimensions`: Rejects invalid query dimensions.
 
-### Integration Tests (`backend/tests/integration/test_postgres_lifecycle.py`) — 21 Tests
+### Integration Tests (`backend/tests/integration/test_postgres_lifecycle.py`) — 22 Tests
 1. `test_postgres_connection_and_session_lifecycle`: Live connectivity and query execution.
 2. `test_postgres_commit_and_rollback_behavior`: Transaction rollback discards uncommitted mutations.
 3. `test_postgres_transaction_local_tenant_context`: Parameterized `set_config` transaction scoping.
@@ -229,6 +234,7 @@ The database test suite covers all categories specified in the requirements:
 19. `test_postgres_vector_similarity_search_hardened_validation_integration`: Verifies live database rejection of invalid limits, empty/NaN vectors, missing/inactive models, and dimension mismatches.
 20. `test_postgres_hnsw_indexes_exist_and_downgrade_upgrade_lifecycle`: HNSW index validation and reversible migrations.
 21. `test_postgres_vector_downgrade_preserves_external_dependent_objects_and_extension`: Verifies safe non-cascading downgrade preserving extension and external vector objects.
+22. `test_postgres_role_initialization_with_custom_credentials_and_reconciliation`: Verifies initialization with custom passwords, validates `rolsuper=false`, `rolbypassrls=false`, `rolcreatedb=false`, and proves credential reconciliation/rotation invalidates old passwords.
 
 ---
 

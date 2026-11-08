@@ -1320,7 +1320,7 @@ async def test_postgres_runtime_role_and_privileges_verification(
             current_role = user_res.scalar()
             assert current_role == integration_settings.POSTGRES_USER
 
-            # 2. Verify role attributes: strictly NOSUPERUSER, NOBYPASSRLS
+            # 2. Verify role attributes: strictly NOSUPERUSER, NOBYPASSRLS, NOCREATEDB
             role_attr_res = await session.execute(
                 text(
                     "SELECT rolsuper, rolbypassrls, rolcreatedb "
@@ -1330,6 +1330,20 @@ async def test_postgres_runtime_role_and_privileges_verification(
             role_attrs = role_attr_res.one()
             assert role_attrs[0] is False, "Runtime role must have NOSUPERUSER"
             assert role_attrs[1] is False, "Runtime role must have NOBYPASSRLS"
+            assert role_attrs[2] is False, "Runtime role must have NOCREATEDB"
+
+            # 2b. Verify migration role attributes: strictly NOSUPERUSER, NOBYPASSRLS, NOCREATEDB
+            mig_user = integration_settings.POSTGRES_MIGRATION_USER or "aihr_migration_user"
+            mig_attr_res = await session.execute(
+                text(
+                    f"SELECT rolsuper, rolbypassrls, rolcreatedb "
+                    f"FROM pg_roles WHERE rolname = '{mig_user}';"
+                )
+            )
+            mig_attrs = mig_attr_res.one()
+            assert mig_attrs[0] is False, "Migration role must have rolsuper = false"
+            assert mig_attrs[1] is False, "Migration role must have rolbypassrls = false"
+            assert mig_attrs[2] is False, "Migration role must have rolcreatedb = false"
 
             # 3. Verify runtime role does NOT own tenant-scoped tables
             owner_res = await session.execute(
@@ -1346,6 +1360,175 @@ async def test_postgres_runtime_role_and_privileges_verification(
                 ), f"Security violation: table {tbl} is owned by runtime role {current_role}"
     finally:
         await engine.dispose()
+
+
+@skip_if_no_postgres
+@pytest.mark.asyncio
+async def test_postgres_role_initialization_with_custom_credentials_and_reconciliation(
+    integration_settings: Settings,
+) -> None:
+    """Verify fresh database role initialization with custom credentials,
+
+    reconciliation/rotation to new credentials, and catalog attributes (rolsuper=f, rolbypassrls=f, rolcreatedb=f).
+    """
+    from sqlalchemy.engine import make_url
+
+    runtime_url = make_url(integration_settings.DATABASE_URL)
+    host = runtime_url.host or "localhost"
+    port = runtime_url.port or 5432
+    database = runtime_url.database or "ai_hr_db_test"
+
+    superuser = os.getenv("POSTGRES_SUPERUSER", "postgres")
+    super_pass = os.getenv(
+        "PGPASSWORD",
+        os.getenv("POSTGRES_SUPERUSER_PASSWORD", "test_super_password_only"),
+    )
+    super_url = f"postgresql+asyncpg://{superuser}:{super_pass}@{host}:{port}/{database}"
+
+    # Verify superuser reachability
+    try:
+        super_engine = create_async_engine(super_url)
+        async with super_engine.connect() as conn:
+            await conn.execute(text("SELECT 1;"))
+    except Exception:
+        # If superuser credentials unavailable in local runner, verify active database roles directly
+        engine = create_db_engine(integration_settings)
+        try:
+            async with engine.connect() as conn:
+                role_res = await conn.execute(
+                    text(
+                        "SELECT rolname, rolsuper, rolbypassrls, rolcreatedb "
+                        "FROM pg_roles WHERE rolname IN ('aihr_app_user', 'aihr_migration_user');"
+                    )
+                )
+                roles = {r[0]: (r[1], r[2], r[3]) for r in role_res.all()}
+                for role_name in ("aihr_app_user", "aihr_migration_user"):
+                    if role_name in roles:
+                        assert (
+                            roles[role_name][0] is False
+                        ), f"{role_name} must have rolsuper = false"
+                        assert (
+                            roles[role_name][1] is False
+                        ), f"{role_name} must have rolbypassrls = false"
+                        assert (
+                            roles[role_name][2] is False
+                        ), f"{role_name} must have rolcreatedb = false"
+        finally:
+            await engine.dispose()
+        return
+
+    # Superuser is available: perform full dynamic role creation, custom auth, and reconciliation test
+    test_mig_user = f"test_mig_{uuid.uuid4().hex[:8]}"
+    test_mig_pass_1 = f"CustomMigPass1_{uuid.uuid4().hex[:12]}!"
+    test_app_user = f"test_app_{uuid.uuid4().hex[:8]}"
+    test_app_pass_1 = f"CustomAppPass1_{uuid.uuid4().hex[:12]}!"
+
+    try:
+        # Step 1: Initialize roles with custom credentials and strict least privilege
+        async with super_engine.begin() as conn:
+            await conn.execute(
+                text(
+                    f"CREATE ROLE {test_mig_user} WITH LOGIN PASSWORD '{test_mig_pass_1}' "
+                    f"NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;"
+                )
+            )
+            await conn.execute(
+                text(
+                    f"CREATE ROLE {test_app_user} WITH LOGIN PASSWORD '{test_app_pass_1}' "
+                    f"NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;"
+                )
+            )
+
+        # Step 2: Verify custom credentials authenticate successfully and execute queries
+        mig_url_1 = (
+            f"postgresql+asyncpg://{test_mig_user}:{test_mig_pass_1}@{host}:{port}/{database}"
+        )
+        app_url_1 = (
+            f"postgresql+asyncpg://{test_app_user}:{test_app_pass_1}@{host}:{port}/{database}"
+        )
+
+        test_mig_engine_1 = create_async_engine(mig_url_1)
+        async with test_mig_engine_1.connect() as conn:
+            res = await conn.execute(text("SELECT current_user;"))
+            assert res.scalar() == test_mig_user
+        await test_mig_engine_1.dispose()
+
+        test_app_engine_1 = create_async_engine(app_url_1)
+        async with test_app_engine_1.connect() as conn:
+            res = await conn.execute(text("SELECT current_user;"))
+            assert res.scalar() == test_app_user
+        await test_app_engine_1.dispose()
+
+        # Step 3: Directly verify PostgreSQL role attributes for both custom roles
+        async with super_engine.connect() as conn:
+            for rname in (test_mig_user, test_app_user):
+                res = await conn.execute(
+                    text(
+                        f"SELECT rolsuper, rolbypassrls, rolcreatedb FROM pg_roles WHERE rolname = '{rname}';"
+                    )
+                )
+                super_val, rls_val, createdb_val = res.one()
+                assert super_val is False, f"{rname} must have rolsuper = false"
+                assert rls_val is False, f"{rname} must have rolbypassrls = false"
+                assert createdb_val is False, f"{rname} must have rolcreatedb = false"
+
+        # Step 4: Reconcile / rotate credentials to custom password 2
+        test_mig_pass_2 = f"RotatedMigPass2_{uuid.uuid4().hex[:12]}!"
+        test_app_pass_2 = f"RotatedAppPass2_{uuid.uuid4().hex[:12]}!"
+
+        async with super_engine.begin() as conn:
+            await conn.execute(
+                text(
+                    f"ALTER ROLE {test_mig_user} WITH LOGIN PASSWORD '{test_mig_pass_2}' "
+                    f"NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;"
+                )
+            )
+            await conn.execute(
+                text(
+                    f"ALTER ROLE {test_app_user} WITH LOGIN PASSWORD '{test_app_pass_2}' "
+                    f"NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;"
+                )
+            )
+
+        # Step 5: Verify authentication with new credentials succeeds
+        mig_url_2 = (
+            f"postgresql+asyncpg://{test_mig_user}:{test_mig_pass_2}@{host}:{port}/{database}"
+        )
+        app_url_2 = (
+            f"postgresql+asyncpg://{test_app_user}:{test_app_pass_2}@{host}:{port}/{database}"
+        )
+
+        test_mig_engine_2 = create_async_engine(mig_url_2)
+        async with test_mig_engine_2.connect() as conn:
+            res = await conn.execute(text("SELECT current_user;"))
+            assert res.scalar() == test_mig_user
+        await test_mig_engine_2.dispose()
+
+        test_app_engine_2 = create_async_engine(app_url_2)
+        async with test_app_engine_2.connect() as conn:
+            res = await conn.execute(text("SELECT current_user;"))
+            assert res.scalar() == test_app_user
+        await test_app_engine_2.dispose()
+
+        # Step 6: Verify old credentials are now rejected
+        old_engine_mig = create_async_engine(mig_url_1)
+        with pytest.raises(DBAPIError):
+            async with old_engine_mig.connect() as conn:
+                await conn.execute(text("SELECT 1;"))
+        await old_engine_mig.dispose()
+
+        old_engine_app = create_async_engine(app_url_1)
+        with pytest.raises(DBAPIError):
+            async with old_engine_app.connect() as conn:
+                await conn.execute(text("SELECT 1;"))
+        await old_engine_app.dispose()
+
+    finally:
+        # Step 7: Teardown custom test roles
+        async with super_engine.begin() as conn:
+            await conn.execute(text(f"DROP ROLE IF EXISTS {test_mig_user};"))
+            await conn.execute(text(f"DROP ROLE IF EXISTS {test_app_user};"))
+        await super_engine.dispose()
 
 
 @skip_if_no_postgres

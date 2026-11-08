@@ -12,11 +12,16 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-ai_hr_db}
       POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-local_development_super_password_only}
+      POSTGRES_MIGRATION_USER: ${POSTGRES_MIGRATION_USER:-aihr_migration_user}
+      POSTGRES_MIGRATION_PASSWORD: ${POSTGRES_MIGRATION_PASSWORD:-local_development_migration_password_only}
+      POSTGRES_APP_USER: ${POSTGRES_USER:-aihr_app_user}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_PASSWORD:-local_development_password_only}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ../scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ../scripts/init-db.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+      - ../scripts/init-db.sql:/infrastructure/scripts/init-db.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-postgres} -d ${POSTGRES_DB:-ai_hr_db}"]
       interval: 10s

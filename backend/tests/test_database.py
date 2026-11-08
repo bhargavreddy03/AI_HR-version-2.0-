@@ -583,3 +583,65 @@ async def test_search_similar_candidate_documents_rejects_inactive_model() -> No
             query_vector=[0.1] * 1536,
             model_identifier="deprecated-model",
         )
+
+
+def test_init_db_sql_no_hardcoded_credentials_and_nocreatedb() -> None:
+    """Verify that infrastructure/scripts/init-db.sql does not embed hardcoded passwords
+
+    and strictly enforces NOCREATEDB, NOSUPERUSER, and NOBYPASSRLS for both roles.
+    """
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    sql_path = repo_root / "infrastructure" / "scripts" / "init-db.sql"
+    assert sql_path.exists(), f"init-db.sql not found at {sql_path}"
+
+    content = sql_path.read_text(encoding="utf-8")
+
+    # 1. No hardcoded password literals in CREATE/ALTER ROLE statements
+    assert (
+        "local_development_password_only'" not in content
+    ), "Security finding: hardcoded application password found in init-db.sql"
+    assert (
+        "local_development_migration_password_only'" not in content
+    ), "Security finding: hardcoded migration password found in init-db.sql"
+
+    # 2. Uses \getenv for secure parameter ingestion
+    assert "\\getenv mig_user POSTGRES_MIGRATION_USER" in content
+    assert "\\getenv mig_password POSTGRES_MIGRATION_PASSWORD" in content
+    assert "\\getenv app_user POSTGRES_APP_USER" in content or "\\getenv app_user" in content
+    assert (
+        "\\getenv app_password POSTGRES_APP_PASSWORD" in content
+        or "\\getenv app_password" in content
+    )
+
+    # 3. Uses quoted psql parameters
+    assert ":'mig_password'" in content
+    assert ":'app_password'" in content
+    assert ':"effective_mig_user"' in content
+    assert ':"effective_app_user"' in content
+
+    # 4. Strictly enforces NOCREATEDB, NOSUPERUSER, and NOBYPASSRLS
+    assert "NOCREATEDB" in content
+    assert "NOSUPERUSER" in content
+    assert "NOBYPASSRLS" in content
+    # Ensure CREATEDB without "NO" is NOT granted to migration user
+    assert "CREATEDB NOSUPERUSER" not in content
+
+
+def test_init_db_sh_entrypoint_security() -> None:
+    """Verify infrastructure/scripts/init-db.sh safe execution and secret protection."""
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    sh_path = repo_root / "infrastructure" / "scripts" / "init-db.sh"
+    assert sh_path.exists(), f"init-db.sh not found at {sh_path}"
+
+    content = sh_path.read_text(encoding="utf-8")
+
+    # Ensures secrets are not leaked in stdout/stderr logs
+    assert "set +x" in content
+    assert "set -eo pipefail" in content
+    # Verifies environment variable names
+    assert "POSTGRES_MIGRATION_USER" in content
+    assert "POSTGRES_MIGRATION_PASSWORD" in content
+    assert "POSTGRES_USER" in content
+    assert "POSTGRES_PASSWORD" in content
+    # Verifies credentials are not passed as -W or -p password CLI flags
+    assert "-W " not in content
