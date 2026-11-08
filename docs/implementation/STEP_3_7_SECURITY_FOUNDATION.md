@@ -81,7 +81,13 @@ RBAC security guards and serialization primitives are integrated directly into t
   - In `assign_membership_role()`, `update_membership()`, and `remove_membership()`, the tenant organization row lock (`serialize_organization_mutation(db, tenant_id)`) is acquired as **Step 1** prior to resolving actor authority or checking permissions.
   - This eliminates a high-severity authorization race condition where an actor's credentials, role, or active status were previously resolved before acquiring the organization lock. Under that previous order, an administrator demoted or deactivated while waiting on the lock would still execute mutations using stale cached authority.
   - With lock-first ordering, transactions serialize before actor resolution. Under PostgreSQL's `READ COMMITTED` isolation level, the waiting transaction's subsequent read of the actor's user and membership record observes the newly committed revocation, immediately terminating execution with `403 MEMBERSHIP_MUTATION_FORBIDDEN`.
-  - A comprehensive PostgreSQL concurrency regression test (`test_actor_revocation_while_waiting_for_organization_lock_rejected` in `test_postgres_lifecycle.py`) exercises all three mutation functions under live row contention, proving that privilege revocations committed while an operation is queued behind the lock strictly prevent execution with stale permissions.
+  - **Deterministic Lock-Wait Verification Methodology**:
+    - Replaced timing-based sleep assumptions (`asyncio.sleep(0.05)`) with server-side PostgreSQL lock verification.
+    - Captures backend process IDs for both connections (`SELECT pg_backend_pid()`).
+    - Employs a separate monitoring connection to verify via `pg_stat_activity` and `pg_blocking_pids(session_2_pid)` that Session 2 is actively and genuinely blocked by Session 1 on a PostgreSQL row lock (`wait_event_type = 'Lock'`).
+    - Session 1 commits the actor demotion/deactivation only after the lock contention is confirmed by the monitor.
+    - Includes bounded monitoring timeouts with immediate task failure detection to prevent hangs or nondeterministic passes.
+    - A comprehensive PostgreSQL concurrency regression test (`test_actor_revocation_while_waiting_for_organization_lock_rejected` in `test_postgres_lifecycle.py`) exercises all three mutation functions (`assign_membership_role`, `update_membership`, `remove_membership`) under verified lock contention.
 - **Database-Resolved Authority & Ceiling Rule (`_resolve_trusted_actor_context`)**:
   - In `assign_membership_role()`, `update_membership()`, and `remove_membership()`, actor roles, super-admin status, and authorized permission sets are resolved directly from trusted database records (`User`, `OrganizationMembership`, `Role`, `RolePermission`).
   - Caller-supplied role or super-admin parameters are never accepted as proof of authority, neutralizing claim-spoofing attacks.

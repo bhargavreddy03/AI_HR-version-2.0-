@@ -11,6 +11,7 @@ import time
 import uuid
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import asyncpg
 import pytest
@@ -580,6 +581,7 @@ async def test_postgres_concurrent_backup_code_redemption_serializes(
         async with session_factory() as session:
             stmt = select(User).where(User.id == user_id)
             db_user = (await session.execute(stmt)).scalar_one()
+            assert db_user.mfa_backup_codes is not None
             assert len(db_user.mfa_backup_codes) == 9
             assert (
                 verify_backup_code(
@@ -2149,6 +2151,66 @@ async def test_sole_admin_concurrency_serialization(
         await engine.dispose()
 
 
+async def wait_until_backend_is_blocked(
+    session_factory: async_sessionmaker[AsyncSession],
+    blocked_pid: int,
+    expected_blocker_pid: int | None = None,
+    task: asyncio.Task[Any] | None = None,
+    timeout: float = 5.0,
+    poll_interval: float = 0.01,
+) -> None:
+    """Verify that a PostgreSQL backend is genuinely blocked waiting on a lock.
+
+    Queries pg_stat_activity and pg_blocking_pids() using a separate monitoring connection.
+    Ensures:
+    1. Deterministic synchronization instead of timing-based sleeps.
+    2. Verification that the backend is waiting on a 'Lock' event and blocked by expected_blocker_pid.
+    3. Bounded timeout that produces a clear assertion failure if lock wait is not observed.
+    4. Immediate failure if the target task finishes prematurely with an error.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    async with session_factory() as monitor_session:
+        while asyncio.get_running_loop().time() < deadline:
+            if task is not None and task.done():
+                exc = task.exception()
+                if exc:
+                    raise AssertionError(
+                        f"Target task failed prematurely before acquiring/waiting on lock: {exc}"
+                    ) from exc
+                raise AssertionError(
+                    f"Target task finished unexpectedly before lock contention was observed: {task.result()}"
+                )
+
+            stmt = text(
+                """
+                SELECT
+                    wait_event_type,
+                    wait_event,
+                    pg_blocking_pids(pid) AS blockers
+                FROM pg_stat_activity
+                WHERE pid = :pid
+                """
+            )
+            res = await monitor_session.execute(stmt, {"pid": blocked_pid})
+            row = res.first()
+            if row is not None:
+                wait_event_type, _wait_event, blockers = row
+                if expected_blocker_pid is not None:
+                    if blockers is not None and expected_blocker_pid in blockers:
+                        return
+                else:
+                    if (blockers is not None and len(blockers) > 0) or wait_event_type == "Lock":
+                        return
+
+            await monitor_session.rollback()
+            await asyncio.sleep(poll_interval)
+
+    raise AssertionError(
+        f"Backend PID {blocked_pid} was not observed waiting on PostgreSQL lock "
+        f"(expected blocker: {expected_blocker_pid}) within {timeout} seconds."
+    )
+
+
 @skip_if_no_postgres
 @pytest.mark.asyncio
 async def test_actor_revocation_while_waiting_for_organization_lock_rejected(
@@ -2157,7 +2219,7 @@ async def test_actor_revocation_while_waiting_for_organization_lock_rejected(
     """Verify that an administrator whose privileges are revoked while waiting for the organization lock
 
     cannot execute operations using stale permissions across assign_membership_role, update_membership,
-    and remove_membership.
+    and remove_membership. Deterministically verified via pg_stat_activity and pg_blocking_pids.
     """
     engine = create_db_engine(integration_settings)
     session_factory = create_session_factory(engine)
@@ -2249,15 +2311,21 @@ async def test_actor_revocation_while_waiting_for_organization_lock_rejected(
         # ----------------------------------------------------------------------
         async with session_factory() as session_1:
             await set_tenant_context(session_1, tenant_id)
+            session_1_pid = (await session_1.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+
             # Session 1 acquires organization row lock
             await session_1.execute(
                 select(Organization.id).where(Organization.id == tenant_id).with_for_update()
             )
 
+            pid_1_future: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+
             # Session 2 attempts assign_membership_role (blocks on organization lock)
             async def try_assign() -> OrganizationMembership:
                 async with session_factory() as session_2:
                     await set_tenant_context(session_2, tenant_id)
+                    s2_pid = (await session_2.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+                    pid_1_future.set_result(s2_pid)
                     return await assign_membership_role(
                         db=session_2,
                         tenant_id=tenant_id,
@@ -2267,9 +2335,18 @@ async def test_actor_revocation_while_waiting_for_organization_lock_rejected(
                     )
 
             assign_task = asyncio.create_task(try_assign())
-            await asyncio.sleep(0.05)  # Ensure Task 2 is waiting on PostgreSQL lock
+            session_2_pid = await asyncio.wait_for(pid_1_future, timeout=5.0)
 
-            # Session 1 demotes admin_id to recruiter while Task 2 is waiting
+            # Deterministically verify Session 2 is actively blocked on PostgreSQL lock held by Session 1
+            await wait_until_backend_is_blocked(
+                session_factory=session_factory,
+                blocked_pid=session_2_pid,
+                expected_blocker_pid=session_1_pid,
+                task=assign_task,
+                timeout=5.0,
+            )
+
+            # Session 1 demotes admin_id to recruiter only after confirmed lock wait
             await session_1.execute(
                 update(OrganizationMembership)
                 .where(
@@ -2278,7 +2355,7 @@ async def test_actor_revocation_while_waiting_for_organization_lock_rejected(
                 )
                 .values(role_id=recruiter_role.id)
             )
-            await session_1.commit()  # Commits demotion & releases lock to Task 2
+            await session_1.commit()  # Commits demotion & releases lock to Session 2
 
             with pytest.raises(AuthorizationException) as exc_assign:
                 await assign_task
@@ -2302,13 +2379,20 @@ async def test_actor_revocation_while_waiting_for_organization_lock_rejected(
         # ----------------------------------------------------------------------
         async with session_factory() as session_1:
             await set_tenant_context(session_1, tenant_id)
+            session_1_pid = (await session_1.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+
+            # Session 1 acquires organization row lock
             await session_1.execute(
                 select(Organization.id).where(Organization.id == tenant_id).with_for_update()
             )
 
+            pid_2_future: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+
             async def try_update() -> OrganizationMembership:
                 async with session_factory() as session_2:
                     await set_tenant_context(session_2, tenant_id)
+                    s2_pid = (await session_2.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+                    pid_2_future.set_result(s2_pid)
                     return await update_membership(
                         db=session_2,
                         tenant_id=tenant_id,
@@ -2318,9 +2402,18 @@ async def test_actor_revocation_while_waiting_for_organization_lock_rejected(
                     )
 
             update_task = asyncio.create_task(try_update())
-            await asyncio.sleep(0.05)
+            session_2_pid = await asyncio.wait_for(pid_2_future, timeout=5.0)
 
-            # Session 1 deactivates admin_id while Task 2 is waiting
+            # Deterministically verify Session 2 is actively blocked on PostgreSQL lock held by Session 1
+            await wait_until_backend_is_blocked(
+                session_factory=session_factory,
+                blocked_pid=session_2_pid,
+                expected_blocker_pid=session_1_pid,
+                task=update_task,
+                timeout=5.0,
+            )
+
+            # Session 1 deactivates admin_id only after confirmed lock wait
             await session_1.execute(
                 update(OrganizationMembership)
                 .where(
@@ -2353,13 +2446,20 @@ async def test_actor_revocation_while_waiting_for_organization_lock_rejected(
         # ----------------------------------------------------------------------
         async with session_factory() as session_1:
             await set_tenant_context(session_1, tenant_id)
+            session_1_pid = (await session_1.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+
+            # Session 1 acquires organization row lock
             await session_1.execute(
                 select(Organization.id).where(Organization.id == tenant_id).with_for_update()
             )
 
+            pid_3_future: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+
             async def try_remove() -> bool:
                 async with session_factory() as session_2:
                     await set_tenant_context(session_2, tenant_id)
+                    s2_pid = (await session_2.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+                    pid_3_future.set_result(s2_pid)
                     return await remove_membership(
                         db=session_2,
                         tenant_id=tenant_id,
@@ -2368,9 +2468,18 @@ async def test_actor_revocation_while_waiting_for_organization_lock_rejected(
                     )
 
             remove_task = asyncio.create_task(try_remove())
-            await asyncio.sleep(0.05)
+            session_2_pid = await asyncio.wait_for(pid_3_future, timeout=5.0)
 
-            # Session 1 demotes admin_id while Task 2 is waiting
+            # Deterministically verify Session 2 is actively blocked on PostgreSQL lock held by Session 1
+            await wait_until_backend_is_blocked(
+                session_factory=session_factory,
+                blocked_pid=session_2_pid,
+                expected_blocker_pid=session_1_pid,
+                task=remove_task,
+                timeout=5.0,
+            )
+
+            # Session 1 demotes admin_id only after confirmed lock wait
             await session_1.execute(
                 update(OrganizationMembership)
                 .where(
