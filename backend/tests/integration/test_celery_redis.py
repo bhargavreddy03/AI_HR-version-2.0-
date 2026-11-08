@@ -22,7 +22,7 @@ from httpx import ASGITransport, AsyncClient
 from app.core.celery_app import celery_app
 from app.core.config import Settings
 from app.core.errors import ServiceUnavailableException
-from app.core.redis import create_redis_pool, get_sync_redis_client
+from app.core.redis import create_redis_client, get_sync_redis_client
 from app.core.security import SecurityContext
 from app.core.tasks.idempotency import IdempotencyManager
 from app.core.tasks.system import system_ping
@@ -226,8 +226,8 @@ async def test_end_to_end_authenticated_idempotent_task_execution(live_celery_wo
     6. Cross-tenant access is rejected with 403 Forbidden.
     """
     app = create_application()
-    redis_pool = create_redis_pool(Settings())
-    app.state.redis_client = redis_pool
+    redis_client = create_redis_client(Settings())
+    app.state.redis_client = redis_client
 
     auth_a = SecurityContext(
         user_id=USER_A,
@@ -317,7 +317,7 @@ async def test_end_to_end_authenticated_idempotent_task_execution(live_celery_wo
         res_b_result = await ac.get(f"/api/v1/tasks/{task_id}/result")
         assert res_b_result.status_code == 403
 
-    await redis_pool.aclose()
+    await redis_client.aclose()
 
 
 @pytest.mark.asyncio
