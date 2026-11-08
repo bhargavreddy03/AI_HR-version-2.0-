@@ -109,34 +109,47 @@ The abstract `BaseTask` hooks into Celery's lifecycle (`before_start`, `on_succe
 - Structured execution timing measures runtime down to hundredths of a millisecond (`duration_ms`).
 
 ### 4.4 Distributed Idempotency Protocol (`IdempotencyManager`)
-Idempotency keys are tracked in Redis under `idempotency:task:{key}`:
-1. **Acquire**: Atomically executes `SET idempotency:task:{key} payload NX EX lock_ttl`.
-   - If key does not exist: lock is acquired; execution proceeds.
-   - If key exists with status `COMPLETED`: returns cached result immediately without re-execution.
-   - If key exists with status `PROCESSING`: detects concurrent or redelivered run; suppresses duplicate execution.
-2. **Complete**: Updates status to `COMPLETED`, records result payload, and sets retention TTL (24 hours).
-3. **Transient Failure**: Calls `release(key)` to remove the lock, allowing the scheduled retry to re-acquire the lock.
-4. **Permanent Failure**: Calls `fail(key)` with status `FAILED` and error details.
+Idempotency keys are tracked in Redis under `idempotency:task:{key}` using atomic Lua scripts and unique lock ownership tokens:
+1. **API Submission Registration (`LUA_REGISTER_SUBMISSION`)**:
+   - Atomically records initial submission under `idempotency:task:{key}` with status `PENDING`, the real Celery `task_id`, and a submission TTL (300s).
+   - If key already exists: returns the existing record and suppresses duplicate dispatch.
+2. **Worker Acquisition (`LUA_ACQUIRE`)**:
+   - Generates a unique `lock_token` (UUID).
+   - If key is in `PENDING` state with matching `task_id` (or key does not exist for direct task invocations): transitions state to `PROCESSING`, assigns the `lock_token`, and sets the execution lock TTL.
+   - If key is already `PROCESSING` by another worker or `COMPLETED`: rejects acquisition, returning the existing record and suppressing duplicate execution.
+3. **Completion Protection (`LUA_COMPLETE`)**:
+   - Atomically sets status to `COMPLETED` and stores the serialized result with retention TTL (24 hours) **only if** the record's `lock_token` matches the current worker.
+   - Prevents stale or expired workers from overwriting new lock holders.
+4. **Transient Failure (`LUA_RELEASE`)**:
+   - Deletes the key **only if** the `lock_token` matches the current worker, allowing the scheduled retry to safely re-acquire.
+5. **Permanent Failure (`LUA_FAIL`)**:
+   - Marks the task as `FAILED` **only if** the `lock_token` matches the current worker.
 
 ---
 
-## 5. FastAPI Client Integration
+## 5. FastAPI Client Integration & Multi-Tenant Authorization
 
 ### 5.1 Reusable `TaskService` (`backend/app/services/task_service.py`)
 Provides safe async dispatching to avoid blocking FastAPI's uvloop:
-- `submit_task(...)`: Runs `apply_async` off-thread (`asyncio.to_thread`), checks idempotency keys, and returns `TaskSubmissionResult`.
+- `submit_task(...)`: Assigns the real task ID upfront, executes off-thread (`asyncio.to_thread`), checks idempotency keys atomically, records task ownership metadata (`task:meta:{task_id}`) in Redis, and returns `TaskSubmissionResult`.
+- `get_task_metadata(...)`: Retrieves ownership metadata (`tenant_id`, `user_id`, `queue`) for authorization verification.
 - `get_task_status(...)`: Queries `AsyncResult` state without blocking.
 - `revoke_task(...)`: Dispatches control revocation for long-running or cancelled jobs.
 
 ### 5.2 API Endpoints (`/api/v1/tasks`)
 
-| Method | Endpoint | Description | Status Code |
-|---|---|---|---|
-| `POST` | `/api/v1/tasks/system/ping` | Enqueue diagnostic system ping task onto default queue | `202 Accepted` |
-| `GET` | `/api/v1/tasks/{task_id}/status` | Query state (`PENDING`, `STARTED`, `SUCCESS`, `FAILURE`, `RETRY`) | `200 OK` |
-| `GET` | `/api/v1/tasks/{task_id}/result` | Fetch task output or error details | `200 OK` |
+| Method | Endpoint | Description | Status Code | Auth Required |
+|---|---|---|---|---|
+| `POST` | `/api/v1/tasks/system/ping` | Enqueue diagnostic system ping task onto default queue | `202 Accepted` | Yes (`require_authenticated_user`) |
+| `GET` | `/api/v1/tasks/{task_id}/status` | Query state (`PENDING`, `STARTED`, `SUCCESS`, `FAILURE`, `RETRY`) | `200 OK` | Yes (`require_authenticated_user`) |
+| `GET` | `/api/v1/tasks/{task_id}/result` | Fetch task output or error details | `200 OK` | Yes (`require_authenticated_user`) |
 
-Supports optional `Idempotency-Key` header on submission to prevent accidental duplicate clicks or retried HTTP submissions.
+#### Multi-Tenant Security & Isolation Boundary
+1. **Authentication Required**: All task endpoints require a valid session via `require_authenticated_user`. Unauthenticated calls are rejected with 401 Unauthorized.
+2. **Tenant Isolation**: When querying task status or results, the application checks `task:meta:{task_id}` against the user's active `tenant_id`:
+   - If the task belongs to another organization, access is denied immediately with 403 Forbidden (`TENANT_MISMATCH`).
+   - If the task has no tenant metadata and was not created by the user (and the user is not superadmin), access is denied with 403 Forbidden or 404 Not Found.
+3. **Idempotency Header**: Supports optional `Idempotency-Key` header on submission to prevent duplicate task submissions across network retries.
 
 ---
 

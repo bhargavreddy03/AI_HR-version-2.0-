@@ -1,4 +1,7 @@
-"""FastAPI endpoints for background task submission, status monitoring, and result retrieval."""
+"""FastAPI endpoints for background task submission, status monitoring, and result retrieval.
+
+Fully protected by authentication and multi-tenant authorization controls.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +11,10 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
+from app.core.errors import AuthorizationException, EntityNotFoundException
+from app.core.security import SecurityContext
 from app.core.tasks.system import system_ping
+from app.modules.auth.dependencies import require_authenticated_user
 from app.services.task_service import TaskService, task_service
 
 logger = logging.getLogger("app.api.v1.tasks")
@@ -60,6 +66,42 @@ def get_task_service() -> TaskService:
     return task_service
 
 
+async def _verify_task_access(
+    task_id: str,
+    security_context: SecurityContext,
+    service: TaskService,
+    redis_client: Any,
+) -> None:
+    """Verify that the requesting security context is authorized to access the given task."""
+    meta = await service.get_task_metadata(task_id, redis_client)
+    if meta is not None:
+        task_tenant = meta.get("tenant_id")
+        if task_tenant:
+            # Multi-tenant task: Enforce strict tenant boundary
+            if not security_context.is_super_admin:
+                if not security_context.tenant_id or str(security_context.tenant_id) != str(
+                    task_tenant
+                ):
+                    raise AuthorizationException(
+                        "Not authorized to access tasks from another organization",
+                        error_code="TENANT_MISMATCH",
+                    )
+        else:
+            # Non-tenant task: User must be super_admin or creator
+            creator_id = meta.get("user_id")
+            if not security_context.is_super_admin and str(security_context.user_id) != str(
+                creator_id
+            ):
+                raise AuthorizationException(
+                    "Not authorized to access this background task",
+                    error_code="FORBIDDEN",
+                )
+    else:
+        # No ownership record found
+        if not security_context.is_super_admin:
+            raise EntityNotFoundException("Task", task_id)
+
+
 @router.post(
     "/system/ping",
     response_model=TaskSubmissionResponse,
@@ -71,9 +113,10 @@ async def submit_system_ping(
     request: Request,
     payload: SystemPingRequest | None = None,
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+    security_context: SecurityContext = Depends(require_authenticated_user),
     service: TaskService = Depends(get_task_service),
 ) -> TaskSubmissionResponse:
-    """Submit system ping task for asynchronous background processing."""
+    """Submit system ping task for asynchronous background processing with auth context."""
     msg = payload.message if payload else "ping"
     redis_client = getattr(request.app.state, "redis_client", None)
 
@@ -82,6 +125,8 @@ async def submit_system_ping(
         args=(msg,),
         queue="default",
         idempotency_key=idempotency_key,
+        tenant_id=security_context.tenant_id,
+        user_id=security_context.user_id,
         redis_client=redis_client,
     )
 
@@ -101,14 +146,19 @@ async def submit_system_ping(
 )
 async def get_task_status_endpoint(
     task_id: str,
+    request: Request,
+    security_context: SecurityContext = Depends(require_authenticated_user),
     service: TaskService = Depends(get_task_service),
 ) -> TaskStatusResponse:
-    """Retrieve execution status for the specified task ID."""
+    """Retrieve execution status for the specified task ID with tenant authorization check."""
     if not task_id or len(task_id.strip()) == 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="task_id cannot be empty",
         )
+
+    redis_client = getattr(request.app.state, "redis_client", None)
+    await _verify_task_access(task_id, security_context, service, redis_client)
 
     status_result = await service.get_task_status(task_id)
     return TaskStatusResponse(
@@ -128,14 +178,19 @@ async def get_task_status_endpoint(
 )
 async def get_task_result_endpoint(
     task_id: str,
+    request: Request,
+    security_context: SecurityContext = Depends(require_authenticated_user),
     service: TaskService = Depends(get_task_service),
 ) -> TaskResultResponse:
-    """Retrieve task execution output or error details."""
+    """Retrieve task execution output or error details with tenant authorization check."""
     if not task_id or len(task_id.strip()) == 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="task_id cannot be empty",
         )
+
+    redis_client = getattr(request.app.state, "redis_client", None)
+    await _verify_task_access(task_id, security_context, service, redis_client)
 
     status_result = await service.get_task_status(task_id)
 

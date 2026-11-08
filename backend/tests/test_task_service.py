@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,9 +15,13 @@ async def test_task_service_submit_task() -> None:
     """Verify task submission dispatches asynchronously and returns initial metadata."""
     mock_celery = MagicMock()
     mock_async_result = MagicMock()
-    mock_async_result.id = "submitted-task-123"
     mock_task = MagicMock()
-    mock_task.apply_async.return_value = mock_async_result
+
+    def _fake_apply_async(*args, **kwargs):
+        mock_async_result.id = kwargs.get("task_id", "fallback-id")
+        return mock_async_result
+
+    mock_task.apply_async.side_effect = _fake_apply_async
 
     service = TaskService(app_celery=mock_celery)
 
@@ -26,16 +31,15 @@ async def test_task_service_submit_task() -> None:
         queue="default",
     )
 
-    assert result.task_id == "submitted-task-123"
     assert result.status == "PENDING"
     assert result.queue == "default"
     assert result.duplicate is False
-    mock_task.apply_async.assert_called_once_with(
-        args=("hello",),
-        kwargs={},
-        queue="default",
-        countdown=None,
-    )
+    assert result.task_id is not None
+    assert mock_task.apply_async.call_count == 1
+    call_kwargs = mock_task.apply_async.call_args.kwargs
+    assert call_kwargs["task_id"] == result.task_id
+    assert call_kwargs["queue"] == "default"
+    assert call_kwargs["args"] == ("hello",)
 
 
 @pytest.mark.asyncio
@@ -45,17 +49,14 @@ async def test_task_service_duplicate_submission_suppressed() -> None:
     mock_task = MagicMock()
     mock_async_redis = AsyncMock()
 
-    # Simulate existing lock acquired in Redis
-    mock_async_redis.set.return_value = False
-    import json
-
+    # Simulate existing lock acquired in Redis via Lua eval
     existing_payload = json.dumps(
         {
             "status": "PROCESSING",
             "task_id": "previously-submitted-456",
         }
     )
-    mock_async_redis.get.return_value = existing_payload
+    mock_async_redis.eval.return_value = [0, existing_payload]
 
     service = TaskService(app_celery=mock_celery)
 
@@ -124,4 +125,6 @@ async def test_task_service_revoke_task() -> None:
 
     success = await service.revoke_task("task-to-kill", terminate=True)
     assert success is True
-    mock_celery.control.revoke.assert_called_once_with("task-to-kill", terminate=True)
+    mock_celery.control.revoke.assert_called_once_with(
+        "task-to-kill", terminate=True, signal="SIGTERM"
+    )

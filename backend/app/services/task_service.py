@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import uuid
+from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 from celery import Task
 from celery.result import AsyncResult
@@ -15,6 +19,8 @@ from app.core.celery_app import celery_app
 from app.core.tasks.idempotency import IdempotencyManager
 
 logger = logging.getLogger("app.services.task_service")
+
+TASK_META_PREFIX = "task:meta:"
 
 
 class TaskSubmissionResult(BaseModel):
@@ -59,23 +65,26 @@ class TaskService:
         queue: str | None = None,
         countdown: int | None = None,
         idempotency_key: str | None = None,
+        tenant_id: UUID | str | None = None,
+        user_id: UUID | str | None = None,
         redis_client: AsyncRedis[Any] | None = None,
     ) -> TaskSubmissionResult:
-        """Submit a background task for asynchronous execution with optional idempotency protection."""
+        """Submit a background task for asynchronous execution with atomic idempotency and ownership tracking."""
         kw = dict(kwargs) if kwargs else {}
         target_queue = queue or "default"
+        assigned_task_id = str(uuid.uuid4())
 
         # Check idempotency duplicate submission if key is provided and async redis client is available
         if idempotency_key:
             kw["idempotency_key"] = idempotency_key
             if redis_client is not None:
-                acquired, existing = await IdempotencyManager.acquire_async(
+                registered, existing = await IdempotencyManager.register_submission_async(
                     client=redis_client,
                     key=idempotency_key,
-                    task_id="pending_submission",
+                    task_id=assigned_task_id,
                     lock_ttl=300,
                 )
-                if not acquired and existing:
+                if not registered and existing:
                     existing_task_id = str(existing.get("task_id", "cached"))
                     existing_status = str(existing.get("status", "PROCESSING"))
                     logger.info(
@@ -91,29 +100,38 @@ class TaskService:
                         duplicate=True,
                     )
 
+        # Record task ownership metadata in Redis for tenant-isolated querying
+        if redis_client is not None:
+            meta_key = f"{TASK_META_PREFIX}{assigned_task_id}"
+            meta_payload = json.dumps(
+                {
+                    "task_id": assigned_task_id,
+                    "tenant_id": str(tenant_id) if tenant_id else None,
+                    "user_id": str(user_id) if user_id else None,
+                    "queue": target_queue,
+                    "created_at": datetime.now(UTC).isoformat(),
+                }
+            )
+            try:
+                await redis_client.set(meta_key, meta_payload, ex=86400)
+            except Exception as meta_exc:
+                logger.warning("Could not persist task metadata: %s", meta_exc)
+
         # Resolve task function or signature
         resolved_task: Task = self.celery.tasks[task] if isinstance(task, str) else task
 
-        # Dispatch via asyncio.to_thread to prevent blocking the event loop on Redis I/O
+        # Dispatch via asyncio.to_thread to prevent blocking the event loop on Redis broker I/O
         def _dispatch() -> str:
             res: AsyncResult = resolved_task.apply_async(
                 args=args,
                 kwargs=kw,
                 queue=queue,
                 countdown=countdown,
+                task_id=assigned_task_id,
             )
             return str(res.id)
 
         task_id = await asyncio.to_thread(_dispatch)
-
-        # If idempotency key was registered as pending, update with real task ID
-        if idempotency_key and redis_client is not None:
-            await IdempotencyManager.acquire_async(
-                client=redis_client,
-                key=idempotency_key,
-                task_id=task_id,
-                lock_ttl=300,
-            )
 
         return TaskSubmissionResult(
             task_id=task_id,
@@ -121,6 +139,23 @@ class TaskService:
             queue=target_queue,
             duplicate=False,
         )
+
+    async def get_task_metadata(
+        self,
+        task_id: str,
+        redis_client: AsyncRedis[Any] | None,
+    ) -> dict[str, Any] | None:
+        """Retrieve task ownership and submission metadata from Redis."""
+        if redis_client is None:
+            return None
+        meta_key = f"{TASK_META_PREFIX}{task_id}"
+        try:
+            raw = await redis_client.get(meta_key)
+            if raw:
+                return json.loads(str(raw))  # type: ignore[no-any-return]
+        except Exception as exc:
+            logger.warning("Error fetching task metadata: %s", exc)
+        return None
 
     async def get_task_status(self, task_id: str) -> TaskStatusResult:
         """Query current execution status of a task from Celery result backend."""
@@ -160,18 +195,20 @@ class TaskService:
             result=res_val,
         )
 
-    async def revoke_task(self, task_id: str, terminate: bool = False) -> bool:
-        """Revoke a pending or running Celery task."""
+    async def revoke_task(
+        self,
+        task_id: str,
+        terminate: bool = False,
+        signal: str = "SIGTERM",
+    ) -> bool:
+        """Revoke a queued or in-flight Celery task."""
 
         def _revoke() -> bool:
-            try:
-                self.celery.control.revoke(task_id, terminate=terminate)
-                return True
-            except Exception as exc:
-                logger.warning("Failed to revoke task %s: %s", task_id, exc)
-                return False
+            self.celery.control.revoke(task_id, terminate=terminate, signal=signal)
+            return True
 
         return await asyncio.to_thread(_revoke)
 
 
+# Global singleton instance
 task_service = TaskService()

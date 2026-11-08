@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,7 +12,7 @@ from app.core.tasks.base import (
     PermanentTaskError,
     TransientTaskError,
 )
-from app.core.tasks.idempotency import idempotent_task
+from app.core.tasks.idempotency import IdempotencyManager, idempotent_task
 from app.core.tasks.system import (
     sample_permanent_failure,
     sample_transient_retry,
@@ -62,7 +63,6 @@ def test_system_ping_execution() -> None:
 
 def test_sample_transient_retry_eventual_success() -> None:
     """Verify transient task failure raises TransientTaskError and succeeds once threshold reached."""
-    # First attempt (retries = 0 -> current_attempt = 1 < 2) must raise TransientTaskError
     sample_transient_retry.push_request(
         retries=0, id="mock-task-1", delivery_info={"routing_key": "default"}
     )
@@ -73,7 +73,6 @@ def test_sample_transient_retry_eventual_success() -> None:
     finally:
         sample_transient_retry.pop_request()
 
-    # Second attempt (retries = 1 -> current_attempt = 2 == 2) succeeds
     sample_transient_retry.push_request(
         retries=1, id="mock-task-1", delivery_info={"routing_key": "default"}
     )
@@ -116,15 +115,8 @@ def test_parse_document_task_execution() -> None:
 def test_idempotent_task_decorator_caches_result() -> None:
     """Verify @idempotent_task returns cached execution result on second execution."""
     mock_redis = MagicMock()
-    # First call: set returns True (acquired)
-    mock_redis.set.side_effect = [
-        True,  # acquire
-        True,  # complete
-        False,  # second acquire
-    ]
-    # Second call: get returns cached completed payload
-    import json
-
+    # 1st call: eval acquire returns [1, token, payload], eval complete returns 1
+    # 2nd call: eval acquire returns [0, None, cached_payload]
     cached_payload = json.dumps(
         {
             "status": "COMPLETED",
@@ -132,7 +124,11 @@ def test_idempotent_task_decorator_caches_result() -> None:
             "result": {"status": "processed", "value": 10, "computed": 20},
         }
     )
-    mock_redis.get.return_value = cached_payload
+    mock_redis.eval.side_effect = [
+        [1, "mock-token-1", "{}"],  # acquire
+        1,  # complete
+        [0, None, cached_payload],  # 2nd acquire
+    ]
 
     execution_counter = 0
 
@@ -143,12 +139,10 @@ def test_idempotent_task_decorator_caches_result() -> None:
         return {"val": val}
 
     with patch("app.core.tasks.idempotency.get_sync_redis_client", return_value=mock_redis):
-        # 1st call
         res1 = sample_fn(10, idempotency_key="key-abc")
         assert res1 == {"val": 10}
         assert execution_counter == 1
 
-        # 2nd call with same key should return cached result without incrementing counter
         res2 = sample_fn(10, idempotency_key="key-abc")
         assert res2 == {"status": "processed", "value": 10, "computed": 20}
         assert execution_counter == 1
@@ -157,17 +151,13 @@ def test_idempotent_task_decorator_caches_result() -> None:
 def test_idempotent_task_suppresses_concurrent_execution() -> None:
     """Verify duplicate running execution is suppressed when lock is already in PROCESSING state."""
     mock_redis = MagicMock()
-    # acquire returns False because key exists
-    mock_redis.set.return_value = False
-    import json
-
     processing_payload = json.dumps(
         {
             "status": "PROCESSING",
             "task_id": "concurrent-worker-1",
         }
     )
-    mock_redis.get.return_value = processing_payload
+    mock_redis.eval.return_value = [0, None, processing_payload]
 
     @idempotent_task(key_param="idempotency_key")
     def sample_fn(val: int, idempotency_key: str | None = None) -> dict[str, int]:
@@ -180,9 +170,12 @@ def test_idempotent_task_suppresses_concurrent_execution() -> None:
 
 
 def test_idempotent_task_releases_lock_on_transient_error() -> None:
-    """Verify lock is released when TransientTaskError is raised so retries can proceed."""
+    """Verify lock is released with lock_token when TransientTaskError is raised so retries can proceed."""
     mock_redis = MagicMock()
-    mock_redis.set.return_value = True
+    mock_redis.eval.side_effect = [
+        [1, "token-for-release", "{}"],  # acquire
+        1,  # release
+    ]
 
     @idempotent_task(key_param="idempotency_key")
     def failing_fn(idempotency_key: str | None = None) -> None:
@@ -192,5 +185,25 @@ def test_idempotent_task_releases_lock_on_transient_error() -> None:
         with pytest.raises(TransientTaskError):
             failing_fn(idempotency_key="retry-key")
 
-        # Must have called delete to release lock
-        mock_redis.delete.assert_called_once_with("idempotency:task:retry-key")
+        assert mock_redis.eval.call_count == 2
+        # Verify second eval called release with token
+        call_args = mock_redis.eval.call_args_list[1]
+        assert "LUA_RELEASE" in str(call_args) or "DEL" in str(call_args[0][0])
+        assert call_args[0][3] == "token-for-release"
+
+
+def test_idempotency_manager_lock_token_protection() -> None:
+    """Verify IdempotencyManager rejects completion or release if lock token does not match."""
+    mock_redis = MagicMock()
+    # eval returning 0 indicates lock token mismatch in Redis Lua script
+    mock_redis.eval.return_value = 0
+
+    manager = IdempotencyManager(sync_client=mock_redis)
+
+    # Wrong token cannot complete
+    completed = manager.complete("key-1", result="data", task_id="t-1", lock_token="wrong-token")
+    assert completed is False
+
+    # Wrong token cannot release
+    released = manager.release("key-1", lock_token="wrong-token")
+    assert released is False
