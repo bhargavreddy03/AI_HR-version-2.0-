@@ -6,7 +6,9 @@ import os
 
 import pytest
 import redis
+from celery.result import AsyncResult
 
+from app.core.celery_app import celery_app
 from app.core.config import Settings
 from app.core.redis import get_sync_redis_client
 from app.core.tasks.idempotency import IdempotencyManager
@@ -38,16 +40,22 @@ skip_if_no_redis = pytest.mark.skipif(
 @skip_if_no_redis
 def test_live_redis_broker_and_result_backend_task_execution() -> None:
     """Verify Celery task dispatches to live Redis broker and writes result to live backend."""
-    # Run task and verify result storage
+    # 1. Dispatch task to live Redis broker
     res = system_ping.apply_async(args=("live-redis-test",), queue="default")
     assert res.id is not None
 
-    # In integration test without a separate running worker process, execute task synchronously
-    # and store result in configured live Redis backend
+    # 2. Execute task synchronously and record result
     task_res = system_ping.apply(args=("live-redis-test",), task_id=res.id)
     assert task_res.successful() is True
     assert task_res.result["status"] == "pong"
     assert task_res.result["message"] == "live-redis-test"
+
+    # 3. Store result directly into configured live result backend and retrieve via AsyncResult
+    celery_app.backend.store_result(res.id, task_res.result, "SUCCESS")
+    ar = AsyncResult(res.id, app=celery_app)
+    assert ar.state == "SUCCESS"
+    assert ar.result["status"] == "pong"
+    assert ar.result["message"] == "live-redis-test"
 
 
 @pytest.mark.integration
@@ -73,7 +81,8 @@ def test_live_redis_queue_routing_lists() -> None:
     assert new_doc_len >= initial_doc_len + 1
 
     # Cleanup the test message from the queue list
-    r_broker.rpop("document_processing")
+    raw_msg = r_broker.rpop("document_processing")
+    assert raw_msg is not None
 
 
 @pytest.mark.integration

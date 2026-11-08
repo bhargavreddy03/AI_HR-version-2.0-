@@ -108,6 +108,9 @@ jobs:
           DATABASE_URL: postgresql+asyncpg://aihr_app_user:local_development_password_only@localhost:5432/ai_hr_db_test
           DATABASE_MIGRATION_URL: postgresql+asyncpg://aihr_migration_user:local_development_migration_password_only@localhost:5432/ai_hr_db_test
           DATABASE_SYNC_URL: postgresql://aihr_migration_user:local_development_migration_password_only@localhost:5432/ai_hr_db_test
+          REDIS_URL: redis://localhost:6379/0
+          CELERY_BROKER_URL: redis://localhost:6379/1
+          CELERY_RESULT_BACKEND: redis://localhost:6379/2
         run: |
           cd backend
           pytest -v --cov=app --cov-report=term-missing
@@ -191,6 +194,8 @@ jobs:
           BACKUP_CODE_PEPPER=mock_production_backup_code_pepper_minimum_32
           REDIS_PASSWORD=mock_production_redis_password_minimum_32_chars
           REDIS_URL=redis://:mock_production_redis_password_minimum_32_chars@redis:6379/0
+          CELERY_BROKER_URL=redis://:mock_production_redis_password_minimum_32_chars@redis:6379/1
+          CELERY_RESULT_BACKEND=redis://:mock_production_redis_password_minimum_32_chars@redis:6379/2
           COOKIE_SECURE=true
           EOF
           docker compose --env-file .env -f infrastructure/docker/docker-compose.yml config --quiet

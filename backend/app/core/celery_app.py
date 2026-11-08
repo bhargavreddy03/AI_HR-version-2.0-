@@ -6,30 +6,21 @@ import logging
 from typing import Any
 
 from celery import Celery
-from kombu.entity import Exchange, Queue
+from kombu.entity import Queue
 
 from app.core.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
-# Primary direct exchanges for task routing
-default_exchange = Exchange("default", type="direct")
-doc_exchange = Exchange("document_processing", type="direct")
-resume_exchange = Exchange("resume_parsing", type="direct")
-embedding_exchange = Exchange("embedding_generation", type="direct")
-matching_exchange = Exchange("candidate_matching", type="direct")
-notification_exchange = Exchange("notifications", type="direct")
-reporting_exchange = Exchange("reporting", type="direct")
-
-# Approved queues for platform background workloads
+# Approved direct queues for platform background workloads
 CELERY_QUEUES: tuple[Queue, ...] = (
-    Queue("default", default_exchange, routing_key="default"),
-    Queue("document_processing", doc_exchange, routing_key="document_processing"),
-    Queue("resume_parsing", resume_exchange, routing_key="resume_parsing"),
-    Queue("embedding_generation", embedding_exchange, routing_key="embedding_generation"),
-    Queue("candidate_matching", matching_exchange, routing_key="candidate_matching"),
-    Queue("notifications", notification_exchange, routing_key="notifications"),
-    Queue("reporting", reporting_exchange, routing_key="reporting"),
+    Queue("default", routing_key="default"),
+    Queue("document_processing", routing_key="document_processing"),
+    Queue("resume_parsing", routing_key="resume_parsing"),
+    Queue("embedding_generation", routing_key="embedding_generation"),
+    Queue("candidate_matching", routing_key="candidate_matching"),
+    Queue("notifications", routing_key="notifications"),
+    Queue("reporting", routing_key="reporting"),
 )
 
 # Deterministic task-to-queue routing map
@@ -88,7 +79,7 @@ def get_celery_config(settings: Settings) -> dict[str, Any]:
         "task_soft_time_limit": settings.CELERY_TASK_SOFT_TIME_LIMIT,
         "result_expires": settings.CELERY_RESULT_EXPIRES,
         "task_default_queue": settings.CELERY_TASK_DEFAULT_QUEUE,
-        "task_default_exchange": "default",
+        "task_default_exchange": "",
         "task_default_routing_key": "default",
         "task_queues": CELERY_QUEUES,
         "task_routes": CELERY_TASK_ROUTES,
