@@ -317,6 +317,17 @@ async def test_end_to_end_authenticated_idempotent_task_execution(live_celery_wo
         res_b_result = await ac.get(f"/api/v1/tasks/{task_id}/result")
         assert res_b_result.status_code == 403
 
+        # Step 7: Cross-tenant idempotency isolation (Tenant B submitting with same key creates independent task)
+        res_b_idem = await ac.post(
+            "/api/v1/tasks/system/ping",
+            json={"message": "tenant-b-payload"},
+            headers={"Idempotency-Key": idem_key},
+        )
+        assert res_b_idem.status_code == 202
+        data_b = res_b_idem.json()
+        assert data_b["duplicate"] is False
+        assert data_b["task_id"] != task_id
+
     await redis_client.aclose()
 
 
@@ -339,8 +350,8 @@ async def test_redis_failure_rejects_idempotent_submission() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_failure_rolls_back_pending_idempotency_and_metadata() -> None:
-    """Verify that when task dispatch fails, the pending idempotency and metadata keys are rolled back."""
+async def test_dispatch_failure_records_recoverable_dispatch_unknown() -> None:
+    """Verify that when task dispatch fails, DISPATCH_UNKNOWN state is recorded to prevent duplicate execution."""
     service = TaskService()
     mock_redis = AsyncMock()
     mock_redis.eval.return_value = [1, "{}"]  # registration succeeded
@@ -352,12 +363,18 @@ async def test_dispatch_failure_rolls_back_pending_idempotency_and_metadata() ->
             await service.submit_task(
                 task=system_ping,
                 args=("test",),
-                idempotency_key="key-rollback",
+                idempotency_key="key-dispatch-unknown",
                 tenant_id=TENANT_A,
                 redis_client=mock_redis,
             )
 
     assert "Task broker unavailable" in str(exc_info.value)
-    # Both task metadata and idempotency key must have been deleted to avoid stuck PENDING state
-    delete_calls = [c.args[0] for c in mock_redis.delete.call_args_list]
-    assert any("idempotency:task:key-rollback" in arg for arg in delete_calls)
+    # DISPATCH_UNKNOWN state recorded via Lua script to preserve record for reconciliation
+    assert mock_redis.eval.call_count == 2
+    second_eval = mock_redis.eval.call_args_list[1]
+    assert "DISPATCH_UNKNOWN" in str(second_eval) or "LUA_RECORD_DISPATCH_UNKNOWN" in str(
+        second_eval
+    )
+    # Ensure idempotency key was NOT deleted
+    for delete_call in mock_redis.delete.call_args_list:
+        assert "key-dispatch-unknown" not in str(delete_call)

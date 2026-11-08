@@ -222,3 +222,80 @@ def test_idempotency_manager_lock_token_protection() -> None:
     # Wrong token cannot release
     released = manager.release("key-1", lock_token="wrong-token")
     assert released is False
+
+
+def test_format_scoped_key_multi_tenant_isolation() -> None:
+    """Verify that format_scoped_key properly scopes keys across tenants, users, and tasks."""
+    from uuid import uuid4
+
+    from app.core.tasks.idempotency import format_scoped_key
+
+    tenant_a = uuid4()
+    tenant_b = uuid4()
+    user_1 = uuid4()
+    user_2 = uuid4()
+    client_key = "report-generation-123"
+
+    key_ta_u1 = format_scoped_key(
+        client_key, tenant_id=tenant_a, user_id=user_1, task_type="generate_report"
+    )
+    key_tb_u1 = format_scoped_key(
+        client_key, tenant_id=tenant_b, user_id=user_1, task_type="generate_report"
+    )
+    key_ta_u2 = format_scoped_key(
+        client_key, tenant_id=tenant_a, user_id=user_2, task_type="generate_report"
+    )
+    key_ta_diff_task = format_scoped_key(
+        client_key, tenant_id=tenant_a, user_id=user_1, task_type="export_csv"
+    )
+
+    # All scoped keys must be distinct to prevent cross-tenant and cross-user collision
+    assert key_ta_u1 != key_tb_u1
+    assert key_ta_u1 != key_ta_u2
+    assert key_ta_u1 != key_ta_diff_task
+    assert str(tenant_a) in key_ta_u1
+    assert str(tenant_b) in key_tb_u1
+    assert client_key in key_ta_u1
+
+
+def test_idempotency_manager_lock_renewal() -> None:
+    """Verify lock renewal succeeds only when matching lock_token is supplied."""
+    mock_redis = MagicMock()
+    mock_redis.eval.side_effect = [1, 0]  # First renewal succeeds, second fails (wrong token)
+
+    manager = IdempotencyManager(sync_client=mock_redis)
+
+    # Valid token renews lock
+    assert manager.renew("key-renew", lock_token="valid-token", extend_ttl=360) is True
+
+    # Empty/missing token is rejected without calling Redis
+    assert manager.renew("key-renew", lock_token="") is False
+    assert manager.renew("key-renew", lock_token=None) is False
+
+    # Mismatched token rejected by Lua
+    assert manager.renew("key-renew", lock_token="expired-or-stolen-token") is False
+
+
+def test_idempotent_task_bounded_lease_exceeds_task_time_limit() -> None:
+    """Verify idempotent_task bounds lock TTL to at least CELERY_TASK_TIME_LIMIT + 60."""
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    mock_redis = MagicMock()
+    mock_redis.eval.side_effect = [
+        [1, "bounded-token", "{}"],  # acquire
+        1,  # complete
+    ]
+
+    @idempotent_task(key_param="idempotency_key", lock_ttl=10)  # Caller requested small 10s TTL
+    def sample_bounded(val: int, idempotency_key: str | None = None) -> int:
+        return val * 2
+
+    with patch("app.core.tasks.idempotency.get_sync_redis_client", return_value=mock_redis):
+        sample_bounded(5, idempotency_key="bounded-test-key")
+
+        # First call is acquire: verify the lock_ttl passed to Lua is at least CELERY_TASK_TIME_LIMIT + 60
+        call_args = mock_redis.eval.call_args_list[0]
+        actual_lock_ttl = int(call_args[0][5])  # ARGV[3] is lock_ttl
+        expected_min = settings.CELERY_TASK_TIME_LIMIT + 60
+        assert actual_lock_ttl >= expected_min

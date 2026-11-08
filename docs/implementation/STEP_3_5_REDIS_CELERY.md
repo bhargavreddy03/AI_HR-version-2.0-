@@ -109,20 +109,33 @@ The abstract `BaseTask` hooks into Celery's lifecycle (`before_start`, `on_succe
 - Structured execution timing measures runtime down to hundredths of a millisecond (`duration_ms`).
 
 ### 4.4 Distributed Idempotency Protocol (`IdempotencyManager`)
-Idempotency keys are tracked in Redis under `idempotency:task:{key}` using atomic Lua scripts and unique lock ownership tokens:
-1. **API Submission Registration (`LUA_REGISTER_SUBMISSION`)**:
-   - Atomically records initial submission under `idempotency:task:{key}` with status `PENDING`, the real Celery `task_id`, and a submission TTL (300s).
-   - If key already exists: returns the existing record and suppresses duplicate dispatch.
-2. **Worker Acquisition (`LUA_ACQUIRE`)**:
+Idempotency keys are tracked in Redis under strictly scoped keys `idempotency:task:{tenant_id}:{user_id}:{task_type}:{key}` using atomic Lua scripts and unique lock ownership tokens:
+1. **Multi-Tenant Key Scoping (`format_scoped_key`)**:
+   - Every idempotency key is partitioned by `tenant_id`, `user_id`, and `task_type` (`idempotency:task:{tenant_id}:{user_id}:{task_type}:{key}`).
+   - Guarantees complete cross-tenant and cross-task isolation. Two distinct organizations or users submitting with identical client keys will never collide or receive each other's task ID.
+2. **API Submission Registration (`LUA_REGISTER_SUBMISSION`)**:
+   - Atomically records initial submission under the scoped key with status `PENDING`, the real Celery `task_id`, tenant/user metadata, and bounded lease TTL.
+   - If key already exists: enforces tenant ownership verification before returning existing payload, and suppresses duplicate dispatch.
+3. **Worker Acquisition (`LUA_ACQUIRE`)**:
    - Generates a unique `lock_token` (UUID).
    - If key is in `PENDING` state with matching `task_id` (or key does not exist for direct task invocations): transitions state to `PROCESSING`, assigns the `lock_token`, and sets the execution lock TTL.
    - If key is already `PROCESSING` by another worker or `COMPLETED`: rejects acquisition, returning the existing record and suppressing duplicate execution.
-3. **Completion Protection (`LUA_COMPLETE`)**:
+4. **Bounded Leases & Lock Renewal (`LUA_RENEW_LOCK` & `LockHeartbeat`)**:
+   - Default lock TTL is automatically bounded to exceed the maximum Celery task execution time (`max(lock_ttl, settings.CELERY_TASK_TIME_LIMIT + 60)`).
+   - While the task is actively executing, a background daemon `LockHeartbeat` periodically calls `renew()` using `LUA_RENEW_LOCK`, extending the key's TTL.
+   - Renewal strictly requires and validates that caller's `lock_token` matches the stored lock token in Redis.
+5. **Safe Broker Dispatch Failure & Reconciliation (`DISPATCH_UNKNOWN`)**:
+   - If Celery broker dispatch raises an exception (e.g., broker timeout or connection drop where broker may have already accepted the message), the idempotency record is **not** deleted.
+   - The state is atomically updated to `DISPATCH_UNKNOWN` via `LUA_RECORD_DISPATCH_UNKNOWN` with the dispatch error details.
+   - When the client retries with the same `Idempotency-Key`, `TaskService` inspects the Celery result backend and broker:
+     - If the task was already received and is executing/finished (`STARTED`, `SUCCESS`, `FAILURE`, `RETRY`), it reconciles to that status and returns `duplicate=True` without redispatching.
+     - If the task was not yet picked up (`PENDING`), it safely re-dispatches using the **exact same** `task_id` and reconciles status to `PENDING` via `LUA_RECONCILE_DISPATCH`. Duplicate execution is strictly impossible because both messages share the same Celery ID and same Redis lock.
+6. **Completion Protection (`LUA_COMPLETE`)**:
    - Atomically sets status to `COMPLETED` and stores the serialized result with retention TTL (24 hours) **only if** the record's `lock_token` matches the current worker.
    - Prevents stale or expired workers from overwriting new lock holders.
-4. **Transient Failure (`LUA_RELEASE`)**:
+7. **Transient Failure (`LUA_RELEASE`)**:
    - Deletes the key **only if** the `lock_token` matches the current worker, allowing the scheduled retry to safely re-acquire.
-5. **Permanent Failure (`LUA_FAIL`)**:
+8. **Permanent Failure (`LUA_FAIL`)**:
    - Marks the task as `FAILED` **only if** the `lock_token` matches the current worker.
 
 ---

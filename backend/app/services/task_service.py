@@ -16,8 +16,11 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis as AsyncRedis
 
 from app.core.celery_app import celery_app
-from app.core.errors import ServiceUnavailableException
-from app.core.tasks.idempotency import IDEMPOTENCY_PREFIX, IdempotencyManager
+from app.core.errors import AuthorizationException, ServiceUnavailableException
+from app.core.tasks.idempotency import (
+    IdempotencyManager,
+    format_scoped_key,
+)
 
 logger = logging.getLogger("app.services.task_service")
 
@@ -76,7 +79,18 @@ class TaskService:
         assigned_task_id = str(uuid.uuid4())
         meta_key = f"{TASK_META_PREFIX}{assigned_task_id}"
 
-        # 1. Atomic Idempotency Registration
+        # 1. Resolve Celery Task Signature up-front
+        resolved_task: Task = self.celery.tasks[task] if isinstance(task, str) else task
+        task_name = resolved_task.name
+
+        scoped_key: str | None = None
+        headers: dict[str, Any] = {}
+        if tenant_id:
+            headers["tenant_id"] = str(tenant_id)
+        if user_id:
+            headers["user_id"] = str(user_id)
+
+        # 2. Atomic Idempotency Registration Scoped by Tenant, User, and Task Type
         if idempotency_key:
             if redis_client is None:
                 raise ServiceUnavailableException(
@@ -84,19 +98,107 @@ class TaskService:
                     error_code="IDEMPOTENCY_UNAVAILABLE",
                 )
             kw["idempotency_key"] = idempotency_key
+            scoped_key = format_scoped_key(
+                key=idempotency_key,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                task_type=task_name,
+            )
+            headers["idempotency_scoped_key"] = scoped_key
 
             registered, existing = await IdempotencyManager.register_submission_async(
                 client=redis_client,
-                key=idempotency_key,
+                key=scoped_key,
                 task_id=assigned_task_id,
-                lock_ttl=300,
+                lock_ttl=360,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                task_type=task_name,
             )
             if not registered and existing:
+                # Enforce multi-tenant isolation before returning existing task ID
+                existing_tenant = existing.get("tenant_id")
+                if tenant_id and existing_tenant and str(existing_tenant) != str(tenant_id):
+                    logger.warning(
+                        "Tenant mismatch on idempotency key %s: requesting_tenant=%s, record_tenant=%s",
+                        scoped_key,
+                        tenant_id,
+                        existing_tenant,
+                    )
+                    raise AuthorizationException(
+                        "Not authorized to access tasks from another organization",
+                        error_code="TENANT_MISMATCH",
+                    )
+
                 existing_task_id = str(existing.get("task_id", "cached"))
                 existing_status = str(existing.get("status", "PROCESSING"))
+
+                # Reconcile uncertain dispatch state if previous submission failed at broker
+                if existing_status == "DISPATCH_UNKNOWN":
+                    logger.info(
+                        "Reconciling previous DISPATCH_UNKNOWN submission: key=%s, task_id=%s",
+                        scoped_key,
+                        existing_task_id,
+                    )
+
+                    def _check_task_state() -> str:
+                        res = AsyncResult(existing_task_id, app=self.celery)
+                        return str(res.state)
+
+                    current_state = await asyncio.to_thread(_check_task_state)
+                    if current_state in ("STARTED", "SUCCESS", "FAILURE", "RETRY"):
+                        await IdempotencyManager.reconcile_dispatch_async(
+                            client=redis_client,
+                            key=scoped_key,
+                            new_status=current_state,
+                        )
+                        return TaskSubmissionResult(
+                            task_id=existing_task_id,
+                            status=current_state,
+                            queue=target_queue,
+                            duplicate=True,
+                        )
+
+                    # Re-dispatch using existing_task_id to guarantee exactly-once execution
+                    try:
+
+                        def _redispatch() -> str:
+                            res: AsyncResult = resolved_task.apply_async(
+                                args=args,
+                                kwargs=kw,
+                                queue=queue,
+                                countdown=countdown,
+                                task_id=existing_task_id,
+                                headers=headers,
+                            )
+                            return str(res.id)
+
+                        await asyncio.to_thread(_redispatch)
+                        await IdempotencyManager.reconcile_dispatch_async(
+                            client=redis_client,
+                            key=scoped_key,
+                            new_status="PENDING",
+                        )
+                        return TaskSubmissionResult(
+                            task_id=existing_task_id,
+                            status="PENDING",
+                            queue=target_queue,
+                            duplicate=True,
+                        )
+                    except Exception as redispatch_exc:
+                        logger.error(
+                            "Re-dispatch failed for uncertain task %s: %s",
+                            existing_task_id,
+                            redispatch_exc,
+                        )
+                        raise ServiceUnavailableException(
+                            f"Task broker unavailable: {redispatch_exc}",
+                            error_code="TASK_DISPATCH_FAILED",
+                        ) from redispatch_exc
+
                 logger.info(
                     "Duplicate task submission suppressed: key=%s, existing_id=%s, status=%s",
-                    idempotency_key,
+                    scoped_key,
                     existing_task_id,
                     existing_status,
                 )
@@ -107,7 +209,7 @@ class TaskService:
                     duplicate=True,
                 )
 
-        # 2. Required Ownership Metadata Persistence
+        # 3. Required Ownership Metadata Persistence
         if tenant_id or user_id or idempotency_key:
             if redis_client is None:
                 if idempotency_key:
@@ -129,9 +231,9 @@ class TaskService:
                     await redis_client.set(meta_key, meta_payload, ex=86400)
                 except Exception as meta_exc:
                     # Clean up registered idempotency record if metadata cannot be persisted
-                    if idempotency_key and redis_client is not None:
+                    if scoped_key and redis_client is not None:
                         try:
-                            await redis_client.delete(f"{IDEMPOTENCY_PREFIX}{idempotency_key}")
+                            await redis_client.delete(scoped_key)
                         except Exception:
                             pass
                     logger.error("Failed to persist task ownership metadata: %s", meta_exc)
@@ -139,9 +241,6 @@ class TaskService:
                         "Failed to persist task ownership metadata. Task not dispatched.",
                         error_code="TASK_METADATA_PERSISTENCE_FAILED",
                     ) from meta_exc
-
-        # 3. Resolve Celery Task Signature
-        resolved_task: Task = self.celery.tasks[task] if isinstance(task, str) else task
 
         # 4. Dispatch Task to Celery Broker Off-Thread
         def _dispatch() -> str:
@@ -151,20 +250,31 @@ class TaskService:
                 queue=queue,
                 countdown=countdown,
                 task_id=assigned_task_id,
+                headers=headers,
             )
             return str(res.id)
 
         try:
             task_id = await asyncio.to_thread(_dispatch)
         except Exception as dispatch_exc:
-            # Dispatch failed: Roll back idempotency and metadata so no stuck PENDING records remain
-            if redis_client is not None:
+            # Handle uncertain dispatch outcomes safely. Do not immediately delete registration records.
+            # Record recoverable DISPATCH_UNKNOWN state so retries reconcile without duplicate tasks.
+            if redis_client is not None and scoped_key:
+                try:
+                    await IdempotencyManager.record_dispatch_unknown_async(
+                        client=redis_client,
+                        key=scoped_key,
+                        error_msg=str(dispatch_exc),
+                        ttl=600,
+                    )
+                except Exception as rec_exc:
+                    logger.warning("Failed to record DISPATCH_UNKNOWN state in Redis: %s", rec_exc)
+            elif redis_client is not None and not idempotency_key:
                 try:
                     await redis_client.delete(meta_key)
-                    if idempotency_key:
-                        await redis_client.delete(f"{IDEMPOTENCY_PREFIX}{idempotency_key}")
                 except Exception:
                     pass
+
             logger.error(
                 "Failed to dispatch Celery task %s to broker: %s", assigned_task_id, dispatch_exc
             )

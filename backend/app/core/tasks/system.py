@@ -18,7 +18,7 @@ logger = logging.getLogger("app.tasks.system")
     base=BaseTask,
     name="app.core.tasks.system.system_ping",
 )
-@idempotent_task(key_param="idempotency_key", lock_ttl=60, result_ttl=3600)
+@idempotent_task(key_param="idempotency_key", lock_ttl=360, result_ttl=3600)
 def system_ping(
     self: Any,
     message: str = "ping",
@@ -87,7 +87,7 @@ def sample_permanent_failure(self: Any, error_message: str = "Validation failed"
     base=BaseTask,
     name="app.core.tasks.system.sample_idempotent_task",
 )
-@idempotent_task(key_param="idempotency_key", lock_ttl=60, result_ttl=3600)
+@idempotent_task(key_param="idempotency_key", lock_ttl=360, result_ttl=3600)
 def sample_idempotent_task(
     self: Any,
     value: int,
