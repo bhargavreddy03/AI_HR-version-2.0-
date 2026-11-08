@@ -10,6 +10,7 @@ import uuid
 from datetime import timedelta
 from pathlib import Path
 
+import asyncpg
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
@@ -1429,7 +1430,7 @@ async def test_postgres_role_initialization_with_custom_credentials_and_reconcil
     )
     bad_runtime_engine = create_async_engine(bad_runtime_url)
     try:
-        with pytest.raises(DBAPIError):
+        with pytest.raises((DBAPIError, asyncpg.exceptions.InvalidPasswordError)):
             async with bad_runtime_engine.connect() as conn:
                 await conn.execute(text("SELECT 1;"))
     finally:
@@ -1439,7 +1440,7 @@ async def test_postgres_role_initialization_with_custom_credentials_and_reconcil
     bad_mig_url = make_url(migration_url).set(password="invalid_wrong_password_for_testing")
     bad_mig_engine = create_async_engine(bad_mig_url)
     try:
-        with pytest.raises(DBAPIError):
+        with pytest.raises((DBAPIError, asyncpg.exceptions.InvalidPasswordError)):
             async with bad_mig_engine.connect() as conn:
                 await conn.execute(text("SELECT 1;"))
     finally:
