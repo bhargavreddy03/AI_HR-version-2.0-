@@ -23,6 +23,15 @@ ROLE_HIRING_MANAGER = "hiring_manager"
 ROLE_ORG_ADMIN = "org_admin"
 ROLE_PLATFORM_SUPER_ADMIN = "platform_super_admin"
 
+# Hierarchical authority ranking for system roles
+ROLE_HIERARCHY: dict[str, int] = {
+    ROLE_PLATFORM_SUPER_ADMIN: 100,
+    ROLE_ORG_ADMIN: 50,
+    ROLE_HIRING_MANAGER: 20,
+    ROLE_RECRUITER: 20,
+    ROLE_CANDIDATE: 10,
+}
+
 # Fields strictly forbidden from being updated via standard user-facing API payloads
 PROTECTED_USER_FIELDS: frozenset[str] = frozenset(
     {
@@ -99,6 +108,58 @@ def validate_ceiling_rule(
         raise AuthorizationException(
             f"Privilege escalation blocked: Cannot grant capabilities you do not possess: {', '.join(sorted(unauthorized_grants))}",
             error_code="PRIVILEGE_ESCALATION_BLOCKED",
+        )
+
+
+def validate_role_assignment(
+    actor_role: str,
+    target_role_name: str,
+    actor_is_super_admin: bool = False,
+    actor_permissions: set[str] | None = None,
+    target_permissions: set[str] | None = None,
+) -> None:
+    """Validate that the actor has authority to grant the target role or permissions.
+
+    Enforces:
+    1. Only platform super-admins can grant platform super-admin privileges.
+    2. An actor cannot grant a role higher in the hierarchy than their own.
+    3. Ceiling Rule: An actor cannot grant permissions exceeding their own capabilities.
+    """
+    if actor_is_super_admin or actor_role == ROLE_PLATFORM_SUPER_ADMIN:
+        return
+
+    # 1. Organization administrators and below cannot grant platform super-admin privileges
+    if target_role_name == ROLE_PLATFORM_SUPER_ADMIN:
+        logger.warning(
+            "Privilege escalation attempt: Actor with role '%s' attempted to grant '%s'",
+            actor_role,
+            ROLE_PLATFORM_SUPER_ADMIN,
+        )
+        raise AuthorizationException(
+            "Privilege escalation blocked: Organization administrators cannot grant platform super-admin privileges",
+            error_code="SUPER_ADMIN_GRANT_PROHIBITED",
+        )
+
+    # 2. Hierarchy ceiling check
+    actor_level = ROLE_HIERARCHY.get(actor_role, 0)
+    target_level = ROLE_HIERARCHY.get(target_role_name, 0)
+    if target_level > actor_level:
+        logger.warning(
+            "Privilege escalation attempt: Actor level %d (%s) attempted to assign role level %d (%s)",
+            actor_level,
+            actor_role,
+            target_level,
+            target_role_name,
+        )
+        raise AuthorizationException(
+            f"Privilege escalation blocked: Cannot grant role '{target_role_name}' which exceeds your authority level",
+            error_code="PRIVILEGE_ESCALATION_BLOCKED",
+        )
+
+    # 3. Fine-grained permission ceiling check if permissions are provided
+    if actor_permissions is not None and target_permissions is not None:
+        validate_ceiling_rule(
+            actor_permissions, target_permissions, is_super_admin=actor_is_super_admin
         )
 
 

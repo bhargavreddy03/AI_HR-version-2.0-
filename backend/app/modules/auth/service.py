@@ -1075,7 +1075,21 @@ async def confirm_password_reset(
     token_hash = hash_token(token.strip())
     token_key = f"password_reset:{token_hash}"
 
-    raw_data = await redis.get(token_key)
+    # Atomically read and delete the token to prevent race conditions (Finding 1)
+    try:
+        raw_data = await redis.getdel(token_key)
+    except (AttributeError, Exception):
+        # Fallback to atomic Lua script for Redis drivers or mocks lacking getdel
+        lua_script = (
+            "local val = redis.call('GET', KEYS[1]); "
+            "if val then redis.call('DEL', KEYS[1]) end; "
+            "return val"
+        )
+        raw_data = await redis.eval(lua_script, 1, token_key)  # type: ignore[no-untyped-call]
+
+    if isinstance(raw_data, bytes):
+        raw_data = raw_data.decode("utf-8")
+
     if not raw_data:
         log_security_event(
             "PASSWORD_RESET_CONFIRM_FAILED",
@@ -1087,9 +1101,6 @@ async def confirm_password_reset(
             "Password reset token is invalid or has expired",
             error_code="RESET_TOKEN_INVALID",
         )
-
-    # Atomically delete the token so it cannot be reused
-    await redis.delete(token_key)
 
     token_payload = json.loads(raw_data)
     user_id = UUID(token_payload["user_id"])

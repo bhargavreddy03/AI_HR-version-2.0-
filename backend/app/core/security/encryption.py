@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import os
+from typing import Any
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -66,3 +67,29 @@ def decrypt_sensitive_data(
     aesgcm = AESGCM(key)
     plaintext_bytes = aesgcm.decrypt(nonce, ciphertext, None)
     return plaintext_bytes.decode("utf-8")
+
+
+def encrypt_field(
+    plaintext: str | bytes,
+    settings: Any = None,
+    context_info: str = "aihr_field_encryption",
+) -> str:
+    """Encrypt sensitive field using configured APP_ENCRYPTION_KEY."""
+    from app.core.config import get_settings
+
+    cfg = settings or get_settings()
+    return encrypt_sensitive_data(plaintext, cfg.APP_ENCRYPTION_KEY, context_info=context_info)
+
+
+def decrypt_field(
+    encrypted_payload: str,
+    settings: Any = None,
+    context_info: str = "aihr_field_encryption",
+) -> str:
+    """Decrypt sensitive field using configured APP_ENCRYPTION_KEY."""
+    from app.core.config import get_settings
+
+    cfg = settings or get_settings()
+    return decrypt_sensitive_data(
+        encrypted_payload, cfg.APP_ENCRYPTION_KEY, context_info=context_info
+    )

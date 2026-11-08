@@ -1,6 +1,9 @@
 """Password complexity validation, policy enforcement, and compromised password protection.
 
-Enforces enterprise password requirements conforming to Architecture Document 07 and 16.
+Enforces password requirements combining NIST SP 800-63B core guidelines (length bounds,
+compromised credential screening, truncation avoidance) with additional internal platform
+enterprise complexity rules (uppercase, lowercase, digit, and special-symbol composition)
+conforming to Architecture Document 07, 16, and Section 3.
 """
 
 from __future__ import annotations
@@ -64,16 +67,18 @@ class PasswordPolicyException(ValidationException):
 
 
 def validate_password_complexity(password: str) -> None:
-    """Validate that plaintext password satisfies enterprise length and complexity rules.
+    """Validate that plaintext password satisfies length, breach blacklist, and platform complexity rules.
 
-    Rules:
-    1. Length between 12 and 128 characters.
-    2. At least one uppercase letter (A-Z).
-    3. At least one lowercase letter (a-z).
-    4. At least one numerical digit (0-9).
-    5. At least one special symbol.
-    6. Cannot match known compromised passwords.
-    7. Cannot consist solely of repeated single characters.
+    NIST SP 800-63B Baseline:
+    1. Length bounds: Minimum 12 characters (exceeds NIST 8-char minimum) and maximum 128 characters.
+    2. Compromised credential protection: Screened against known breached password dictionaries.
+
+    Additional Internal Platform Requirements:
+    3. At least one uppercase letter (A-Z).
+    4. At least one lowercase letter (a-z).
+    5. At least one numerical digit (0-9).
+    6. At least one special symbol (!@#$%^&*...).
+    7. Sufficient character variety (more than 4 distinct characters).
     """
     if not isinstance(password, str):
         raise PasswordPolicyException("Password must be a string")

@@ -133,6 +133,10 @@ class Settings(BaseSettings):
         default="local_development_backup_code_pepper_minimum_32_characters_for_security",
         description="Dedicated server-side secret key for HMAC-SHA256 backup-code hashing (never stored in DB)",
     )
+    APP_ENCRYPTION_KEY: str = Field(
+        default="local_development_app_encryption_key_minimum_32_characters_for_security",
+        description="Dedicated 256-bit cryptographic master key for application-level AES-256-GCM encryption",
+    )
     JWT_ALGORITHM: str = Field(default="HS256", description="JWT algorithm")
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=15, description="Short-lived access token TTL")
     REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7, description="Sliding refresh token TTL")
@@ -206,6 +210,20 @@ class Settings(BaseSettings):
             if self.BACKUP_CODE_PEPPER in (self.JWT_SECRET_KEY, self.MFA_ENCRYPTION_KEY):
                 raise ValueError(
                     "Security violation: BACKUP_CODE_PEPPER must be separate and distinct from JWT_SECRET_KEY and MFA_ENCRYPTION_KEY"
+                )
+
+            # 2c. Application Encryption Key Validation (Dedicated key for AES-256-GCM data encryption)
+            if "local_development" in self.APP_ENCRYPTION_KEY or len(self.APP_ENCRYPTION_KEY) < 32:
+                raise ValueError(
+                    "Insecure or default APP_ENCRYPTION_KEY detected for production/staging (minimum 32 chars required)"
+                )
+            if self.APP_ENCRYPTION_KEY in (
+                self.JWT_SECRET_KEY,
+                self.MFA_ENCRYPTION_KEY,
+                self.BACKUP_CODE_PEPPER,
+            ):
+                raise ValueError(
+                    "Key separation violation: APP_ENCRYPTION_KEY must be separate and distinct from JWT_SECRET_KEY, MFA_ENCRYPTION_KEY, and BACKUP_CODE_PEPPER"
                 )
 
             # 3. POSTGRES_PASSWORD Validation

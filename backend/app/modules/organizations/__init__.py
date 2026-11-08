@@ -7,6 +7,11 @@ from app.modules.organizations.models import (
     Role,
     RolePermission,
 )
+from app.modules.organizations.service import (
+    assign_membership_role,
+    remove_membership,
+    update_membership,
+)
 
 __all__ = [
     "Organization",
@@ -14,4 +19,7 @@ __all__ = [
     "Permission",
     "RolePermission",
     "OrganizationMembership",
+    "assign_membership_role",
+    "update_membership",
+    "remove_membership",
 ]

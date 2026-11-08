@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from cryptography.exceptions import InvalidTag
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
@@ -596,6 +596,7 @@ def test_security_headers_middleware_injection() -> None:
         CELERY_RESULT_BACKEND="redis://:mock_production_redis_password_minimum_32_chars@localhost:6379/2",
         MFA_ENCRYPTION_KEY="mock_production_mfa_encryption_key_minimum_32",
         BACKUP_CODE_PEPPER="mock_production_backup_code_pepper_minimum_32",
+        APP_ENCRYPTION_KEY="mock_production_app_encryption_key_minimum_32",
         COOKIE_SECURE=True,
     )
     app.add_middleware(SecurityHeadersMiddleware, settings=settings)
@@ -640,3 +641,316 @@ def test_security_headers_middleware_rejects_oversized_request() -> None:
     )
     assert response.status_code == 413
     assert response.json()["code"] == "ERR_PAYLOAD_TOO_LARGE"
+
+
+def test_security_headers_middleware_rejects_chunked_oversized_request() -> None:
+    """Verify that chunked requests without Content-Length exceeding max body size return HTTP 413 (Finding 2)."""
+    app = FastAPI()
+    register_exception_handlers(app)
+    app.add_middleware(SecurityHeadersMiddleware, max_body_size=1024)
+
+    @app.post("/api/v1/stream-upload")
+    async def stream_endpoint(request: Request):
+        body = await request.body()
+        return {"received_bytes": len(body)}
+
+    client = TestClient(app)
+
+    # Stream a generator yielding chunks without Content-Length
+    def chunk_generator():
+        for _ in range(5):
+            yield b"x" * 300  # Total 1500 bytes > 1024 byte limit
+
+    response = client.post(
+        "/api/v1/stream-upload",
+        content=chunk_generator(),
+    )
+    assert response.status_code == 413
+    assert response.json()["code"] == "ERR_PAYLOAD_TOO_LARGE"
+
+
+# ==============================================================================
+# 9. Malware Scanning Fail-Closed Tests (Finding 3)
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_malware_scanning_fail_closed_in_production() -> None:
+    """Verify that in production/staging environments, unscanned files or missing scanners fail closed."""
+    from app.core.security.file_security import (
+        NullMalwareScanner,
+        set_malware_scanner,
+    )
+
+    pdf_bytes = (
+        b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF"
+    )
+    prod_settings = MagicMock(ENVIRONMENT="production")
+
+    # 1. NullMalwareScanner in production -> Rejection
+    set_malware_scanner(NullMalwareScanner())
+    with pytest.raises(FileSecurityException) as exc_info:
+        await validate_document_upload(pdf_bytes, "resume.pdf", settings=prod_settings)
+    assert exc_info.value.code == "ERR_MALWARE_SCANNER_UNAVAILABLE"
+
+    # 2. Scanner that returns scanned=False in production -> Rejection
+    class FakeUnscannedScanner(BaseMalwareScanner):
+        async def scan(self, file_bytes: bytes, filename: str) -> MalwareScanResult:
+            return MalwareScanResult(is_clean=True, scanned=False, details="Bypassed scan")
+
+    set_malware_scanner(FakeUnscannedScanner())
+    with pytest.raises(FileSecurityException) as exc_info2:
+        await validate_document_upload(pdf_bytes, "resume.pdf", settings=prod_settings)
+    assert exc_info2.value.code == "ERR_MALWARE_UNSCANNED"
+
+    # 3. Scanner that throws an exception in production -> Fail-closed rejection
+    class ErrorScanner(BaseMalwareScanner):
+        async def scan(self, file_bytes: bytes, filename: str) -> MalwareScanResult:
+            raise RuntimeError("Antivirus daemon socket connection reset")
+
+    set_malware_scanner(ErrorScanner())
+    with pytest.raises(FileSecurityException) as exc_info3:
+        await validate_document_upload(pdf_bytes, "resume.pdf", settings=prod_settings)
+    assert exc_info3.value.code == "ERR_MALWARE_SCANNER_ERROR"
+
+    # 4. Valid active scanner returning scanned=True and is_clean=True -> Success
+    class CleanScanner(BaseMalwareScanner):
+        async def scan(self, file_bytes: bytes, filename: str) -> MalwareScanResult:
+            return MalwareScanResult(is_clean=True, scanned=True, details="Clean")
+
+    set_malware_scanner(CleanScanner())
+    ext, storage_name = await validate_document_upload(
+        pdf_bytes, "resume.pdf", settings=prod_settings
+    )
+    assert ext == "pdf"
+    assert storage_name.endswith(".pdf")
+
+    # Reset scanner to NullMalwareScanner for test teardown
+    set_malware_scanner(NullMalwareScanner())
+
+
+# ==============================================================================
+# 10. Dedicated APP_ENCRYPTION_KEY Configuration Tests (Finding 4)
+# ==============================================================================
+
+
+def test_app_encryption_key_production_validation_and_separation() -> None:
+    """Verify APP_ENCRYPTION_KEY production requirements and separation from other secrets."""
+    app_pass = "mock_production_app_password_minimum_32_chars"
+    mig_pass = "mock_production_mig_password_minimum_32_chars"
+    su_pass = "mock_production_su_password_minimum_32_chars"
+    jwt_secret = "mock_production_jwt_secret_key_minimum_32_characters_for_testing"
+
+    # 1. Missing / default APP_ENCRYPTION_KEY in production is rejected
+    with pytest.raises(ValueError, match="APP_ENCRYPTION_KEY"):
+        Settings(
+            ENVIRONMENT="production",
+            DEBUG=False,
+            DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{app_pass}@localhost:5432/ai_hr_db",
+            DATABASE_MIGRATION_URL=f"postgresql+asyncpg://aihr_migration_user:{mig_pass}@localhost:5432/ai_hr_db",
+            DATABASE_SYNC_URL=f"postgresql://aihr_migration_user:{mig_pass}@localhost:5432/ai_hr_db",
+            JWT_SECRET_KEY=jwt_secret,
+            POSTGRES_PASSWORD=app_pass,
+            POSTGRES_SUPERUSER_PASSWORD=su_pass,
+            POSTGRES_MIGRATION_PASSWORD=mig_pass,
+            REDIS_PASSWORD="mock_production_redis_password_minimum_32_chars",
+            REDIS_URL="redis://:mock_production_redis_password_minimum_32_chars@localhost:6379/0",
+            CELERY_BROKER_URL="redis://:mock_production_redis_password_minimum_32_chars@localhost:6379/1",
+            CELERY_RESULT_BACKEND="redis://:mock_production_redis_password_minimum_32_chars@localhost:6379/2",
+            MFA_ENCRYPTION_KEY="mock_production_mfa_encryption_key_minimum_32",
+            BACKUP_CODE_PEPPER="mock_production_backup_code_pepper_minimum_32",
+            APP_ENCRYPTION_KEY="local_development_insecure",
+            COOKIE_SECURE=True,
+        )
+
+    # 2. APP_ENCRYPTION_KEY colliding with JWT_SECRET_KEY is rejected (Key separation violation)
+    with pytest.raises(ValueError, match="Key separation violation"):
+        Settings(
+            ENVIRONMENT="production",
+            DEBUG=False,
+            DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{app_pass}@localhost:5432/ai_hr_db",
+            DATABASE_MIGRATION_URL=f"postgresql+asyncpg://aihr_migration_user:{mig_pass}@localhost:5432/ai_hr_db",
+            DATABASE_SYNC_URL=f"postgresql://aihr_migration_user:{mig_pass}@localhost:5432/ai_hr_db",
+            JWT_SECRET_KEY=jwt_secret,
+            POSTGRES_PASSWORD=app_pass,
+            POSTGRES_SUPERUSER_PASSWORD=su_pass,
+            POSTGRES_MIGRATION_PASSWORD=mig_pass,
+            REDIS_PASSWORD="mock_production_redis_password_minimum_32_chars",
+            REDIS_URL="redis://:mock_production_redis_password_minimum_32_chars@localhost:6379/0",
+            CELERY_BROKER_URL="redis://:mock_production_redis_password_minimum_32_chars@localhost:6379/1",
+            CELERY_RESULT_BACKEND="redis://:mock_production_redis_password_minimum_32_chars@localhost:6379/2",
+            MFA_ENCRYPTION_KEY="mock_production_mfa_encryption_key_minimum_32",
+            BACKUP_CODE_PEPPER="mock_production_backup_code_pepper_minimum_32",
+            APP_ENCRYPTION_KEY=jwt_secret,  # Collision
+            COOKIE_SECURE=True,
+        )
+
+    # 3. Field encryption helper function execution
+    from app.core.security.encryption import decrypt_field, encrypt_field
+
+    cfg = MagicMock(APP_ENCRYPTION_KEY="custom_isolated_test_encryption_key_32_chars")
+    encrypted = encrypt_field("Candidate SSN / Comp", settings=cfg)
+    decrypted = decrypt_field(encrypted, settings=cfg)
+    assert decrypted == "Candidate SSN / Comp"
+
+
+# ==============================================================================
+# 11. RBAC Service & Mutation Operations Tests (Finding 5)
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_rbac_organization_service_mutation_guards() -> None:
+    """Verify that actual organization membership and role mutations enforce RBAC guards."""
+    from app.modules.organizations.models import OrganizationMembership, Role
+    from app.modules.organizations.service import (
+        assign_membership_role,
+        remove_membership,
+        update_membership,
+    )
+
+    db = AsyncMock()
+    tenant_id = uuid.uuid4()
+    actor_id = uuid.uuid4()
+    target_user_id = uuid.uuid4()
+    role_id = uuid.uuid4()
+
+    # 1. Non-admin caller rejected
+    with pytest.raises(AuthorizationException, match="Only organization administrators"):
+        await assign_membership_role(
+            db,
+            tenant_id=tenant_id,
+            target_user_id=target_user_id,
+            new_role_id=role_id,
+            actor_user_id=actor_id,
+            actor_role="recruiter",  # Non-admin
+        )
+
+    # 2. Org admin cannot grant platform_super_admin
+    mock_super_admin_role = MagicMock(spec=Role)
+    mock_super_admin_role.id = role_id
+    mock_super_admin_role.name = "platform_super_admin"
+    mock_super_admin_role.tenant_id = None
+    mock_super_admin_role.role_permissions = []
+
+    db.execute.return_value = MagicMock(
+        scalar_one_or_none=MagicMock(return_value=mock_super_admin_role)
+    )
+
+    with pytest.raises(AuthorizationException, match="cannot grant platform super-admin"):
+        await assign_membership_role(
+            db,
+            tenant_id=tenant_id,
+            target_user_id=target_user_id,
+            new_role_id=role_id,
+            actor_user_id=actor_id,
+            actor_role="org_admin",
+        )
+
+    # 3. Sole Admin Protection: Demoting sole org_admin to recruiter is rejected
+    mock_recruiter_role = MagicMock(spec=Role)
+    mock_recruiter_role.id = role_id
+    mock_recruiter_role.name = "recruiter"
+    mock_recruiter_role.tenant_id = tenant_id
+    mock_recruiter_role.role_permissions = []
+
+    # Mock DB queries: 1. fetch role, 2. fetch membership, 3. count active admins (=1), 4. check target is admin (=True)
+    res_role = MagicMock()
+    res_role.scalar_one_or_none.return_value = mock_recruiter_role
+
+    res_mem = MagicMock()
+    res_mem.scalar_one_or_none.return_value = MagicMock(spec=OrganizationMembership)
+
+    res_count = MagicMock()
+    res_count.scalar.return_value = 1
+
+    res_target = MagicMock()
+    res_target.scalar_one_or_none.return_value = uuid.uuid4()
+
+    db.execute.side_effect = [res_role, res_mem, res_count, res_target]
+
+    with pytest.raises(AuthorizationException, match="sole administrator"):
+        await assign_membership_role(
+            db,
+            tenant_id=tenant_id,
+            target_user_id=target_user_id,
+            new_role_id=role_id,
+            actor_user_id=actor_id,
+            actor_role="org_admin",
+        )
+
+    # 4. Mass assignment filtering on update_membership
+    mock_membership = MagicMock(spec=OrganizationMembership)
+    mock_membership.id = uuid.uuid4()
+    mock_membership.tenant_id = tenant_id
+    mock_membership.user_id = target_user_id
+    mock_membership.is_active = True
+    mock_membership.department_id = None
+
+    db.execute.side_effect = [
+        MagicMock(scalar_one_or_none=MagicMock(return_value=mock_membership)),
+    ]
+
+    new_dept_id = uuid.uuid4()
+    hacked_payload = {
+        "id": str(uuid.uuid4()),  # Protected
+        "tenant_id": str(uuid.uuid4()),  # Protected
+        "role_id": str(uuid.uuid4()),  # Protected
+        "role_version": 9999,  # Protected
+        "department_id": new_dept_id,  # Permitted
+    }
+
+    updated = await update_membership(
+        db,
+        tenant_id=tenant_id,
+        target_user_id=target_user_id,
+        update_data=hacked_payload,
+        actor_user_id=actor_id,
+        actor_role="org_admin",
+    )
+    assert updated.department_id == new_dept_id
+    # Assert protected fields were not overwritten
+    assert updated.tenant_id == tenant_id
+
+    # 5. Sole admin removal rejected
+    res_count_rem = MagicMock()
+    res_count_rem.scalar.return_value = 1
+    res_target_rem = MagicMock()
+    res_target_rem.scalar_one_or_none.return_value = uuid.uuid4()
+    db.execute.side_effect = [res_count_rem, res_target_rem]
+
+    with pytest.raises(AuthorizationException, match="sole administrator"):
+        await remove_membership(
+            db,
+            tenant_id=tenant_id,
+            target_user_id=target_user_id,
+            actor_user_id=actor_id,
+            actor_role="org_admin",
+        )
+
+
+# ==============================================================================
+# 12. Frontend Security Headers Configuration Tests (Finding 6)
+# ==============================================================================
+
+
+def test_frontend_security_headers_configuration() -> None:
+    """Verify that frontend/next.config.mjs exports strict security headers."""
+    import pathlib
+
+    next_config_path = pathlib.Path(__file__).parent.parent.parent / "frontend" / "next.config.mjs"
+    assert next_config_path.exists(), "frontend/next.config.mjs must exist"
+    content = next_config_path.read_text(encoding="utf-8")
+
+    # Assert mandatory security headers are defined
+    assert "Content-Security-Policy" in content
+    assert "X-Content-Type-Options" in content
+    assert "nosniff" in content
+    assert "X-Frame-Options" in content
+    assert "DENY" in content
+    assert "Referrer-Policy" in content
+    assert "strict-origin-when-cross-origin" in content
+    assert "Permissions-Policy" in content
+    assert "Strict-Transport-Security" in content
+    assert "max-age=31536000" in content
+    assert "X-XSS-Protection" in content

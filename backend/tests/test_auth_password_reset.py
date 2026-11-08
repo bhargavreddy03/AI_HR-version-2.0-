@@ -62,8 +62,12 @@ def test_password_reset_flow_e2e(test_settings: Settings) -> None:
     async def mock_redis_ttl(key: str) -> int:
         return 60
 
+    async def mock_redis_getdel(key: str) -> str | None:
+        return stored_redis_data.pop(key, None)
+
     mock_redis.set = mock_redis_set
     mock_redis.get = mock_redis_get
+    mock_redis.getdel = mock_redis_getdel
     mock_redis.delete = mock_redis_delete
     mock_redis.eval = mock_redis_eval
     mock_redis.incr = mock_redis_incr
@@ -173,3 +177,82 @@ def test_password_reset_enumeration_safe(test_settings: Settings) -> None:
     assert resp.status_code == 200
     assert "If the provided email is registered" in resp.json()["message"]
     assert "reset_token" not in resp.json()  # No token exposed for non-existent user
+
+
+@pytest.mark.asyncio
+async def test_password_reset_token_concurrency_atomic_consumption(
+    test_settings: Settings,
+) -> None:
+    """Verify that when two concurrent requests attempt to consume the same reset token simultaneously, exactly one succeeds."""
+    import asyncio
+    import json
+
+    from app.core.errors import AuthenticationException
+    from app.modules.auth.crypto import hash_token
+    from app.modules.auth.service import confirm_password_reset
+
+    mock_db = AsyncMock()
+    mock_redis = AsyncMock()
+    stored_redis_data: dict[str, str] = {}
+
+    reset_token = "secure_concurrency_test_token_string_48_chars"
+    token_hash = hash_token(reset_token)
+    token_key = f"password_reset:{token_hash}"
+
+    user_id = uuid.uuid4()
+    token_payload = json.dumps(
+        {"user_id": str(user_id), "email": "test@example.com", "token_version": 1}
+    )
+    stored_redis_data[token_key] = token_payload
+
+    # Atomic getdel simulation protected by asyncio lock
+    lock = asyncio.Lock()
+
+    async def mock_redis_getdel(key: str) -> str | None:
+        async with lock:
+            return stored_redis_data.pop(key, None)
+
+    mock_redis.getdel = mock_redis_getdel
+
+    mock_user = MagicMock()
+    mock_user.id = user_id
+    mock_user.email = "test@example.com"
+    mock_user.is_active = True
+    mock_user.token_version = 1
+    mock_user.password_hash = "old_hash"
+
+    mock_user_query = MagicMock()
+    mock_user_query.scalar_one_or_none.return_value = mock_user
+
+    mock_session_query = MagicMock()
+    mock_session_query.scalars.return_value.all.return_value = []
+
+    mock_db.execute.side_effect = [mock_user_query, mock_session_query]
+
+    # Two concurrent requests racing to consume the exact same token
+    results = await asyncio.gather(
+        confirm_password_reset(
+            mock_db,
+            mock_redis,
+            reset_token,
+            "NewStrongPassword2026#!",
+            "127.0.0.1",
+            test_settings,
+        ),
+        confirm_password_reset(
+            mock_db,
+            mock_redis,
+            reset_token,
+            "NewStrongPassword2026#!",
+            "127.0.0.1",
+            test_settings,
+        ),
+        return_exceptions=True,
+    )
+
+    successes = [r for r in results if r is True]
+    failures = [r for r in results if isinstance(r, AuthenticationException)]
+
+    assert len(successes) == 1, f"Exactly one concurrent request must succeed, got {results}"
+    assert len(failures) == 1, f"Exactly one concurrent request must fail, got {results}"
+    assert failures[0].error_code == "RESET_TOKEN_INVALID"

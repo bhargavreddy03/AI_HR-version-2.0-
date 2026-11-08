@@ -12,6 +12,7 @@ import re
 import uuid
 import zipfile
 from dataclasses import dataclass
+from typing import Any
 
 from app.core.errors import ValidationException
 
@@ -258,12 +259,20 @@ async def validate_document_upload(
     file_bytes: bytes,
     original_filename: str,
     max_size_bytes: int = MAX_FILE_SIZE_BYTES,
+    settings: Any = None,
 ) -> tuple[str, str]:
     """Execute complete document security validation pipeline.
+
+    Enforces fail-closed malware scanning in staging and production (Finding 3).
 
     Returns:
         tuple[canonical_extension: str, secure_storage_name: str]
     """
+    from app.core.config import get_settings
+
+    resolved_settings = settings or get_settings()
+    is_production_like = getattr(resolved_settings, "ENVIRONMENT", "") in ("staging", "production")
+
     # 1. Size check
     validate_file_size(file_bytes, max_size_bytes=max_size_bytes)
 
@@ -289,9 +298,37 @@ async def validate_document_upload(
     elif ext == "txt":
         validate_txt_content(file_bytes)
 
-    # 5. Malware scanning interface
+    # 5. Malware scanning boundary (Finding 3: Fail-closed in staging/production)
     scanner = get_malware_scanner()
-    scan_result = await scanner.scan(file_bytes, clean_name)
+
+    if is_production_like:
+        if scanner is None or isinstance(scanner, NullMalwareScanner):
+            logger.error(
+                "Document upload blocked: Null or missing malware scanner in %s",
+                resolved_settings.ENVIRONMENT,
+            )
+            raise FileSecurityException(
+                "Antivirus inspection is unavailable. Uploads are disabled until scanner service is operational.",
+                code="ERR_MALWARE_SCANNER_UNAVAILABLE",
+            )
+
+    try:
+        scan_result = await scanner.scan(file_bytes, clean_name)
+    except Exception as exc:
+        logger.exception("Malware scanner error scanning file '%s': %s", clean_name, exc)
+        raise FileSecurityException(
+            "Malware scanning service encountered an error and failed closed.",
+            code="ERR_MALWARE_SCANNER_ERROR",
+        ) from exc
+
+    if is_production_like:
+        if not scan_result.scanned:
+            logger.error("Document upload rejected: File '%s' was not scanned", clean_name)
+            raise FileSecurityException(
+                "Document upload rejected: File could not be verified by malware scanner.",
+                code="ERR_MALWARE_UNSCANNED",
+            )
+
     if not scan_result.is_clean:
         logger.error("Malware scanner flagged file '%s': %s", clean_name, scan_result.threat_name)
         raise FileSecurityException(

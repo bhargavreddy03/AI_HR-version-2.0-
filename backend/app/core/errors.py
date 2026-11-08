@@ -230,6 +230,24 @@ class ServiceUnavailableException(AppException):
         )
 
 
+class PayloadTooLargeException(AppException):
+    """Raised when request body size exceeds configured maximum limits."""
+
+    def __init__(
+        self,
+        message: str = "Request body size exceeds maximum allowed limit",
+        code: str = "ERR_PAYLOAD_TOO_LARGE",
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(
+            message=message,
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            code=error_code or code,
+            detail=message,
+            error_type="https://api.ai-hr.com/v1/errors/PAYLOAD_TOO_LARGE",
+        )
+
+
 # ------------------------------------------------------------------------------
 # 3. Global Exception Handlers
 # ------------------------------------------------------------------------------

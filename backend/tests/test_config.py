@@ -40,6 +40,7 @@ def _valid_prod_params(**overrides: Any) -> dict[str, Any]:
         "JWT_SECRET_KEY": "a_very_secure_production_jwt_signing_key_here_32_chars!",
         "MFA_ENCRYPTION_KEY": "a_very_secure_production_mfa_signing_key_here_32_chars!",
         "BACKUP_CODE_PEPPER": "a_very_secure_production_backup_pepper_key_32_chars!",
+        "APP_ENCRYPTION_KEY": "a_very_secure_production_app_encryption_key_32_chars!",
         "POSTGRES_USER": "aihr_app_user",
         "POSTGRES_PASSWORD": app_pass,
         "POSTGRES_MIGRATION_USER": "aihr_migration_user",
