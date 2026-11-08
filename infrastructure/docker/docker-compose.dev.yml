@@ -33,6 +33,13 @@ services:
       - ENVIRONMENT=development
       - DEBUG=true
 
+  celery_worker:
+    volumes:
+      - ../../backend:/app
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+
   frontend:
     volumes:
       - ../../frontend:/app

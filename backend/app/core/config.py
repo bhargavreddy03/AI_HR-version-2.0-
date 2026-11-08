@@ -104,6 +104,21 @@ class Settings(BaseSettings):
     CELERY_RESULT_BACKEND: str = Field(
         default="redis://localhost:6379/2", description="Celery result backend URI"
     )
+    CELERY_WORKER_CONCURRENCY: int = Field(
+        default=2, description="Celery worker concurrency level (threads/processes)"
+    )
+    CELERY_TASK_TIME_LIMIT: int = Field(
+        default=300, description="Hard execution time limit for Celery tasks in seconds"
+    )
+    CELERY_TASK_SOFT_TIME_LIMIT: int = Field(
+        default=240, description="Soft execution time limit for Celery tasks in seconds"
+    )
+    CELERY_RESULT_EXPIRES: int = Field(
+        default=86400, description="Celery task result expiration in seconds (24 hours)"
+    )
+    CELERY_TASK_DEFAULT_QUEUE: str = Field(
+        default="default", description="Default queue name for unrouted Celery tasks"
+    )
 
     # 5. Security & Authentication
     JWT_SECRET_KEY: str = Field(
@@ -403,6 +418,9 @@ class Settings(BaseSettings):
                             f"Invalid CELERY_RESULT_BACKEND configuration: {exc}"
                         ) from exc
                     raise
+
+        if self.CELERY_TASK_SOFT_TIME_LIMIT >= self.CELERY_TASK_TIME_LIMIT:
+            raise ValueError("CELERY_TASK_SOFT_TIME_LIMIT must be less than CELERY_TASK_TIME_LIMIT")
 
         return self
 

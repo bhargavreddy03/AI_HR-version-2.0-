@@ -79,6 +79,36 @@ services:
       retries: 3
 
   # ----------------------------------------------------------------------------
+  # Asynchronous Background Worker: Celery Worker Fleet
+  # (Ports NOT published; communicates strictly via internal Docker network)
+  # ----------------------------------------------------------------------------
+  celery_worker:
+    build:
+      context: ../../backend
+      dockerfile: Dockerfile
+    container_name: ai_hr_celery_worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - ${ENV_FILE:-../../.env}
+    command: >-
+      celery -A app.core.celery_app:celery_app worker
+      --loglevel=INFO
+      -Q default,document_processing,resume_parsing,embedding_generation,candidate_matching,notifications,reporting
+      --concurrency=${CELERY_WORKER_CONCURRENCY:-2}
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "python -m app.core.celery_health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+
+  # ----------------------------------------------------------------------------
   # Web Portal: Next.js 14 Frontend
   # ----------------------------------------------------------------------------
   frontend:
