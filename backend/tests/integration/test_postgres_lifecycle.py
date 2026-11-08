@@ -142,7 +142,9 @@ def ensure_database_schema(integration_settings: Settings) -> None:
         or os.getenv("DATABASE_MIGRATION_URL")
         or getattr(integration_settings, "DATABASE_SYNC_URL", None)
         or integration_settings.DATABASE_URL
-    ).replace("+asyncpg", "")
+    )
+    if migration_url.startswith("postgresql://"):
+        migration_url = migration_url.replace("postgresql://", "postgresql+asyncpg://", 1)
     alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
     command.upgrade(alembic_cfg, "head")
 
@@ -1630,8 +1632,13 @@ def test_postgres_vector_downgrade_preserves_external_dependent_objects_and_exte
         or os.getenv("DATABASE_MIGRATION_URL")
         or getattr(integration_settings, "DATABASE_SYNC_URL", None)
         or integration_settings.DATABASE_URL
-    ).replace("+asyncpg", "")
-    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
+    )
+    alembic_url = (
+        migration_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        if migration_url.startswith("postgresql://")
+        else migration_url
+    )
+    alembic_cfg.set_main_option("sqlalchemy.url", alembic_url)
 
     # Ensure head first
     command.upgrade(alembic_cfg, "head")
@@ -1639,7 +1646,7 @@ def test_postgres_vector_downgrade_preserves_external_dependent_objects_and_exte
     # Connect with synchronous engine using migration credentials (schema owner with CREATE privileges)
     from sqlalchemy import create_engine
 
-    sync_engine = create_engine(migration_url)
+    sync_engine = create_engine(alembic_url.replace("+asyncpg", ""))
 
     try:
         with sync_engine.begin() as conn:

@@ -77,6 +77,8 @@ async def run_async_migrations() -> None:
     """Create an AsyncEngine and associate a connection with the context."""
     configuration = config.get_section(config.config_ini_section, {})
     url = config.get_main_option("sqlalchemy.url")
+    if url and url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
     configuration["sqlalchemy.url"] = url
 
     connectable = async_engine_from_config(
