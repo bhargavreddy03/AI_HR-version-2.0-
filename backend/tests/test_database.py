@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import Request
 from sqlalchemy import Column, Integer, String
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from alembic.config import Config
 from app.core.base import (
@@ -909,13 +909,11 @@ async def test_search_similar_candidate_documents_rejects_booleans_in_vector() -
 
 
 def test_get_engine_disposes_previous_engine_on_url_change() -> None:
-    """Verify that get_engine disposes the old engine's pool when the connection URL changes."""
+    """Verify that get_engine asynchronously disposes the old engine's pool when the connection URL changes."""
     s1 = Settings(DATABASE_URL="postgresql+asyncpg://user:pass@localhost:5432/db1")
     engine1 = get_engine(s1)
 
-    with patch.object(
-        engine1.sync_engine, "dispose", wraps=engine1.sync_engine.dispose
-    ) as mock_dispose:
+    with patch.object(AsyncEngine, "dispose") as mock_dispose:
         s2 = Settings(DATABASE_URL="postgresql+asyncpg://user:pass@localhost:5432/db2")
         engine2 = get_engine(s2)
         assert engine1 is not engine2

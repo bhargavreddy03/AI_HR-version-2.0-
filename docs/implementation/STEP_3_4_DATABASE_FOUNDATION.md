@@ -49,8 +49,8 @@ POSTGRES_NAMING_CONVENTION = {
 
 ### 3.1 Asynchronous Engine & Pool Configuration
 The engine is created via SQLAlchemy 2.x `create_async_engine` bound to the `postgresql+asyncpg` driver:
-- `pool_size`: Configurable via `DB_POOL_SIZE` (default: 10).
-- `max_overflow`: Configurable via `DB_MAX_OVERFLOW` (default: 20).
+- `pool_size`: Configurable via `DB_POOL_SIZE` (default: 20).
+- `max_overflow`: Configurable via `DB_MAX_OVERFLOW` (default: 10).
 - `pool_timeout`: Configurable via `DB_POOL_TIMEOUT` (default: 30.0s).
 - `pool_recycle`: Configurable via `DB_POOL_RECYCLE` (default: 1800s / 30 min).
 - `pool_pre_ping`: Enabled (`True`) to transparently discard dead socket connections.
@@ -105,7 +105,7 @@ In strict conformance with Architecture Document 04 Section 1:
 - **Mandatory Authentication**: Redis 7 is deployed with mandatory authentication (`--requirepass`) across both production and development environments.
 - **Production Secret Validation**: In production/staging, `REDIS_PASSWORD` must be explicitly configured and non-empty; placeholder values are strictly rejected.
 - **URL & Broker Consistency**: Pydantic configuration (`app.core.config.Settings`) parses and enforces that `REDIS_URL`, `CELERY_BROKER_URL`, and `CELERY_RESULT_BACKEND` include matching authentication credentials whenever `REDIS_PASSWORD` is configured. Unauthenticated Redis URLs or password mismatches are immediately rejected at application startup.
-- **Connection Pool Authentication**: Asynchronous Redis pools in `app.core.redis.create_redis_pool` explicitly pass `password=settings.REDIS_PASSWORD` to ensure secure connections across all environments.
+- **Connection Pool Authentication**: Asynchronous Redis connection pools created via `app.core.redis.create_redis_pool` rely on `REDIS_URL` as the single authoritative connection descriptor. Because `REDIS_URL` already embeds the authentication credentials (`redis://:<password>@<host>:<port>/<db>`), `ConnectionPool.from_url` extracts and applies credentials directly from the URL rather than supplying the password separately.
 
 ### 4.2 Two-Tier Row-Level Security (RLS) Policy Model
 Conforming to Architecture Document 04 Section 2, all tenant-scoped tables implement:
@@ -240,9 +240,9 @@ The database test suite covers all categories specified in the requirements:
 34. `test_init_db_sql_role_collision_check`: Verifies `init-db.sql` includes a strict role distinctness PL/pgSQL assertion before role creation or privilege grants.
 35. `test_alembic_migration_role_collision_rejection`: Verifies Alembic migrations reject runtime role colliding with superuser or migration role.
 36. `test_alembic_custom_app_role_resolution`: Verifies Alembic `_get_app_role()` dynamically resolves from `get_settings()` and validates identifier syntax.
-37. `test_create_redis_pool_passes_password_when_configured`: Verifies Redis pool creation passes configured authentication password.
+37. `test_redis_client_authenticated_connection_pool`: Verifies Redis connection pool extracts and enforces authentication directly from the authoritative `REDIS_URL`.
 
-### Configuration Tests (`backend/tests/test_config.py`) — 21 Tests
+### Configuration Tests (`backend/tests/test_config.py`) — 22 Tests
 Extensive testing for environment resolution, production security rules, and Redis/Celery URL password matching:
 - Validates production rejections for insecure defaults (`test_production_rejects_insecure_defaults`).
 - Validates production acceptance with full secrets (`test_production_accepts_valid_secrets`).

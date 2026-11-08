@@ -82,10 +82,34 @@ def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSessi
     )
 
 
+async def _async_dispose_engine(engine: AsyncEngine) -> None:
+    """Asynchronously and safely close an AsyncEngine connection pool."""
+    try:
+        await engine.dispose()
+    except Exception as exc:
+        logger.warning("Error asynchronously disposing engine pool: %s", exc)
+
+
+def _schedule_engine_disposal(engine: AsyncEngine) -> None:
+    """Schedule asynchronous disposal of an engine without blocking active users or instances."""
+    try:
+        loop = asyncio.get_running_loop()
+        if loop.is_running():
+            loop.create_task(_async_dispose_engine(engine))
+        else:
+            loop.run_until_complete(_async_dispose_engine(engine))
+    except RuntimeError:
+        # No running event loop in the current thread (e.g. sync CLI or startup)
+        try:
+            asyncio.run(_async_dispose_engine(engine))
+        except Exception as exc:
+            logger.warning("Error disposing engine pool: %s", exc)
+
+
 def get_engine(settings: Settings | None = None) -> AsyncEngine:
     """Return the global cached AsyncEngine instance or initialize a new one.
 
-    Safely disposes of any previous engine pool when database configuration changes.
+    Safely and asynchronously disposes of any previous engine pool when database configuration changes.
     Preserves simple singleton defaults for standalone CLI and script execution.
     """
     global _engine, _session_factory
@@ -93,10 +117,7 @@ def get_engine(settings: Settings | None = None) -> AsyncEngine:
 
     if _engine is None or str(_engine.url) != cfg.DATABASE_URL:
         if _engine is not None:
-            try:
-                _engine.sync_engine.dispose()
-            except Exception as exc:
-                logger.warning("Error disposing previous engine sync pool: %s", exc)
+            _schedule_engine_disposal(_engine)
         _engine = create_db_engine(cfg)
         _session_factory = None
 
