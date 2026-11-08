@@ -36,13 +36,18 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 # Inject active database URL from config or Pydantic Settings fallback
-if not config.get_main_option("sqlalchemy.url"):
-    settings = get_settings()
-    migration_url = (
-        getattr(settings, "DATABASE_MIGRATION_URL", None)
-        or getattr(settings, "DATABASE_SYNC_URL", None)
-        or settings.DATABASE_URL
-    )
+active_url = config.get_main_option("sqlalchemy.url")
+settings = get_settings()
+migration_url = (
+    getattr(settings, "DATABASE_MIGRATION_URL", None)
+    or getattr(settings, "DATABASE_SYNC_URL", None)
+    or settings.DATABASE_URL
+)
+
+# Prioritize dynamic environment/settings URL when alembic.ini has empty or localhost URL
+if not active_url or (
+    migration_url and migration_url != active_url and "localhost" in (active_url or "")
+):
     config.set_main_option("sqlalchemy.url", migration_url)
 
 
