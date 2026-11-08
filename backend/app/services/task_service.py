@@ -16,7 +16,8 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis as AsyncRedis
 
 from app.core.celery_app import celery_app
-from app.core.tasks.idempotency import IdempotencyManager
+from app.core.errors import ServiceUnavailableException
+from app.core.tasks.idempotency import IDEMPOTENCY_PREFIX, IdempotencyManager
 
 logger = logging.getLogger("app.services.task_service")
 
@@ -69,58 +70,80 @@ class TaskService:
         user_id: UUID | str | None = None,
         redis_client: AsyncRedis[Any] | None = None,
     ) -> TaskSubmissionResult:
-        """Submit a background task for asynchronous execution with atomic idempotency and ownership tracking."""
+        """Submit a background task for asynchronous execution with atomic idempotency and metadata lifecycle."""
         kw = dict(kwargs) if kwargs else {}
         target_queue = queue or "default"
         assigned_task_id = str(uuid.uuid4())
+        meta_key = f"{TASK_META_PREFIX}{assigned_task_id}"
 
-        # Check idempotency duplicate submission if key is provided and async redis client is available
+        # 1. Atomic Idempotency Registration
         if idempotency_key:
-            kw["idempotency_key"] = idempotency_key
-            if redis_client is not None:
-                registered, existing = await IdempotencyManager.register_submission_async(
-                    client=redis_client,
-                    key=idempotency_key,
-                    task_id=assigned_task_id,
-                    lock_ttl=300,
+            if redis_client is None:
+                raise ServiceUnavailableException(
+                    "Idempotency service unavailable. Reliable task idempotency cannot be guaranteed.",
+                    error_code="IDEMPOTENCY_UNAVAILABLE",
                 )
-                if not registered and existing:
-                    existing_task_id = str(existing.get("task_id", "cached"))
-                    existing_status = str(existing.get("status", "PROCESSING"))
-                    logger.info(
-                        "Duplicate task submission suppressed: key=%s, existing_id=%s, status=%s",
-                        idempotency_key,
-                        existing_task_id,
-                        existing_status,
-                    )
-                    return TaskSubmissionResult(
-                        task_id=existing_task_id,
-                        status=existing_status,
-                        queue=target_queue,
-                        duplicate=True,
-                    )
+            kw["idempotency_key"] = idempotency_key
 
-        # Record task ownership metadata in Redis for tenant-isolated querying
-        if redis_client is not None:
-            meta_key = f"{TASK_META_PREFIX}{assigned_task_id}"
-            meta_payload = json.dumps(
-                {
-                    "task_id": assigned_task_id,
-                    "tenant_id": str(tenant_id) if tenant_id else None,
-                    "user_id": str(user_id) if user_id else None,
-                    "queue": target_queue,
-                    "created_at": datetime.now(UTC).isoformat(),
-                }
+            registered, existing = await IdempotencyManager.register_submission_async(
+                client=redis_client,
+                key=idempotency_key,
+                task_id=assigned_task_id,
+                lock_ttl=300,
             )
-            try:
-                await redis_client.set(meta_key, meta_payload, ex=86400)
-            except Exception as meta_exc:
-                logger.warning("Could not persist task metadata: %s", meta_exc)
+            if not registered and existing:
+                existing_task_id = str(existing.get("task_id", "cached"))
+                existing_status = str(existing.get("status", "PROCESSING"))
+                logger.info(
+                    "Duplicate task submission suppressed: key=%s, existing_id=%s, status=%s",
+                    idempotency_key,
+                    existing_task_id,
+                    existing_status,
+                )
+                return TaskSubmissionResult(
+                    task_id=existing_task_id,
+                    status=existing_status,
+                    queue=target_queue,
+                    duplicate=True,
+                )
 
-        # Resolve task function or signature
+        # 2. Required Ownership Metadata Persistence
+        if tenant_id or user_id or idempotency_key:
+            if redis_client is None:
+                if idempotency_key:
+                    raise ServiceUnavailableException(
+                        "Redis service unavailable to store task metadata.",
+                        error_code="REDIS_UNAVAILABLE",
+                    )
+            else:
+                meta_payload = json.dumps(
+                    {
+                        "task_id": assigned_task_id,
+                        "tenant_id": str(tenant_id) if tenant_id else None,
+                        "user_id": str(user_id) if user_id else None,
+                        "queue": target_queue,
+                        "created_at": datetime.now(UTC).isoformat(),
+                    }
+                )
+                try:
+                    await redis_client.set(meta_key, meta_payload, ex=86400)
+                except Exception as meta_exc:
+                    # Clean up registered idempotency record if metadata cannot be persisted
+                    if idempotency_key and redis_client is not None:
+                        try:
+                            await redis_client.delete(f"{IDEMPOTENCY_PREFIX}{idempotency_key}")
+                        except Exception:
+                            pass
+                    logger.error("Failed to persist task ownership metadata: %s", meta_exc)
+                    raise ServiceUnavailableException(
+                        "Failed to persist task ownership metadata. Task not dispatched.",
+                        error_code="TASK_METADATA_PERSISTENCE_FAILED",
+                    ) from meta_exc
+
+        # 3. Resolve Celery Task Signature
         resolved_task: Task = self.celery.tasks[task] if isinstance(task, str) else task
 
-        # Dispatch via asyncio.to_thread to prevent blocking the event loop on Redis broker I/O
+        # 4. Dispatch Task to Celery Broker Off-Thread
         def _dispatch() -> str:
             res: AsyncResult = resolved_task.apply_async(
                 args=args,
@@ -131,7 +154,24 @@ class TaskService:
             )
             return str(res.id)
 
-        task_id = await asyncio.to_thread(_dispatch)
+        try:
+            task_id = await asyncio.to_thread(_dispatch)
+        except Exception as dispatch_exc:
+            # Dispatch failed: Roll back idempotency and metadata so no stuck PENDING records remain
+            if redis_client is not None:
+                try:
+                    await redis_client.delete(meta_key)
+                    if idempotency_key:
+                        await redis_client.delete(f"{IDEMPOTENCY_PREFIX}{idempotency_key}")
+                except Exception:
+                    pass
+            logger.error(
+                "Failed to dispatch Celery task %s to broker: %s", assigned_task_id, dispatch_exc
+            )
+            raise ServiceUnavailableException(
+                f"Task broker unavailable: {dispatch_exc}",
+                error_code="TASK_DISPATCH_FAILED",
+            ) from dispatch_exc
 
         return TaskSubmissionResult(
             task_id=task_id,

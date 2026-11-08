@@ -61,6 +61,21 @@ def test_system_ping_execution() -> None:
     assert "queue" in data
 
 
+def test_system_ping_execution_with_idempotency_key() -> None:
+    """Verify system_ping task accepts and respects idempotency_key."""
+    mock_redis = MagicMock()
+    mock_redis.eval.side_effect = [
+        [1, "ping-token-1", "{}"],  # acquire
+        1,  # complete
+    ]
+    with patch("app.core.tasks.idempotency.get_sync_redis_client", return_value=mock_redis):
+        res = system_ping.apply(args=("test-ping",), kwargs={"idempotency_key": "ping-key-1"})
+        assert res.successful() is True
+        data = res.result
+        assert data["status"] == "pong"
+        assert data["idempotency_key"] == "ping-key-1"
+
+
 def test_sample_transient_retry_eventual_success() -> None:
     """Verify transient task failure raises TransientTaskError and succeeds once threshold reached."""
     sample_transient_retry.push_request(

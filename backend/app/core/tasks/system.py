@@ -18,7 +18,12 @@ logger = logging.getLogger("app.tasks.system")
     base=BaseTask,
     name="app.core.tasks.system.system_ping",
 )
-def system_ping(self: Any, message: str = "ping") -> dict[str, Any]:
+@idempotent_task(key_param="idempotency_key", lock_ttl=60, result_ttl=3600)
+def system_ping(
+    self: Any,
+    message: str = "ping",
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
     """Lightweight system ping task validating worker execution, Redis broker, and result backend."""
     now_utc = datetime.now(UTC).isoformat()
     return {
@@ -27,6 +32,7 @@ def system_ping(self: Any, message: str = "ping") -> dict[str, Any]:
         "task_id": self.request.id,
         "timestamp": now_utc,
         "queue": getattr(self.request, "delivery_info", {}).get("routing_key", "default"),
+        "idempotency_key": idempotency_key,
     }
 
 

@@ -14,6 +14,7 @@ import redis
 from redis.asyncio import Redis as AsyncRedis
 
 from app.core.config import Settings, get_settings
+from app.core.errors import ServiceUnavailableException
 from app.core.redis import get_sync_redis_client
 from app.core.tasks.base import TransientTaskError
 
@@ -24,7 +25,7 @@ F = TypeVar("F", bound=Callable[..., Any])
 IDEMPOTENCY_PREFIX = "idempotency:task:"
 
 # ------------------------------------------------------------------------------
-# Lua Scripts for Atomic Idempotency State Transitions and Safe Lock Ownership
+# Lua Scripts for Atomic Idempotency State Transitions and Strict Lock Ownership
 # ------------------------------------------------------------------------------
 
 # Atomic submission registration from API layer (sets status=PENDING with task_id if not present)
@@ -85,7 +86,7 @@ end
 return {0, cjson.null, val}
 """
 
-# Atomic task completion: stores result and COMPLETED status ONLY if caller still owns the lock_token
+# Atomic task completion: stores result and COMPLETED status strictly if caller owns lock_token
 LUA_COMPLETE = """
 local key = KEYS[1]
 local lock_token = ARGV[1]
@@ -94,13 +95,23 @@ local task_id = ARGV[3]
 local result_ttl = tonumber(ARGV[4])
 local completed_at = ARGV[5]
 
+-- Strictly reject missing or empty caller lock token
+if not lock_token or lock_token == "" then
+    return 0
+end
+
 local val = redis.call('GET', key)
 if not val then
     return 0
 end
 
 local data = cjson.decode(val)
-if data.lock_token and data.lock_token ~= lock_token then
+-- Strictly reject if stored record has null, empty, or non-matching lock token
+if not data.lock_token or data.lock_token == cjson.null or data.lock_token == "" then
+    return 0
+end
+
+if data.lock_token ~= lock_token then
     return 0
 end
 
@@ -108,7 +119,7 @@ data.status = "COMPLETED"
 data.task_id = task_id
 data.completed_at = completed_at
 data.lock_token = cjson.null
-if result_json ~= "" then
+if result_json and result_json ~= "" then
     data.result = cjson.decode(result_json)
 else
     data.result = cjson.null
@@ -119,10 +130,14 @@ redis.call('SET', key, new_payload, 'EX', result_ttl)
 return 1
 """
 
-# Atomic lock release: deletes key ONLY if lock_token matches current owner
+# Atomic lock release: deletes key strictly if lock_token matches current owner
 LUA_RELEASE = """
 local key = KEYS[1]
 local lock_token = ARGV[1]
+
+if not lock_token or lock_token == "" then
+    return 0
+end
 
 local val = redis.call('GET', key)
 if not val then
@@ -130,7 +145,11 @@ if not val then
 end
 
 local data = cjson.decode(val)
-if data.lock_token and data.lock_token == lock_token then
+if not data.lock_token or data.lock_token == cjson.null or data.lock_token == "" then
+    return 0
+end
+
+if data.lock_token == lock_token then
     redis.call('DEL', key)
     return 1
 end
@@ -138,7 +157,7 @@ end
 return 0
 """
 
-# Atomic permanent failure: marks FAILED ONLY if caller still holds the lock_token
+# Atomic permanent failure: marks FAILED strictly if caller holds the matching lock_token
 LUA_FAIL = """
 local key = KEYS[1]
 local lock_token = ARGV[1]
@@ -147,13 +166,21 @@ local task_id = ARGV[3]
 local ttl = tonumber(ARGV[4])
 local failed_at = ARGV[5]
 
+if not lock_token or lock_token == "" then
+    return 0
+end
+
 local val = redis.call('GET', key)
 if not val then
     return 0
 end
 
 local data = cjson.decode(val)
-if data.lock_token and data.lock_token ~= lock_token then
+if not data.lock_token or data.lock_token == cjson.null or data.lock_token == "" then
+    return 0
+end
+
+if data.lock_token ~= lock_token then
     return 0
 end
 
@@ -200,6 +227,8 @@ class IdempotencyManager:
         Returns:
             (True, None) if registered fresh.
             (False, existing_payload) if key already exists (duplicate submission).
+        Raises:
+            ServiceUnavailableException if Redis is unreachable or operation fails.
         """
         redis_key = self._format_key(key)
         created_at = datetime.now(UTC).isoformat()
@@ -219,8 +248,11 @@ class IdempotencyManager:
             data = json.loads(str(payload_str)) if payload_str else None
             return False, data
         except Exception as exc:
-            logger.warning("Error evaluating register_submission Lua: %s", exc)
-            return True, None
+            logger.error("Redis failure during idempotency registration: %s", exc)
+            raise ServiceUnavailableException(
+                "Idempotency service unavailable. Unable to guarantee task idempotency.",
+                error_code="IDEMPOTENCY_UNAVAILABLE",
+            ) from exc
 
     def acquire(
         self,
@@ -233,6 +265,8 @@ class IdempotencyManager:
         Returns:
             (True, lock_token, None) if lock was successfully acquired.
             (False, None, payload) if key already exists in a non-acquirable state.
+        Raises:
+            ServiceUnavailableException if Redis operation fails.
         """
         redis_key = self._format_key(key)
         lock_token = uuid.uuid4().hex
@@ -262,21 +296,11 @@ class IdempotencyManager:
                     pass
             return False, None, {"status": "PROCESSING", "task_id": "unknown"}
         except Exception as exc:
-            logger.warning("Error evaluating acquire Lua script: %s", exc)
-            # Fallback to direct SET NX if script fails
-            fallback_payload = json.dumps(
-                {
-                    "status": "PROCESSING",
-                    "task_id": task_id,
-                    "lock_token": lock_token,
-                    "created_at": now_str,
-                    "result": None,
-                }
-            )
-            acquired = bool(self.sync_client.set(redis_key, fallback_payload, ex=lock_ttl, nx=True))
-            if acquired:
-                return True, lock_token, None
-            return False, None, {"status": "PROCESSING", "task_id": "unknown"}
+            logger.error("Redis failure during idempotency acquire: %s", exc)
+            raise ServiceUnavailableException(
+                "Idempotency service unavailable.",
+                error_code="IDEMPOTENCY_UNAVAILABLE",
+            ) from exc
 
     def complete(
         self,
@@ -288,8 +312,13 @@ class IdempotencyManager:
     ) -> bool:
         """Store completed execution result under the idempotency key with retention TTL.
 
-        Guarantees that only the worker holding lock_token can mark the task COMPLETED.
+        Strictly enforces that only the caller holding the matching lock_token can complete.
+        Rejects missing tokens, null stored tokens, and stale tokens.
         """
+        if not lock_token or not lock_token.strip():
+            logger.warning("Rejected complete() attempt without valid lock_token for key %s", key)
+            return False
+
         redis_key = self._format_key(key)
         now_str = datetime.now(UTC).isoformat()
         try:
@@ -297,30 +326,24 @@ class IdempotencyManager:
         except (TypeError, ValueError):
             result_json = json.dumps(str(result))
 
-        if not lock_token:
-            # Direct overwrite if no token supplied
-            payload = json.dumps(
-                {
-                    "status": "COMPLETED",
-                    "task_id": task_id,
-                    "completed_at": now_str,
-                    "result": result,
-                }
+        try:
+            res = self.sync_client.eval(
+                LUA_COMPLETE,
+                1,
+                redis_key,
+                lock_token,
+                result_json,
+                task_id,
+                str(result_ttl),
+                now_str,
             )
-            self.sync_client.set(redis_key, payload, ex=result_ttl)
-            return True
-
-        res = self.sync_client.eval(
-            LUA_COMPLETE,
-            1,
-            redis_key,
-            lock_token,
-            result_json,
-            task_id,
-            str(result_ttl),
-            now_str,
-        )
-        return bool(res)
+            return bool(res)
+        except Exception as exc:
+            logger.error("Redis failure during idempotency complete: %s", exc)
+            raise ServiceUnavailableException(
+                "Idempotency service unavailable during completion.",
+                error_code="IDEMPOTENCY_UNAVAILABLE",
+            ) from exc
 
     def fail(
         self,
@@ -330,50 +353,63 @@ class IdempotencyManager:
         lock_token: str | None = None,
         ttl: int = 3600,
     ) -> bool:
-        """Mark task as permanently failed under the idempotency key if lock_token matches."""
+        """Mark task as permanently failed under the idempotency key strictly if lock_token matches."""
+        if not lock_token or not lock_token.strip():
+            logger.warning("Rejected fail() attempt without valid lock_token for key %s", key)
+            return False
+
         redis_key = self._format_key(key)
         now_str = datetime.now(UTC).isoformat()
 
-        if not lock_token:
-            payload = json.dumps(
-                {
-                    "status": "FAILED",
-                    "task_id": task_id,
-                    "failed_at": now_str,
-                    "error": error,
-                }
+        try:
+            res = self.sync_client.eval(
+                LUA_FAIL,
+                1,
+                redis_key,
+                lock_token,
+                error,
+                task_id,
+                str(ttl),
+                now_str,
             )
-            self.sync_client.set(redis_key, payload, ex=ttl)
-            return True
-
-        res = self.sync_client.eval(
-            LUA_FAIL,
-            1,
-            redis_key,
-            lock_token,
-            error,
-            task_id,
-            str(ttl),
-            now_str,
-        )
-        return bool(res)
+            return bool(res)
+        except Exception as exc:
+            logger.error("Redis failure during idempotency fail: %s", exc)
+            raise ServiceUnavailableException(
+                "Idempotency service unavailable during failure record.",
+                error_code="IDEMPOTENCY_UNAVAILABLE",
+            ) from exc
 
     def release(self, key: str, lock_token: str | None = None) -> bool:
-        """Release lock allowing subsequent retry or invocation.
+        """Release lock allowing subsequent retry. Strictly enforces matching lock_token."""
+        if not lock_token or not lock_token.strip():
+            logger.warning("Rejected release() attempt without valid lock_token for key %s", key)
+            return False
 
-        If lock_token is supplied, only the lock owner can release the record.
-        """
         redis_key = self._format_key(key)
-        if not lock_token:
-            return bool(self.sync_client.delete(redis_key))
+        try:
+            res = self.sync_client.eval(
+                LUA_RELEASE,
+                1,
+                redis_key,
+                lock_token,
+            )
+            return bool(res)
+        except Exception as exc:
+            logger.error("Redis failure during idempotency release: %s", exc)
+            raise ServiceUnavailableException(
+                "Idempotency service unavailable during release.",
+                error_code="IDEMPOTENCY_UNAVAILABLE",
+            ) from exc
 
-        res = self.sync_client.eval(
-            LUA_RELEASE,
-            1,
-            redis_key,
-            lock_token,
-        )
-        return bool(res)
+    def force_delete(self, key: str) -> bool:
+        """Administrative / test reset utility to delete an idempotency key unconditionally."""
+        redis_key = self._format_key(key)
+        try:
+            return bool(self.sync_client.delete(redis_key))
+        except Exception as exc:
+            logger.error("Redis failure during force_delete: %s", exc)
+            return False
 
     @classmethod
     async def register_submission_async(
@@ -383,7 +419,11 @@ class IdempotencyManager:
         task_id: str,
         lock_ttl: int = 300,
     ) -> tuple[bool, dict[str, Any] | None]:
-        """Asynchronously register a task submission with status PENDING and real task ID."""
+        """Asynchronously register a task submission with status PENDING and real task ID.
+
+        Raises:
+            ServiceUnavailableException if Redis operation fails.
+        """
         redis_key = f"{IDEMPOTENCY_PREFIX}{key}"
         created_at = datetime.now(UTC).isoformat()
         try:
@@ -402,8 +442,11 @@ class IdempotencyManager:
             data = json.loads(str(payload_str)) if payload_str else None
             return False, data
         except Exception as exc:
-            logger.warning("Error evaluating register_submission_async Lua: %s", exc)
-            return True, None
+            logger.error("Redis failure in register_submission_async Lua: %s", exc)
+            raise ServiceUnavailableException(
+                "Idempotency service unavailable. Unable to guarantee task idempotency.",
+                error_code="IDEMPOTENCY_UNAVAILABLE",
+            ) from exc
 
     @classmethod
     async def acquire_async(
@@ -440,8 +483,11 @@ class IdempotencyManager:
                     pass
             return False, None, {"status": "PROCESSING", "task_id": "unknown"}
         except Exception as exc:
-            logger.warning("Error in acquire_async Lua: %s", exc)
-            return True, lock_token, None
+            logger.error("Redis failure in acquire_async Lua: %s", exc)
+            raise ServiceUnavailableException(
+                "Idempotency service unavailable.",
+                error_code="IDEMPOTENCY_UNAVAILABLE",
+            ) from exc
 
     @classmethod
     async def get_async(
@@ -451,13 +497,20 @@ class IdempotencyManager:
     ) -> dict[str, Any] | None:
         """Asynchronously retrieve idempotency payload from Redis."""
         redis_key = f"{IDEMPOTENCY_PREFIX}{key}"
-        raw = await client.get(redis_key)
-        if raw:
-            try:
-                return json.loads(str(raw))  # type: ignore[no-any-return]
-            except (json.JSONDecodeError, TypeError):
-                return None
-        return None
+        try:
+            raw = await client.get(redis_key)
+            if raw:
+                try:
+                    return json.loads(str(raw))  # type: ignore[no-any-return]
+                except (json.JSONDecodeError, TypeError):
+                    return None
+            return None
+        except Exception as exc:
+            logger.error("Redis failure in get_async: %s", exc)
+            raise ServiceUnavailableException(
+                "Idempotency service unavailable.",
+                error_code="IDEMPOTENCY_UNAVAILABLE",
+            ) from exc
 
 
 def idempotent_task(
