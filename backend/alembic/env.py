@@ -17,6 +17,7 @@ if backend_dir not in sys.path:
     sys.path.insert(0, backend_dir)
 
 import app.modules.auth.models  # noqa: F401, E402
+import app.modules.embeddings.models  # noqa: F401, E402
 import app.modules.organizations.models  # noqa: F401, E402
 from app.core.base import Base  # noqa: E402
 from app.core.config import get_settings  # noqa: E402

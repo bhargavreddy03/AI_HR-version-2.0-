@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Any, cast
 
 from fastapi import Request
@@ -143,6 +144,28 @@ async def get_db(
             raise
         finally:
             await session.close()
+
+
+@asynccontextmanager
+async def transactional_session(
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    engine: AsyncEngine | None = None,
+    settings: Settings | None = None,
+) -> AsyncGenerator[AsyncSession, None]:
+    """Explicit transaction context manager for background workers, tasks, and scripts.
+
+    Commits on clean exit, rolls back on any exception, and closes the session.
+    """
+    factory = session_factory or get_session_factory(engine=engine, settings=settings)
+    async with factory() as session:
+        async with session.begin():
+            try:
+                yield session
+            except Exception:
+                await session.rollback()
+                raise
+            finally:
+                await session.close()
 
 
 async def check_database_health(

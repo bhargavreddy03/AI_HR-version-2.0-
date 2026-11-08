@@ -27,6 +27,21 @@ from app.core.database import (
     get_db,
     get_engine,
     get_session_factory,
+    transactional_session,
+)
+from app.modules.embeddings.models import (
+    APPROVED_MODELS,
+    CandidateDocumentEmbedding,
+    EmbeddingModel,
+    JobEmbedding,
+)
+from app.modules.embeddings.service import (
+    DeprecatedEmbeddingModelException,
+    EmbeddingModelNotFoundException,
+    InvalidEmbeddingDimensionException,
+    search_similar_candidate_documents,
+    store_candidate_document_embedding,
+    store_job_embedding,
 )
 
 
@@ -225,3 +240,171 @@ def test_alembic_config_validation() -> None:
     alembic_cfg = Config(str(ini_path))
     assert "alembic" in str(alembic_cfg.get_main_option("script_location"))
     assert alembic_cfg.get_main_option("output_encoding") == "utf-8"
+
+
+@pytest.mark.asyncio
+async def test_transactional_session_commits_on_success() -> None:
+    """Verify transactional_session commits upon block completion."""
+    mock_session = AsyncMock(spec=AsyncSession)
+    mock_begin_ctx = AsyncMock()
+
+    @asynccontextmanager
+    async def mock_begin():
+        yield mock_begin_ctx
+
+    mock_session.begin = mock_begin
+
+    @asynccontextmanager
+    async def mock_factory_ctx():
+        yield mock_session
+
+    mock_factory = MagicMock(return_value=mock_factory_ctx())
+
+    async with transactional_session(session_factory=mock_factory) as session:
+        assert session == mock_session
+
+    mock_session.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_transactional_session_rolls_back_on_exception() -> None:
+    """Verify transactional_session rolls back and re-raises on failure."""
+    mock_session = AsyncMock(spec=AsyncSession)
+
+    @asynccontextmanager
+    async def mock_begin():
+        yield AsyncMock()
+
+    mock_session.begin = mock_begin
+
+    @asynccontextmanager
+    async def mock_factory_ctx():
+        yield mock_session
+
+    mock_factory = MagicMock(return_value=mock_factory_ctx())
+
+    with pytest.raises(ValueError, match="Transaction error"):
+        async with transactional_session(session_factory=mock_factory):
+            raise ValueError("Transaction error")
+
+    mock_session.rollback.assert_awaited_once()
+    mock_session.close.assert_awaited_once()
+
+
+def test_embedding_models_schema_and_approved_catalog() -> None:
+    """Verify EmbeddingModel table structure and approved models definitions."""
+    cols = EmbeddingModel.__table__.columns
+    assert "model_identifier" in cols
+    assert "provider" in cols
+    assert "expected_dimensions" in cols
+    assert "is_active" in cols
+    assert "created_at" in cols
+    assert cols["model_identifier"].primary_key is True
+
+    assert len(APPROVED_MODELS) == 4
+    model_ids = {m["model_identifier"] for m in APPROVED_MODELS}
+    assert "text-embedding-3-small" in model_ids
+    assert "amazon.titan-embed-text-v1" in model_ids
+    assert "cohere.embed-english-v3" in model_ids
+    assert "bge-base-en-v1.5" in model_ids
+
+
+def test_vector_embedding_tables_schema_and_constraints() -> None:
+    """Verify CandidateDocumentEmbedding and JobEmbedding columns and constraints."""
+    for model_cls in (CandidateDocumentEmbedding, JobEmbedding):
+        cols = model_cls.__table__.columns
+        assert "id" in cols
+        assert "tenant_id" in cols
+        assert "model_identifier" in cols
+        assert "model_version" in cols
+        assert "vector_dimensions" in cols
+        assert "embedding_1536" in cols
+        assert "embedding_1024" in cols
+        assert "embedding_768" in cols
+        assert "created_at" in cols
+
+        # Verify dimension constraint exists
+        ck_names = [ck.name for ck in model_cls.__table__.constraints if hasattr(ck, "name")]
+        assert any("chk_" in str(name) and "dimensions" in str(name) for name in ck_names)
+
+
+@pytest.mark.asyncio
+async def test_store_embedding_rejects_unregistered_model() -> None:
+    """Verify service rejects unknown embedding models."""
+    mock_session = AsyncMock(spec=AsyncSession)
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = None
+    mock_session.execute.return_value = mock_result
+
+    with pytest.raises(EmbeddingModelNotFoundException):
+        await store_candidate_document_embedding(
+            session=mock_session,
+            tenant_id=utc_now(),  # dummy uuid
+            document_id=utc_now(),
+            model_identifier="non_existent_model",
+            model_version="1.0",
+            embedding=[0.1] * 1536,
+        )
+
+
+@pytest.mark.asyncio
+async def test_store_embedding_rejects_inactive_model() -> None:
+    """Verify service rejects deprecated or deactivated embedding models."""
+    mock_session = AsyncMock(spec=AsyncSession)
+    mock_model = EmbeddingModel(
+        model_identifier="old-model",
+        provider="openai",
+        expected_dimensions=1536,
+        is_active=False,
+    )
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = mock_model
+    mock_session.execute.return_value = mock_result
+
+    with pytest.raises(DeprecatedEmbeddingModelException):
+        await store_candidate_document_embedding(
+            session=mock_session,
+            tenant_id=utc_now(),
+            document_id=utc_now(),
+            model_identifier="old-model",
+            model_version="1.0",
+            embedding=[0.1] * 1536,
+        )
+
+
+@pytest.mark.asyncio
+async def test_store_job_embedding_validation() -> None:
+    """Verify store_job_embedding validates dimensions against active registered model."""
+    mock_session = AsyncMock(spec=AsyncSession)
+    mock_model = EmbeddingModel(
+        model_identifier="amazon.titan-embed-text-v1",
+        provider="aws_bedrock",
+        expected_dimensions=1536,
+        is_active=True,
+    )
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = mock_model
+    mock_session.execute.return_value = mock_result
+
+    with pytest.raises(InvalidEmbeddingDimensionException):
+        await store_job_embedding(
+            session=mock_session,
+            tenant_id=utc_now(),
+            job_id=utc_now(),
+            model_identifier="amazon.titan-embed-text-v1",
+            model_version="1.0",
+            embedding=[0.5] * 1024,  # mismatched dimension
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_similar_candidate_documents_rejects_unsupported_dimensions() -> None:
+    """Verify search_similar_candidate_documents validates query vector dimensions."""
+    mock_session = AsyncMock(spec=AsyncSession)
+    with pytest.raises(InvalidEmbeddingDimensionException):
+        await search_similar_candidate_documents(
+            session=mock_session,
+            tenant_id=utc_now(),
+            query_vector=[0.1] * 500,  # invalid dimension
+            model_identifier="text-embedding-3-small",
+        )

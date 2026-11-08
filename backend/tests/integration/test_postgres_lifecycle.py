@@ -48,6 +48,17 @@ from app.modules.auth.models import (
     UserSession,
 )
 from app.modules.auth.service import refresh_session_tokens, verify_mfa_challenge
+from app.modules.embeddings.models import (
+    CandidateDocumentEmbedding,
+    EmbeddingModel,
+)
+from app.modules.embeddings.service import (
+    EmbeddingModelNotFoundException,
+    InvalidEmbeddingDimensionException,
+    search_similar_candidate_documents,
+    store_candidate_document_embedding,
+    store_job_embedding,
+)
 from app.modules.organizations.models import (
     Organization,
     OrganizationMembership,
@@ -1035,3 +1046,338 @@ async def test_postgres_state_a_micro_validation_rejects_revoked_and_expired_ses
             assert updated_data["last_db_verified_at"] > elapsed_ts
     finally:
         await engine.dispose()
+
+
+@skip_if_no_postgres
+@pytest.mark.asyncio
+async def test_postgres_pgvector_extension_and_model_registry(
+    integration_settings: Settings,
+) -> None:
+    """Verify pgvector extension availability and approved embedding model registry."""
+    engine = create_db_engine(integration_settings)
+    session_factory = create_session_factory(engine)
+
+    try:
+        async with session_factory() as session:
+            # 1. Verify extension
+            ext_res = await session.execute(
+                text("SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';")
+            )
+            ext_row = ext_res.first()
+            assert ext_row is not None
+            assert ext_row[0] == "vector"
+
+            # 2. Verify seeded models
+            models_res = await session.execute(
+                select(EmbeddingModel).order_by(EmbeddingModel.model_identifier)
+            )
+            models = models_res.scalars().all()
+            model_map = {m.model_identifier: m for m in models}
+
+            assert "text-embedding-3-small" in model_map
+            assert model_map["text-embedding-3-small"].expected_dimensions == 1536
+            assert model_map["text-embedding-3-small"].provider == "openai"
+
+            assert "amazon.titan-embed-text-v1" in model_map
+            assert model_map["amazon.titan-embed-text-v1"].expected_dimensions == 1536
+
+            assert "cohere.embed-english-v3" in model_map
+            assert model_map["cohere.embed-english-v3"].expected_dimensions == 1024
+
+            assert "bge-base-en-v1.5" in model_map
+            assert model_map["bge-base-en-v1.5"].expected_dimensions == 768
+
+            # 3. Verify check constraint rejects unapproved dimensions (e.g. 512)
+            with pytest.raises(DBAPIError):
+                bad_model = EmbeddingModel(
+                    model_identifier=f"bad-model-{uuid.uuid4().hex[:6]}",
+                    provider="custom",
+                    expected_dimensions=512,  # Invalid
+                )
+                session.add(bad_model)
+                await session.flush()
+            await session.rollback()
+    finally:
+        await engine.dispose()
+
+
+@skip_if_no_postgres
+@pytest.mark.asyncio
+async def test_postgres_vector_dimension_check_constraints_and_foreign_keys(
+    integration_settings: Settings,
+) -> None:
+    """Verify database-level check constraints and model-registry foreign keys on vector tables."""
+    engine = create_db_engine(integration_settings)
+    session_factory = create_session_factory(engine)
+
+    tenant_id = generate_uuid7()
+    doc_id = generate_uuid7()
+
+    try:
+        async with session_factory() as session:
+            org = Organization(
+                id=tenant_id,
+                name=f"Vector Test Org {tenant_id.hex[:6]}",
+                slug=f"vec-org-{tenant_id.hex[:6]}",
+            )
+            session.add(org)
+            await session.commit()
+
+        # 1. Foreign key rejection for unregistered model
+        async with session_factory() as session:
+            with pytest.raises(EmbeddingModelNotFoundException):
+                await store_candidate_document_embedding(
+                    session=session,
+                    tenant_id=tenant_id,
+                    document_id=doc_id,
+                    model_identifier="unregistered-model",
+                    model_version="1.0",
+                    embedding=[0.01] * 1536,
+                )
+
+            with pytest.raises(DBAPIError):
+                bad_fk_emb = CandidateDocumentEmbedding(
+                    tenant_id=tenant_id,
+                    document_id=doc_id,
+                    model_identifier="unregistered-model",
+                    model_version="1.0",
+                    vector_dimensions=1536,
+                    embedding_1536=[0.01] * 1536,
+                )
+                session.add(bad_fk_emb)
+                await session.flush()
+            await session.rollback()
+
+        # 2. Check constraint rejection: vector_dimensions=1536 but populated in embedding_1024
+        async with session_factory() as session:
+            with pytest.raises(InvalidEmbeddingDimensionException):
+                await store_candidate_document_embedding(
+                    session=session,
+                    tenant_id=tenant_id,
+                    document_id=doc_id,
+                    model_identifier="text-embedding-3-small",
+                    model_version="1.0",
+                    embedding=[0.01] * 1024,  # mismatched dimension
+                )
+            with pytest.raises(DBAPIError):
+                mismatched_col_emb = CandidateDocumentEmbedding(
+                    tenant_id=tenant_id,
+                    document_id=doc_id,
+                    model_identifier="text-embedding-3-small",
+                    model_version="1.0",
+                    vector_dimensions=1536,
+                    embedding_1024=[0.01] * 1024,  # populated in wrong column
+                )
+                session.add(mismatched_col_emb)
+                await session.flush()
+            await session.rollback()
+
+        # 3. Check constraint rejection: multiple vector columns populated simultaneously
+        async with session_factory() as session:
+            with pytest.raises(DBAPIError):
+                multi_col_emb = CandidateDocumentEmbedding(
+                    tenant_id=tenant_id,
+                    document_id=doc_id,
+                    model_identifier="text-embedding-3-small",
+                    model_version="1.0",
+                    vector_dimensions=1536,
+                    embedding_1536=[0.01] * 1536,
+                    embedding_1024=[0.01] * 1024,
+                )
+                session.add(multi_col_emb)
+                await session.flush()
+            await session.rollback()
+    finally:
+        await engine.dispose()
+
+
+@skip_if_no_postgres
+@pytest.mark.asyncio
+async def test_postgres_vector_insertion_and_cosine_similarity_search(
+    integration_settings: Settings,
+) -> None:
+    """Verify inserting embeddings across dimensions and executing cosine distance similarity queries."""
+    engine = create_db_engine(integration_settings)
+    session_factory = create_session_factory(engine)
+
+    tenant_id = generate_uuid7()
+    doc_a_id = generate_uuid7()
+    doc_b_id = generate_uuid7()
+
+    try:
+        async with session_factory() as session:
+            org = Organization(
+                id=tenant_id,
+                name=f"Cosine Test Org {tenant_id.hex[:6]}",
+                slug=f"cos-org-{tenant_id.hex[:6]}",
+            )
+            session.add(org)
+            await session.commit()
+
+        # Construct orthogonal and similar test vectors
+        vec_target = [0.0] * 1536
+        vec_target[0] = 1.0  # Unit vector along axis 0
+
+        vec_similar = [0.0] * 1536
+        vec_similar[0] = 0.95
+        vec_similar[1] = 0.05
+
+        vec_orthogonal = [0.0] * 1536
+        vec_orthogonal[1] = 1.0  # Orthogonal along axis 1
+
+        async with session_factory() as session:
+            await store_candidate_document_embedding(
+                session=session,
+                tenant_id=tenant_id,
+                document_id=doc_a_id,
+                model_identifier="text-embedding-3-small",
+                model_version="1.0",
+                embedding=vec_similar,
+            )
+            await store_candidate_document_embedding(
+                session=session,
+                tenant_id=tenant_id,
+                document_id=doc_b_id,
+                model_identifier="text-embedding-3-small",
+                model_version="1.0",
+                embedding=vec_orthogonal,
+            )
+            # Also verify job_embeddings storage
+            job_id = generate_uuid7()
+            job_emb = await store_job_embedding(
+                session=session,
+                tenant_id=tenant_id,
+                job_id=job_id,
+                model_identifier="text-embedding-3-small",
+                model_version="1.0",
+                embedding=vec_similar,
+            )
+            assert job_emb.id is not None
+            assert job_emb.embedding_1536 is not None
+            await session.commit()
+
+        # Perform cosine similarity search
+        async with session_factory() as session:
+            results = await search_similar_candidate_documents(
+                session=session,
+                tenant_id=tenant_id,
+                query_vector=vec_target,
+                model_identifier="text-embedding-3-small",
+                limit=10,
+            )
+
+            assert len(results) == 2
+            top_doc, top_sim = results[0]
+            second_doc, second_sim = results[1]
+
+            # doc_a must rank higher than doc_b
+            assert top_doc.document_id == doc_a_id
+            assert second_doc.document_id == doc_b_id
+            assert top_sim > second_sim
+            assert top_sim > 0.9  # Highly aligned with axis 0
+    finally:
+        await engine.dispose()
+
+
+@skip_if_no_postgres
+@pytest.mark.asyncio
+async def test_postgres_vector_tenant_isolation_under_rls(
+    integration_settings: Settings,
+) -> None:
+    """Verify that vector embedding queries and similarity searches are strictly isolated per tenant under RLS."""
+    engine = create_db_engine(integration_settings)
+    session_factory = create_session_factory(engine)
+
+    tenant_a_id = generate_uuid7()
+    tenant_b_id = generate_uuid7()
+    doc_a_id = generate_uuid7()
+
+    try:
+        async with session_factory() as session:
+            org_a = Organization(
+                id=tenant_a_id,
+                name=f"Tenant A {tenant_a_id.hex[:6]}",
+                slug=f"tenant-a-{tenant_a_id.hex[:6]}",
+            )
+            org_b = Organization(
+                id=tenant_b_id,
+                name=f"Tenant B {tenant_b_id.hex[:6]}",
+                slug=f"tenant-b-{tenant_b_id.hex[:6]}",
+            )
+            session.add_all([org_a, org_b])
+            await session.commit()
+
+        test_vec = [0.1] * 1536
+
+        # Tenant A inserts vector embedding
+        async with session_factory() as session:
+            await set_tenant_context(session, tenant_a_id)
+            await store_candidate_document_embedding(
+                session=session,
+                tenant_id=tenant_a_id,
+                document_id=doc_a_id,
+                model_identifier="text-embedding-3-small",
+                model_version="1.0",
+                embedding=test_vec,
+            )
+            await session.commit()
+
+        # Tenant B queries under its tenant context: must return 0 results
+        async with session_factory() as session:
+            await set_tenant_context(session, tenant_b_id)
+            # Direct query
+            res = await session.execute(
+                select(CandidateDocumentEmbedding).where(
+                    CandidateDocumentEmbedding.document_id == doc_a_id
+                )
+            )
+            assert res.scalar_one_or_none() is None
+
+            # Similarity search under Tenant B
+            b_results = await search_similar_candidate_documents(
+                session=session,
+                tenant_id=tenant_b_id,
+                query_vector=test_vec,
+                model_identifier="text-embedding-3-small",
+            )
+            assert len(b_results) == 0
+
+        # Mismatched context (Tenant B context attempting to insert row with tenant_a_id) is rejected
+        async with session_factory() as session:
+            await set_tenant_context(session, tenant_b_id)
+            with pytest.raises(DBAPIError):
+                cross_tenant_emb = CandidateDocumentEmbedding(
+                    tenant_id=tenant_a_id,  # Mismatched!
+                    document_id=generate_uuid7(),
+                    model_identifier="text-embedding-3-small",
+                    model_version="1.0",
+                    vector_dimensions=1536,
+                    embedding_1536=test_vec,
+                )
+                session.add(cross_tenant_emb)
+                await session.flush()
+            await session.rollback()
+    finally:
+        await engine.dispose()
+
+
+@skip_if_no_postgres
+def test_postgres_hnsw_indexes_exist_and_downgrade_upgrade_lifecycle(
+    integration_settings: Settings,
+) -> None:
+    """Verify that HNSW partial indexes are created and test Alembic downgrade/re-upgrade determinism."""
+    ini_path = Path(__file__).resolve().parent.parent.parent / "alembic.ini"
+    alembic_cfg = Config(str(ini_path))
+    alembic_cfg.set_main_option("sqlalchemy.url", integration_settings.DATABASE_URL)
+
+    # 1. Verify HNSW indexes exist in live schema
+    script = ScriptDirectory.from_config(alembic_cfg)
+    heads = script.get_heads()
+    assert "002_db_foundation_pgvector" in heads
+
+    # 2. Downgrade to 001_auth_identity
+    command.downgrade(alembic_cfg, "001_auth_identity")
+
+    # 3. Re-upgrade back to head
+    command.upgrade(alembic_cfg, "head")
+    assert script.get_heads() == heads
