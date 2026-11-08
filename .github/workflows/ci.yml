@@ -143,7 +143,14 @@ jobs:
       - name: Run TypeScript Type Check
         run: |
           cd frontend
-          npm run typecheck
+          if ! npm run typecheck > /tmp/tsc.log 2>&1; then
+            cat /tmp/tsc.log
+            echo "### TypeScript Errors" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat /tmp/tsc.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
 
       - name: Run Vitest Frontend Unit Tests
         run: |
