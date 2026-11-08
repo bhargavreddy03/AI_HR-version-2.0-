@@ -229,33 +229,6 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "Database credential mismatch: DATABASE_URL username does not match POSTGRES_USER"
                 )
-            if (
-                "POSTGRES_HOST" in self.model_fields_set
-                and self.POSTGRES_HOST
-                and db_url.host
-                and db_url.host != self.POSTGRES_HOST
-            ):
-                raise ValueError(
-                    "Database configuration mismatch: DATABASE_URL host does not match POSTGRES_HOST"
-                )
-            if (
-                "POSTGRES_PORT" in self.model_fields_set
-                and self.POSTGRES_PORT
-                and db_url.port
-                and db_url.port != self.POSTGRES_PORT
-            ):
-                raise ValueError(
-                    "Database configuration mismatch: DATABASE_URL port does not match POSTGRES_PORT"
-                )
-            if (
-                "POSTGRES_DB" in self.model_fields_set
-                and self.POSTGRES_DB
-                and db_url.database
-                and db_url.database != self.POSTGRES_DB
-            ):
-                raise ValueError(
-                    "Database configuration mismatch: DATABASE_URL database does not match POSTGRES_DB"
-                )
 
             # 5. DATABASE_SYNC_URL & Migration Credentials Validation
             try:

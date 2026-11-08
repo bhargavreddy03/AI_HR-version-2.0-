@@ -312,8 +312,8 @@ def downgrade() -> None:
                     DROP EXTENSION IF EXISTS vector;
                 EXCEPTION
                     -- Catch only expected dependency-related failures; do not swallow unexpected errors
-                    WHEN dependent_objects_still_exist THEN
-                        RAISE NOTICE 'Preserving vector extension: other objects depend upon it.';
+                    WHEN dependent_objects_still_exist OR insufficient_privilege THEN
+                        RAISE NOTICE 'Preserving vector extension: other objects depend upon it or insufficient privilege to drop extension.';
                 END;
             END IF;
         END $$;
