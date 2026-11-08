@@ -70,6 +70,8 @@ jobs:
           POSTGRES_USER: aihr_app_user
           POSTGRES_PASSWORD: local_development_password_only
           POSTGRES_DB: ai_hr_db_test
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
         run: |
           bash infrastructure/scripts/init-db.sh
 

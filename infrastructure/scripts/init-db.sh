@@ -21,8 +21,8 @@ export POSTGRES_PASSWORD="${POSTGRES_APP_PASSWORD:-${POSTGRES_PASSWORD:-local_de
 export POSTGRES_DB="${POSTGRES_DB:-ai_hr_db}"
 
 SUPERUSER="${POSTGRES_SUPERUSER:-postgres}"
-DB_HOST="${POSTGRES_HOST:-localhost}"
-DB_PORT="${POSTGRES_PORT:-5432}"
+DB_HOST="${PGHOST:-${POSTGRES_HOST:-}}"
+DB_PORT="${PGPORT:-${POSTGRES_PORT:-5432}}"
 
 if [ ! -f "${SQL_FILE}" ]; then
     echo "Error: SQL initialization file not found at ${SQL_FILE}" >&2
@@ -31,13 +31,16 @@ fi
 
 echo "Starting database role initialization and credential reconciliation..."
 
-# In container entrypoint, if PGHOST is unset or localhost is not active, connect via local socket
-if [ -n "${PGHOST:-}" ]; then
-    psql -v ON_ERROR_STOP=1 -U "${SUPERUSER}" -d "${POSTGRES_DB}" -f "${SQL_FILE}"
-elif [ -n "${POSTGRES_HOST:-}" ] && [ "${POSTGRES_HOST}" != "localhost" ]; then
+# Determine connection method:
+# 1. If explicit host is supplied (e.g. PGHOST or POSTGRES_HOST), connect via TCP.
+# 2. If running inside a container with an active local socket, connect via socket.
+# 3. Otherwise (e.g. CI or external host without socket), default to localhost TCP.
+if [ -n "${DB_HOST}" ]; then
     psql -v ON_ERROR_STOP=1 -h "${DB_HOST}" -p "${DB_PORT}" -U "${SUPERUSER}" -d "${POSTGRES_DB}" -f "${SQL_FILE}"
+elif [ -e "/var/run/postgresql/.s.PGSQL.${DB_PORT}" ] || [ -e "/tmp/.s.PGSQL.${DB_PORT}" ]; then
+    psql -v ON_ERROR_STOP=1 -p "${DB_PORT}" -U "${SUPERUSER}" -d "${POSTGRES_DB}" -f "${SQL_FILE}"
 else
-    psql -v ON_ERROR_STOP=1 -U "${SUPERUSER}" -d "${POSTGRES_DB}" -f "${SQL_FILE}"
+    psql -v ON_ERROR_STOP=1 -h "localhost" -p "${DB_PORT}" -U "${SUPERUSER}" -d "${POSTGRES_DB}" -f "${SQL_FILE}"
 fi
 
 echo "Database roles, extensions, and privileges successfully initialized and reconciled."
