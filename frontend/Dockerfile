@@ -17,7 +17,7 @@ FROM base AS deps
 
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm ci
+RUN if [ -f package-lock.json ]; then npm ci || npm install; else npm install; fi
 
 # ------------------------------------------------------------------------------
 # Stage 3: Development Image (Targeted in docker-compose.dev.yml)
