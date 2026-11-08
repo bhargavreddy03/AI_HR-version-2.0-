@@ -1990,6 +1990,7 @@ async def test_sole_admin_concurrency_serialization() -> None:
     session_factory = create_session_factory(engine)
 
     tenant_id = generate_uuid7()
+    super_admin_id = generate_uuid7()
     admin_1_id = generate_uuid7()
     admin_2_id = generate_uuid7()
     admin_role_id = generate_uuid7()
@@ -2021,6 +2022,15 @@ async def test_sole_admin_concurrency_serialization() -> None:
             else:
                 admin_role_id = role.id
 
+            super_user = User(
+                id=super_admin_id,
+                email=f"super_{super_admin_id.hex[:6]}@example.com",
+                password_hash=hash_password("SuperSecret123!"),
+                first_name="Super",
+                last_name="Admin",
+                is_active=True,
+                is_super_admin=True,
+            )
             user_1 = User(
                 id=admin_1_id,
                 email=f"admin1_{admin_1_id.hex[:6]}@example.com",
@@ -2039,7 +2049,7 @@ async def test_sole_admin_concurrency_serialization() -> None:
                 is_active=True,
                 is_super_admin=False,
             )
-            session.add_all([user_1, user_2])
+            session.add_all([super_user, user_1, user_2])
             await session.flush()
 
             mem_1 = OrganizationMembership(
@@ -2060,8 +2070,7 @@ async def test_sole_admin_concurrency_serialization() -> None:
             await session.commit()
 
         # Step 2: Concurrently execute two simultaneous membership removals
-        # Task 1 tries to remove Admin 1 (with Admin 2 acting as actor)
-        # Task 2 tries to remove Admin 2 (with Admin 1 acting as actor)
+        # Both operations are authorized by super_user to eliminate actor revocation side effects
         async def remove_op_1() -> bool:
             async with session_factory() as session:
                 await set_tenant_context(session, tenant_id)
@@ -2069,7 +2078,7 @@ async def test_sole_admin_concurrency_serialization() -> None:
                     db=session,
                     tenant_id=tenant_id,
                     target_user_id=admin_1_id,
-                    actor_user_id=admin_2_id,
+                    actor_user_id=super_admin_id,
                 )
 
         async def remove_op_2() -> bool:
@@ -2079,7 +2088,7 @@ async def test_sole_admin_concurrency_serialization() -> None:
                     db=session,
                     tenant_id=tenant_id,
                     target_user_id=admin_2_id,
-                    actor_user_id=admin_1_id,
+                    actor_user_id=super_admin_id,
                 )
 
         results = await asyncio.gather(remove_op_1(), remove_op_2(), return_exceptions=True)
@@ -2109,6 +2118,29 @@ async def test_sole_admin_concurrency_serialization() -> None:
             assert (
                 remaining_admins == 1
             ), f"Expected exactly 1 admin remaining, got {remaining_admins}"
+
+        # Step 4: Attempting to remove the sole remaining administrator is immediately rejected
+        with pytest.raises(AuthorizationException) as exc_sole:
+            async with session_factory() as session:
+                await set_tenant_context(session, tenant_id)
+                # Determine which admin remains and attempt removal
+                rem_stmt = (
+                    select(OrganizationMembership.user_id)
+                    .join(Role, Role.id == OrganizationMembership.role_id)
+                    .where(
+                        OrganizationMembership.tenant_id == tenant_id,
+                        OrganizationMembership.is_active.is_(True),
+                        Role.name == "org_admin",
+                    )
+                )
+                last_admin_id = (await session.execute(rem_stmt)).scalar_one()
+                await remove_membership(
+                    db=session,
+                    tenant_id=tenant_id,
+                    target_user_id=last_admin_id,
+                    actor_user_id=super_admin_id,
+                )
+        assert exc_sole.value.error_code == "SOLE_ADMIN_PROTECTION_VIOLATION"
 
     finally:
         await engine.dispose()
