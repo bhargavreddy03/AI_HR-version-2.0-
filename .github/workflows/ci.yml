@@ -79,6 +79,11 @@ jobs:
         env:
           ENVIRONMENT: testing
           POSTGRES_DB: ai_hr_db_test
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_SUPERUSER: postgres
+          POSTGRES_SUPERUSER_PASSWORD: test_super_password_only
+          PGPASSWORD: test_super_password_only
           POSTGRES_USER: aihr_app_user
           POSTGRES_PASSWORD: local_development_password_only
           POSTGRES_MIGRATION_USER: aihr_migration_user

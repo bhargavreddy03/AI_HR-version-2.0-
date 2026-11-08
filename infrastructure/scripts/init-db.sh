@@ -13,23 +13,54 @@ if [ ! -f "${SQL_FILE}" ] && [ -f "/infrastructure/scripts/init-db.sql" ]; then
     SQL_FILE="/infrastructure/scripts/init-db.sql"
 fi
 
-# Export environment credentials with fallback to defaults
-export POSTGRES_MIGRATION_USER="${POSTGRES_MIGRATION_USER:-aihr_migration_user}"
-export POSTGRES_MIGRATION_PASSWORD="${POSTGRES_MIGRATION_PASSWORD:-local_development_migration_password_only}"
-export POSTGRES_USER="${POSTGRES_APP_USER:-${POSTGRES_USER:-aihr_app_user}}"
-export POSTGRES_PASSWORD="${POSTGRES_APP_PASSWORD:-${POSTGRES_PASSWORD:-local_development_password_only}}"
-export POSTGRES_DB="${POSTGRES_DB:-ai_hr_db}"
-
-SUPERUSER="${POSTGRES_SUPERUSER:-postgres}"
-DB_HOST="${PGHOST:-${POSTGRES_HOST:-}}"
-DB_PORT="${PGPORT:-${POSTGRES_PORT:-5432}}"
-
 if [ ! -f "${SQL_FILE}" ]; then
     echo "Error: SQL initialization file not found at ${SQL_FILE}" >&2
     exit 1
 fi
 
-echo "Starting database role initialization and credential reconciliation..."
+APP_ENV="${ENVIRONMENT:-${APP_ENV:-production}}"
+
+# In development mode, provide convenient local defaults if not already set.
+# Outside development (e.g. production, staging, testing), explicit credentials are strictly required.
+if [ "${APP_ENV}" = "development" ] || [ "${APP_ENV}" = "dev" ] || [ "${APP_ENV}" = "local" ]; then
+    export POSTGRES_MIGRATION_USER="${POSTGRES_MIGRATION_USER:-aihr_migration_user}"
+    export POSTGRES_MIGRATION_PASSWORD="${POSTGRES_MIGRATION_PASSWORD:-local_development_migration_password_only}"
+    export POSTGRES_USER="${POSTGRES_APP_USER:-${POSTGRES_USER:-aihr_app_user}}"
+    export POSTGRES_PASSWORD="${POSTGRES_APP_PASSWORD:-${POSTGRES_PASSWORD:-local_development_password_only}}"
+    export POSTGRES_DB="${POSTGRES_DB:-ai_hr_db}"
+    export PGPASSWORD="${PGPASSWORD:-${POSTGRES_SUPERUSER_PASSWORD:-local_development_super_password_only}}"
+else
+    # Outside development: fail immediately if required secrets are missing
+    if [ -z "${POSTGRES_MIGRATION_PASSWORD}" ]; then
+        echo "Error: POSTGRES_MIGRATION_PASSWORD must be explicitly configured outside development (env: ${APP_ENV})." >&2
+        exit 1
+    fi
+
+    EFFECTIVE_APP_PASSWORD="${POSTGRES_APP_PASSWORD:-${POSTGRES_PASSWORD:-}}"
+    if [ -z "${EFFECTIVE_APP_PASSWORD}" ]; then
+        echo "Error: POSTGRES_APP_PASSWORD or POSTGRES_PASSWORD must be explicitly configured outside development (env: ${APP_ENV})." >&2
+        exit 1
+    fi
+
+    EFFECTIVE_SUPER_PASSWORD="${PGPASSWORD:-${POSTGRES_SUPERUSER_PASSWORD:-}}"
+    if [ -z "${EFFECTIVE_SUPER_PASSWORD}" ]; then
+        echo "Error: PGPASSWORD or POSTGRES_SUPERUSER_PASSWORD must be explicitly configured outside development (env: ${APP_ENV})." >&2
+        exit 1
+    fi
+
+    export POSTGRES_MIGRATION_USER="${POSTGRES_MIGRATION_USER:-aihr_migration_user}"
+    export POSTGRES_MIGRATION_PASSWORD="${POSTGRES_MIGRATION_PASSWORD}"
+    export POSTGRES_USER="${POSTGRES_APP_USER:-${POSTGRES_USER:-aihr_app_user}}"
+    export POSTGRES_PASSWORD="${EFFECTIVE_APP_PASSWORD}"
+    export POSTGRES_DB="${POSTGRES_DB:-ai_hr_db}"
+    export PGPASSWORD="${EFFECTIVE_SUPER_PASSWORD}"
+fi
+
+SUPERUSER="${POSTGRES_SUPERUSER:-postgres}"
+DB_HOST="${PGHOST:-${POSTGRES_HOST:-}}"
+DB_PORT="${PGPORT:-${POSTGRES_PORT:-5432}}"
+
+echo "Starting database role initialization and credential reconciliation (env: ${APP_ENV})..."
 
 # Determine connection method:
 # 1. If explicit host is supplied (e.g. PGHOST or POSTGRES_HOST), connect via TCP.

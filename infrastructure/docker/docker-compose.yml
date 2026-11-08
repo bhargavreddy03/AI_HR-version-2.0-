@@ -9,13 +9,16 @@ services:
     container_name: ai_hr_postgres
     restart: unless-stopped
     environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
       POSTGRES_DB: ${POSTGRES_DB:-ai_hr_db}
       POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-local_development_super_password_only}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?POSTGRES_SUPERUSER_PASSWORD must be set}
+      POSTGRES_SUPERUSER: ${POSTGRES_SUPERUSER:-postgres}
+      POSTGRES_SUPERUSER_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?POSTGRES_SUPERUSER_PASSWORD must be set}
       POSTGRES_MIGRATION_USER: ${POSTGRES_MIGRATION_USER:-aihr_migration_user}
-      POSTGRES_MIGRATION_PASSWORD: ${POSTGRES_MIGRATION_PASSWORD:-local_development_migration_password_only}
+      POSTGRES_MIGRATION_PASSWORD: ${POSTGRES_MIGRATION_PASSWORD:?POSTGRES_MIGRATION_PASSWORD must be set}
       POSTGRES_APP_USER: ${POSTGRES_USER:-aihr_app_user}
-      POSTGRES_APP_PASSWORD: ${POSTGRES_PASSWORD:-local_development_password_only}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:

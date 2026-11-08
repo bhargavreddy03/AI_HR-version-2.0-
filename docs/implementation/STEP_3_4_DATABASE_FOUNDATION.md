@@ -87,8 +87,10 @@ In strict conformance with Architecture Document 04 Section 1:
   - Created with `NOSUPERUSER`, `NOBYPASSRLS`, `NOCREATEDB`, `NOCREATEROLE`.
 - **Zero Hardcoded Role Credentials & Controlled Reconciliation**:
   - `infrastructure/scripts/init-db.sql` and `infrastructure/scripts/init-db.sh` contain no hardcoded password literals.
-  - Ingests configured credentials directly from environment variables (`POSTGRES_MIGRATION_PASSWORD`, `POSTGRES_PASSWORD`) via psql `\getenv`.
+  - Ingests configured credentials directly from environment variables (`POSTGRES_MIGRATION_PASSWORD`, `POSTGRES_PASSWORD`, `PGPASSWORD`) via psql `\getenv`.
   - Employs safely quoted psql identifiers (`:"effective_mig_user"`, `:"effective_app_user"`) and string literals (`:'mig_password'`, `:'app_password'`).
+  - Outside development (`ENVIRONMENT != development`), `init-db.sh` strictly forbids silent fallbacks: missing bootstrap, migration, or runtime secrets cause immediate failure with a clear error message and zero secret exposure.
+  - Production `docker-compose.yml` requires explicit secrets via `${VAR:?error}` syntax, while local developer convenience is maintained via `docker-compose.dev.yml` overrides.
   - Idempotently reconciles passwords for both freshly created and pre-existing roles during controlled bootstrap without exposing secrets in logs or CLI process listings (`ps aux`).
   - Does **NOT** own any tenant-scoped tables, ensuring table-owner RLS bypass is impossible.
   - Granted restricted DML permissions (`SELECT`, `INSERT`, `UPDATE`, `DELETE`) via `ALTER DEFAULT PRIVILEGES`.
@@ -234,7 +236,9 @@ The database test suite covers all categories specified in the requirements:
 19. `test_postgres_vector_similarity_search_hardened_validation_integration`: Verifies live database rejection of invalid limits, empty/NaN vectors, missing/inactive models, and dimension mismatches.
 20. `test_postgres_hnsw_indexes_exist_and_downgrade_upgrade_lifecycle`: HNSW index validation and reversible migrations.
 21. `test_postgres_vector_downgrade_preserves_external_dependent_objects_and_extension`: Verifies safe non-cascading downgrade preserving extension and external vector objects.
-22. `test_postgres_role_initialization_with_custom_credentials_and_reconciliation`: Verifies initialization with custom passwords, validates `rolsuper=false`, `rolbypassrls=false`, `rolcreatedb=false`, and proves credential reconciliation/rotation invalidates old passwords.
+22. `test_postgres_role_initialization_with_custom_credentials_and_reconciliation`: Genuine PostgreSQL credential reconciliation integration test that executes the actual `init-db.sh` / `init-db.sql` bootstrap mechanism with custom credentials, verifies authentication, re-executes bootstrap with rotated credentials to prove database-level password reconciliation, verifies new credentials succeed and old credentials are rejected, verifies catalog attributes (`rolsuper=false, rolbypassrls=false, rolcreatedb=false, rolcreaterole=false`), verifies runtime role does not own tenant-scoped tables and cannot bypass RLS, and cleans up test roles safely.
+23. `test_init_db_sh_missing_secrets_failure_outside_development`: Unit test verifying `init-db.sh` fails immediately without silent fallbacks when required secrets are missing in non-development environments.
+24. `test_init_db_sh_local_development_initialization`: Unit test verifying `init-db.sh` sets convenient local development defaults when `ENVIRONMENT=development`.
 
 ---
 

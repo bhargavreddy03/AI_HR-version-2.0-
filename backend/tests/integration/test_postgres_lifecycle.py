@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
+import subprocess
 import time
 import uuid
 from datetime import timedelta
@@ -1368,83 +1370,270 @@ async def test_postgres_runtime_role_and_privileges_verification(
 async def test_postgres_role_initialization_with_custom_credentials_and_reconciliation(
     integration_settings: Settings,
 ) -> None:
-    """Verify database role initialization with configured credentials,
-    rejection of invalid credentials, and catalog attributes (rolsuper=f, rolbypassrls=f, rolcreatedb=f).
+    """Verify fresh database role initialization with custom credentials,
+    execution of the actual initialization mechanism, credential reconciliation/rotation,
+    attribute verification, RLS enforcement, and safe cleanup.
     """
-    from sqlalchemy.engine import make_url
+    from sqlalchemy.engine import URL, make_url
 
-    # 1. Verify runtime application user connects and authenticates with configured credentials
-    runtime_engine = create_db_engine(integration_settings)
+    runtime_url = make_url(integration_settings.DATABASE_URL)
+    host = os.getenv("POSTGRES_HOST", runtime_url.host or "localhost")
+    port = int(os.getenv("POSTGRES_PORT", str(runtime_url.port or 5432)))
+    database = os.getenv("POSTGRES_DB", runtime_url.database or "ai_hr_db_test")
+
+    superuser = os.getenv("POSTGRES_SUPERUSER", "postgres")
+    super_pass = os.getenv(
+        "PGPASSWORD",
+        os.getenv("POSTGRES_SUPERUSER_PASSWORD", "test_super_password_only"),
+    )
+
+    repo_root = Path(__file__).resolve().parents[3]
+    init_sh = repo_root / "infrastructure" / "scripts" / "init-db.sh"
+    init_sql = repo_root / "infrastructure" / "scripts" / "init-db.sql"
+
+    def _find_bash() -> str | None:
+        found = shutil.which("bash")
+        if found:
+            return found
+        git_bash = Path("C:/Program Files/Git/bin/bash.exe")
+        if git_bash.exists():
+            return str(git_bash)
+        return None
+
+    bash_bin = _find_bash()
+    psql_bin = shutil.which("psql")
+
+    if not bash_bin and not psql_bin:
+        pytest.skip(
+            "Neither bash nor psql is available on test runner to execute init-db mechanism"
+        )
+
+    def execute_bootstrap(env_overrides: dict[str, str]) -> None:
+        merged_env = os.environ.copy()
+        merged_env.update(env_overrides)
+        if bash_bin and init_sh.exists():
+            proc = subprocess.run(
+                [bash_bin, str(init_sh)],
+                env=merged_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"init-db.sh failed ({proc.returncode}): {proc.stderr}")
+        elif psql_bin and init_sql.exists():
+            proc = subprocess.run(
+                [
+                    psql_bin,
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-h",
+                    env_overrides.get("POSTGRES_HOST", host),
+                    "-p",
+                    str(env_overrides.get("POSTGRES_PORT", port)),
+                    "-U",
+                    env_overrides.get("POSTGRES_SUPERUSER", superuser),
+                    "-d",
+                    env_overrides.get("POSTGRES_DB", database),
+                    "-f",
+                    str(init_sql),
+                ],
+                env=merged_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"psql init-db.sql failed ({proc.returncode}): {proc.stderr}")
+
+    test_id = uuid.uuid4().hex[:8]
+    custom_mig_user = f"test_mig_{test_id}"
+    custom_mig_pass_1 = f"CustomMigPass1_{test_id}"
+    custom_app_user = f"test_app_{test_id}"
+    custom_app_pass_1 = f"CustomAppPass1_{test_id}"
+
     try:
-        async with runtime_engine.connect() as conn:
-            res = await conn.execute(text("SELECT current_user;"))
-            assert res.scalar() == integration_settings.POSTGRES_USER
+        # Step 1 & 2: Initialize roles with custom credentials via actual bootstrap mechanism
+        env_run_1 = {
+            "ENVIRONMENT": "testing",
+            "POSTGRES_SUPERUSER": superuser,
+            "POSTGRES_SUPERUSER_PASSWORD": super_pass,
+            "PGPASSWORD": super_pass,
+            "POSTGRES_HOST": host,
+            "POSTGRES_PORT": str(port),
+            "POSTGRES_DB": database,
+            "POSTGRES_MIGRATION_USER": custom_mig_user,
+            "POSTGRES_MIGRATION_PASSWORD": custom_mig_pass_1,
+            "POSTGRES_APP_USER": custom_app_user,
+            "POSTGRES_APP_PASSWORD": custom_app_pass_1,
+        }
+        execute_bootstrap(env_run_1)
 
-            # Verify runtime role attributes: strictly NOSUPERUSER, NOBYPASSRLS, NOCREATEDB
-            role_attr_res = await conn.execute(
+        # Step 3: Verify both roles can authenticate with custom credentials
+        mig_url_1 = URL.create(
+            "postgresql+asyncpg",
+            username=custom_mig_user,
+            password=custom_mig_pass_1,
+            host=host,
+            port=port,
+            database=database,
+        )
+        mig_engine_1 = create_async_engine(mig_url_1)
+        async with mig_engine_1.connect() as conn:
+            res = await conn.execute(text("SELECT current_user;"))
+            assert res.scalar() == custom_mig_user
+        await mig_engine_1.dispose()
+
+        app_url_1 = URL.create(
+            "postgresql+asyncpg",
+            username=custom_app_user,
+            password=custom_app_pass_1,
+            host=host,
+            port=port,
+            database=database,
+        )
+        app_engine_1 = create_async_engine(app_url_1)
+        async with app_engine_1.connect() as conn:
+            res = await conn.execute(text("SELECT current_user;"))
+            assert res.scalar() == custom_app_user
+        await app_engine_1.dispose()
+
+        # Step 4: Re-run initialization with rotated credentials (exercises reconciliation branch in SQL)
+        custom_mig_pass_2 = f"RotatedMigPass2_{test_id}"
+        custom_app_pass_2 = f"RotatedAppPass2_{test_id}"
+
+        env_run_2 = {
+            "ENVIRONMENT": "testing",
+            "POSTGRES_SUPERUSER": superuser,
+            "POSTGRES_SUPERUSER_PASSWORD": super_pass,
+            "PGPASSWORD": super_pass,
+            "POSTGRES_HOST": host,
+            "POSTGRES_PORT": str(port),
+            "POSTGRES_DB": database,
+            "POSTGRES_MIGRATION_USER": custom_mig_user,
+            "POSTGRES_MIGRATION_PASSWORD": custom_mig_pass_2,
+            "POSTGRES_APP_USER": custom_app_user,
+            "POSTGRES_APP_PASSWORD": custom_app_pass_2,
+        }
+        execute_bootstrap(env_run_2)
+
+        # Step 5: Verify new credentials work
+        mig_url_2 = URL.create(
+            "postgresql+asyncpg",
+            username=custom_mig_user,
+            password=custom_mig_pass_2,
+            host=host,
+            port=port,
+            database=database,
+        )
+        mig_engine_2 = create_async_engine(mig_url_2)
+        async with mig_engine_2.connect() as conn:
+            res = await conn.execute(text("SELECT current_user;"))
+            assert res.scalar() == custom_mig_user
+        await mig_engine_2.dispose()
+
+        app_url_2 = URL.create(
+            "postgresql+asyncpg",
+            username=custom_app_user,
+            password=custom_app_pass_2,
+            host=host,
+            port=port,
+            database=database,
+        )
+        app_engine_2 = create_async_engine(app_url_2)
+        async with app_engine_2.connect() as conn:
+            res = await conn.execute(text("SELECT current_user;"))
+            assert res.scalar() == custom_app_user
+
+            # Step 7: Verify role attributes remain strictly least-privilege
+            role_res = await conn.execute(
                 text(
-                    "SELECT rolsuper, rolbypassrls, rolcreatedb "
-                    "FROM pg_roles WHERE rolname = current_user;"
+                    f"SELECT rolname, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole "
+                    f"FROM pg_roles WHERE rolname IN ('{custom_mig_user}', '{custom_app_user}');"
                 )
             )
-            super_val, rls_val, createdb_val = role_attr_res.one()
-            assert super_val is False, "Runtime role must have rolsuper = false"
-            assert rls_val is False, "Runtime role must have rolbypassrls = false"
-            assert createdb_val is False, "Runtime role must have rolcreatedb = false"
-    finally:
-        await runtime_engine.dispose()
+            roles = {r[0]: (r[1], r[2], r[3], r[4]) for r in role_res.all()}
+            for role_name in (custom_mig_user, custom_app_user):
+                assert role_name in roles
+                assert roles[role_name][0] is False, f"{role_name} must have rolsuper = false"
+                assert roles[role_name][1] is False, f"{role_name} must have rolbypassrls = false"
+                assert roles[role_name][2] is False, f"{role_name} must have rolcreatedb = false"
+                assert roles[role_name][3] is False, f"{role_name} must have rolcreaterole = false"
 
-    # 2. Verify migration user connects and authenticates with configured migration credentials
-    migration_url = (
-        getattr(integration_settings, "DATABASE_MIGRATION_URL", None)
-        or os.getenv("DATABASE_MIGRATION_URL")
-        or getattr(integration_settings, "DATABASE_SYNC_URL", None)
-        or integration_settings.DATABASE_URL
-    )
-    if migration_url.startswith("postgresql://"):
-        migration_url = migration_url.replace("postgresql://", "postgresql+asyncpg://", 1)
-
-    mig_engine = create_async_engine(migration_url)
-    try:
-        async with mig_engine.connect() as conn:
-            res = await conn.execute(text("SELECT current_user;"))
-            mig_user = integration_settings.POSTGRES_MIGRATION_USER or "aihr_migration_user"
-            assert res.scalar() == mig_user
-
-            # Verify migration role attributes: strictly NOSUPERUSER, NOBYPASSRLS, NOCREATEDB
-            mig_attr_res = await conn.execute(
+            # Step 8a: Verify custom_app_user does NOT own tenant-scoped tables
+            owner_res = await conn.execute(
                 text(
-                    f"SELECT rolsuper, rolbypassrls, rolcreatedb FROM pg_roles WHERE rolname = '{mig_user}';"
+                    "SELECT tablename, tableowner FROM pg_tables "
+                    "WHERE tablename IN ('candidate_document_embeddings', 'job_embeddings', 'organization_memberships');"
                 )
             )
-            super_val, rls_val, createdb_val = mig_attr_res.one()
-            assert super_val is False, "Migration role must have rolsuper = false"
-            assert rls_val is False, "Migration role must have rolbypassrls = false"
-            assert createdb_val is False, "Migration role must have rolcreatedb = false"
-    finally:
-        await mig_engine.dispose()
+            for tbl, owner in owner_res.all():
+                assert (
+                    owner != custom_app_user
+                ), f"Security violation: table {tbl} is owned by runtime role {custom_app_user}"
 
-    # 3. Verify that incorrect credentials for runtime role are rejected by PostgreSQL
-    bad_runtime_url = make_url(integration_settings.DATABASE_URL).set(
-        password="invalid_wrong_password_for_testing"
-    )
-    bad_runtime_engine = create_async_engine(bad_runtime_url)
-    try:
-        with pytest.raises((DBAPIError, asyncpg.exceptions.InvalidPasswordError)):
-            async with bad_runtime_engine.connect() as conn:
-                await conn.execute(text("SELECT 1;"))
-    finally:
-        await bad_runtime_engine.dispose()
+            # Step 8b: Verify custom_app_user cannot bypass RLS
+            bypass_res = await conn.execute(
+                text(f"SELECT rolbypassrls FROM pg_roles WHERE rolname = '{custom_app_user}';")
+            )
+            assert bypass_res.scalar() is False, f"{custom_app_user} must have rolbypassrls = false"
 
-    # 4. Verify that incorrect credentials for migration role are rejected by PostgreSQL
-    bad_mig_url = make_url(migration_url).set(password="invalid_wrong_password_for_testing")
-    bad_mig_engine = create_async_engine(bad_mig_url)
-    try:
+        await app_engine_2.dispose()
+
+        # Step 6: Verify old credentials are now rejected
+        old_mig_engine = create_async_engine(mig_url_1)
         with pytest.raises((DBAPIError, asyncpg.exceptions.InvalidPasswordError)):
-            async with bad_mig_engine.connect() as conn:
+            async with old_mig_engine.connect() as conn:
                 await conn.execute(text("SELECT 1;"))
+        await old_mig_engine.dispose()
+
+        old_app_engine = create_async_engine(app_url_1)
+        with pytest.raises((DBAPIError, asyncpg.exceptions.InvalidPasswordError)):
+            async with old_app_engine.connect() as conn:
+                await conn.execute(text("SELECT 1;"))
+        await old_app_engine.dispose()
+
     finally:
-        await bad_mig_engine.dispose()
+        # Step 9: Safely clean up test-created roles and restore authoritative configuration
+        auth_mig_user = integration_settings.POSTGRES_MIGRATION_USER or "aihr_migration_user"
+        auth_app_user = integration_settings.POSTGRES_USER or "aihr_app_user"
+        auth_mig_pass = os.getenv(
+            "POSTGRES_MIGRATION_PASSWORD", "local_development_migration_password_only"
+        )
+        auth_app_pass = os.getenv("POSTGRES_PASSWORD", "local_development_password_only")
+
+        # 9a: Restore schema public ownership to authoritative migration role and drop test roles
+        super_url = f"postgresql+asyncpg://{superuser}:{super_pass}@{host}:{port}/{database}"
+        try:
+            cleanup_engine = create_async_engine(super_url, isolation_level="AUTOCOMMIT")
+            async with cleanup_engine.connect() as conn:
+                await conn.execute(text(f'ALTER SCHEMA public OWNER TO "{auth_mig_user}";'))
+                await conn.execute(text(f'REVOKE ALL ON SCHEMA public FROM "{custom_mig_user}";'))
+                await conn.execute(text(f'REVOKE ALL ON SCHEMA public FROM "{custom_app_user}";'))
+                await conn.execute(text(f'DROP ROLE IF EXISTS "{custom_mig_user}";'))
+                await conn.execute(text(f'DROP ROLE IF EXISTS "{custom_app_user}";'))
+            await cleanup_engine.dispose()
+        except Exception:
+            pass
+
+        # 9b: Re-run bootstrap with authoritative credentials to guarantee clean baseline
+        try:
+            restore_env = {
+                "ENVIRONMENT": "testing",
+                "POSTGRES_SUPERUSER": superuser,
+                "POSTGRES_SUPERUSER_PASSWORD": super_pass,
+                "PGPASSWORD": super_pass,
+                "POSTGRES_HOST": host,
+                "POSTGRES_PORT": str(port),
+                "POSTGRES_DB": database,
+                "POSTGRES_MIGRATION_USER": auth_mig_user,
+                "POSTGRES_MIGRATION_PASSWORD": auth_mig_pass,
+                "POSTGRES_APP_USER": auth_app_user,
+                "POSTGRES_APP_PASSWORD": auth_app_pass,
+            }
+            execute_bootstrap(restore_env)
+        except Exception:
+            pass
 
 
 @skip_if_no_postgres

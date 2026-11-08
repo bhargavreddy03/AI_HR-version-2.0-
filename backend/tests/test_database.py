@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 from contextlib import asynccontextmanager
 from datetime import UTC
 from pathlib import Path
@@ -645,3 +648,76 @@ def test_init_db_sh_entrypoint_security() -> None:
     assert "POSTGRES_PASSWORD" in content
     # Verifies credentials are not passed as -W or -p password CLI flags
     assert "-W " not in content
+
+
+def _find_bash() -> str | None:
+    found = shutil.which("bash")
+    if found:
+        return found
+    git_bash = Path("C:/Program Files/Git/bin/bash.exe")
+    if git_bash.exists():
+        return str(git_bash)
+    return None
+
+
+def test_init_db_sh_missing_secrets_failure_outside_development() -> None:
+    """Verify infrastructure/scripts/init-db.sh fails immediately when secrets are missing outside development."""
+    bash = _find_bash()
+    if not bash:
+        pytest.skip("Bash not available on test runner host")
+
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    sh_path = repo_root / "infrastructure" / "scripts" / "init-db.sh"
+    assert sh_path.exists()
+
+    clean_env = {
+        "PATH": os.environ.get("PATH", ""),
+        "ENVIRONMENT": "production",
+        # Explicitly ensure passwords are NOT set
+        "POSTGRES_MIGRATION_PASSWORD": "",
+        "POSTGRES_PASSWORD": "",
+        "POSTGRES_APP_PASSWORD": "",
+        "PGPASSWORD": "",
+        "POSTGRES_SUPERUSER_PASSWORD": "",
+    }
+    proc = subprocess.run(
+        [bash, str(sh_path)],
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert (
+        "POSTGRES_MIGRATION_PASSWORD must be explicitly configured outside development"
+        in proc.stderr
+    )
+
+
+def test_init_db_sh_local_development_initialization() -> None:
+    """Verify infrastructure/scripts/init-db.sh sets convenient local defaults in development mode."""
+    bash = _find_bash()
+    if not bash:
+        pytest.skip("Bash not available on test runner host")
+
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    sh_path = repo_root / "infrastructure" / "scripts" / "init-db.sh"
+    assert sh_path.exists()
+
+    dev_env = {
+        "PATH": os.environ.get("PATH", ""),
+        "ENVIRONMENT": "development",
+    }
+    proc = subprocess.run(
+        [bash, str(sh_path)],
+        env=dev_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # Even if psql is not installed, it should reach the psql invocation and not fail with "must be explicitly configured"
+    assert "must be explicitly configured outside development" not in proc.stderr
+    assert (
+        "Starting database role initialization and credential reconciliation (env: development)"
+        in proc.stdout
+    )
