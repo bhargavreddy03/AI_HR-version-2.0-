@@ -1119,6 +1119,25 @@ async def confirm_password_reset(
             "User account not found or inactive", error_code="ACCOUNT_INACTIVE"
         )
 
+    # Validate token_version matches user's current token_version (Finding 1)
+    stored_token_version = token_payload.get("token_version")
+    if stored_token_version is None or stored_token_version != user.token_version:
+        log_security_event(
+            "PASSWORD_RESET_CONFIRM_FAILED",
+            "FAILURE",
+            actor_id=user.id,
+            client_ip=client_ip,
+            details={
+                "reason": "Token version mismatch / stale token",
+                "token_version": stored_token_version,
+                "current_version": user.token_version,
+            },
+        )
+        raise AuthenticationException(
+            "Password reset token is invalid or has expired",
+            error_code="RESET_TOKEN_INVALID",
+        )
+
     # Update password with Argon2id
     user.password_hash = hash_password(new_password, settings=settings)
     user.token_version += 1

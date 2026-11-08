@@ -801,8 +801,14 @@ def test_app_encryption_key_production_validation_and_separation() -> None:
 
 @pytest.mark.asyncio
 async def test_rbac_organization_service_mutation_guards() -> None:
-    """Verify that actual organization membership and role mutations enforce RBAC guards."""
-    from app.modules.organizations.models import OrganizationMembership, Role
+    """Verify that actual organization membership and role mutations enforce RBAC guards, DB resolution, and Ceiling Rule."""
+    from app.modules.auth.models import User
+    from app.modules.organizations.models import (
+        OrganizationMembership,
+        Permission,
+        Role,
+        RolePermission,
+    )
     from app.modules.organizations.service import (
         assign_membership_role,
         remove_membership,
@@ -815,7 +821,36 @@ async def test_rbac_organization_service_mutation_guards() -> None:
     target_user_id = uuid.uuid4()
     role_id = uuid.uuid4()
 
-    # 1. Non-admin caller rejected
+    def make_mock_result(scalar_val=None):
+        m = MagicMock()
+        m.scalar_one_or_none.return_value = scalar_val
+        m.scalar.return_value = scalar_val
+        return m
+
+    # 1. Non-admin caller rejected even if caller supplies fake super-admin claims (Finding 3)
+    actor_user = User(
+        id=actor_id,
+        email="recruiter@example.com",
+        first_name="Test",
+        last_name="Recruiter",
+        is_active=True,
+        is_super_admin=False,
+    )
+    recruiter_role = Role(id=uuid.uuid4(), name="recruiter", is_system=True)
+    recruiter_role.role_permissions = []
+    actor_membership = OrganizationMembership(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        user_id=actor_id,
+        role=recruiter_role,
+        is_active=True,
+    )
+
+    db.execute.side_effect = [
+        make_mock_result(actor_user),  # 1. _resolve_trusted_actor_context: User
+        make_mock_result(actor_membership),  # 2. _resolve_trusted_actor_context: OrgMembership
+    ]
+
     with pytest.raises(AuthorizationException, match="Only organization administrators"):
         await assign_membership_role(
             db,
@@ -823,19 +858,43 @@ async def test_rbac_organization_service_mutation_guards() -> None:
             target_user_id=target_user_id,
             new_role_id=role_id,
             actor_user_id=actor_id,
-            actor_role="recruiter",  # Non-admin
+            actor_role="platform_super_admin",  # Attacker attempt to spoof role claim
+            actor_is_super_admin=True,  # Attacker attempt to spoof super-admin claim
         )
 
     # 2. Org admin cannot grant platform_super_admin
-    mock_super_admin_role = MagicMock(spec=Role)
-    mock_super_admin_role.id = role_id
-    mock_super_admin_role.name = "platform_super_admin"
-    mock_super_admin_role.tenant_id = None
+    admin_user = User(
+        id=actor_id,
+        email="admin@example.com",
+        first_name="Org",
+        last_name="Admin",
+        is_active=True,
+        is_super_admin=False,
+    )
+    admin_role = Role(id=uuid.uuid4(), name="org_admin", is_system=True)
+    admin_role.role_permissions = []
+    admin_membership = OrganizationMembership(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        user_id=actor_id,
+        role=admin_role,
+        is_active=True,
+    )
+
+    mock_super_admin_role = Role(
+        id=role_id,
+        name="platform_super_admin",
+        is_system=True,
+        tenant_id=None,
+    )
     mock_super_admin_role.role_permissions = []
 
-    db.execute.return_value = MagicMock(
-        scalar_one_or_none=MagicMock(return_value=mock_super_admin_role)
-    )
+    db.execute.side_effect = [
+        make_mock_result(admin_user),  # 1. actor user
+        make_mock_result(admin_membership),  # 2. actor membership
+        make_mock_result(tenant_id),  # 3. serialize_organization_mutation
+        make_mock_result(mock_super_admin_role),  # 4. target role
+    ]
 
     with pytest.raises(AuthorizationException, match="cannot grant platform super-admin"):
         await assign_membership_role(
@@ -844,51 +903,107 @@ async def test_rbac_organization_service_mutation_guards() -> None:
             target_user_id=target_user_id,
             new_role_id=role_id,
             actor_user_id=actor_id,
-            actor_role="org_admin",
         )
 
-    # 3. Sole Admin Protection: Demoting sole org_admin to recruiter is rejected
-    mock_recruiter_role = MagicMock(spec=Role)
-    mock_recruiter_role.id = role_id
-    mock_recruiter_role.name = "recruiter"
-    mock_recruiter_role.tenant_id = tenant_id
-    mock_recruiter_role.role_permissions = []
+    # 3. Permission Ceiling Rule: Org admin cannot grant role containing permissions they do not hold (Finding 3)
+    p_job_read = Permission(id=uuid.uuid4(), code="jobs:read", name="Read Jobs", module="jobs")
+    p_billing_manage = Permission(
+        id=uuid.uuid4(), code="billing:manage", name="Manage Billing", module="billing"
+    )
 
-    # Mock DB queries: 1. fetch role, 2. fetch membership, 3. count active admins (=1), 4. check target is admin (=True)
-    res_role = MagicMock()
-    res_role.scalar_one_or_none.return_value = mock_recruiter_role
+    rp_actor = RolePermission(id=uuid.uuid4(), permission=p_job_read)
+    admin_role_with_perm = Role(id=uuid.uuid4(), name="org_admin", is_system=True)
+    admin_role_with_perm.role_permissions = [rp_actor]
+    admin_mem_with_perm = OrganizationMembership(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        user_id=actor_id,
+        role=admin_role_with_perm,
+        is_active=True,
+    )
 
-    res_mem = MagicMock()
-    res_mem.scalar_one_or_none.return_value = MagicMock(spec=OrganizationMembership)
+    rp_target_1 = RolePermission(id=uuid.uuid4(), permission=p_job_read)
+    rp_target_2 = RolePermission(id=uuid.uuid4(), permission=p_billing_manage)
+    target_role_excess = Role(id=role_id, name="recruiter", tenant_id=tenant_id, is_system=False)
+    target_role_excess.role_permissions = [rp_target_1, rp_target_2]
 
-    res_count = MagicMock()
-    res_count.scalar.return_value = 1
+    db.execute.side_effect = [
+        make_mock_result(admin_user),  # 1. actor user
+        make_mock_result(admin_mem_with_perm),  # 2. actor membership
+        make_mock_result(tenant_id),  # 3. serialize_organization_mutation
+        make_mock_result(target_role_excess),  # 4. target role
+    ]
 
-    res_target = MagicMock()
-    res_target.scalar_one_or_none.return_value = uuid.uuid4()
-
-    db.execute.side_effect = [res_role, res_mem, res_count, res_target]
-
-    with pytest.raises(AuthorizationException, match="sole administrator"):
+    with pytest.raises(AuthorizationException) as exc_ceiling:
         await assign_membership_role(
             db,
             tenant_id=tenant_id,
             target_user_id=target_user_id,
             new_role_id=role_id,
             actor_user_id=actor_id,
-            actor_role="org_admin",
         )
+    assert exc_ceiling.value.error_code == "PRIVILEGE_ESCALATION_BLOCKED"
+    assert "billing:manage" in exc_ceiling.value.message
 
-    # 4. Mass assignment filtering on update_membership
-    mock_membership = MagicMock(spec=OrganizationMembership)
-    mock_membership.id = uuid.uuid4()
-    mock_membership.tenant_id = tenant_id
-    mock_membership.user_id = target_user_id
-    mock_membership.is_active = True
-    mock_membership.department_id = None
+    # 4. Sole Admin Protection: Demoting sole org_admin to recruiter is rejected
+    rp_admin_demote = RolePermission(id=uuid.uuid4(), permission=p_job_read)
+    admin_role_for_demote = Role(id=uuid.uuid4(), name="org_admin", is_system=True)
+    admin_role_for_demote.role_permissions = [rp_admin_demote]
+    admin_mem_for_demote = OrganizationMembership(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        user_id=actor_id,
+        role=admin_role_for_demote,
+        is_active=True,
+    )
+
+    rp_target_recruiter = RolePermission(id=uuid.uuid4(), permission=p_job_read)
+    target_role_recruiter = Role(id=role_id, name="recruiter", tenant_id=tenant_id, is_system=False)
+    target_role_recruiter.role_permissions = [rp_target_recruiter]
+
+    target_membership = OrganizationMembership(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        user_id=target_user_id,
+        role_id=admin_role.id,
+        is_active=True,
+    )
 
     db.execute.side_effect = [
-        MagicMock(scalar_one_or_none=MagicMock(return_value=mock_membership)),
+        make_mock_result(admin_user),  # 1. actor user
+        make_mock_result(admin_mem_for_demote),  # 2. actor membership
+        make_mock_result(tenant_id),  # 3. serialize_organization_mutation
+        make_mock_result(target_role_recruiter),  # 4. target role
+        make_mock_result(target_membership),  # 5. target membership
+        make_mock_result(1),  # 6. count active admins (=1)
+        make_mock_result(target_membership.id),  # 7. check target is admin (=True)
+    ]
+
+    with pytest.raises(AuthorizationException, match="sole administrator") as exc_sole:
+        await assign_membership_role(
+            db,
+            tenant_id=tenant_id,
+            target_user_id=target_user_id,
+            new_role_id=role_id,
+            actor_user_id=actor_id,
+        )
+    assert exc_sole.value.error_code == "SOLE_ADMIN_PROTECTION_VIOLATION"
+
+    # 5. Mass assignment filtering on update_membership
+    mock_membership_to_update = OrganizationMembership(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        user_id=target_user_id,
+        role_id=admin_role.id,
+        is_active=True,
+        department_id=None,
+    )
+
+    db.execute.side_effect = [
+        make_mock_result(admin_user),  # 1. actor user
+        make_mock_result(admin_membership),  # 2. actor membership
+        make_mock_result(tenant_id),  # 3. serialize_organization_mutation
+        make_mock_result(mock_membership_to_update),  # 4. target membership
     ]
 
     new_dept_id = uuid.uuid4()
@@ -906,27 +1021,27 @@ async def test_rbac_organization_service_mutation_guards() -> None:
         target_user_id=target_user_id,
         update_data=hacked_payload,
         actor_user_id=actor_id,
-        actor_role="org_admin",
     )
     assert updated.department_id == new_dept_id
-    # Assert protected fields were not overwritten
     assert updated.tenant_id == tenant_id
 
-    # 5. Sole admin removal rejected
-    res_count_rem = MagicMock()
-    res_count_rem.scalar.return_value = 1
-    res_target_rem = MagicMock()
-    res_target_rem.scalar_one_or_none.return_value = uuid.uuid4()
-    db.execute.side_effect = [res_count_rem, res_target_rem]
+    # 6. Sole admin removal rejected
+    db.execute.side_effect = [
+        make_mock_result(admin_user),  # 1. actor user
+        make_mock_result(admin_membership),  # 2. actor membership
+        make_mock_result(tenant_id),  # 3. serialize_organization_mutation
+        make_mock_result(1),  # 4. count active admins (=1)
+        make_mock_result(target_membership.id),  # 5. check target is admin (=True)
+    ]
 
-    with pytest.raises(AuthorizationException, match="sole administrator"):
+    with pytest.raises(AuthorizationException, match="sole administrator") as exc_rem:
         await remove_membership(
             db,
             tenant_id=tenant_id,
             target_user_id=target_user_id,
             actor_user_id=actor_id,
-            actor_role="org_admin",
         )
+    assert exc_rem.value.error_code == "SOLE_ADMIN_PROTECTION_VIOLATION"
 
 
 # ==============================================================================

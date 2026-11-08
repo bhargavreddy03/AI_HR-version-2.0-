@@ -14,7 +14,7 @@ from pathlib import Path
 
 import asyncpg
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from starlette.requests import Request
@@ -29,7 +29,7 @@ from app.core.database import (
     create_session_factory,
     register_pool_cleanup_listener,
 )
-from app.core.errors import AuthenticationException
+from app.core.errors import AuthenticationException, AuthorizationException
 from app.core.security import hash_password, set_tenant_context
 from app.modules.auth.crypto import (
     encrypt_mfa_secret,
@@ -69,6 +69,7 @@ from app.modules.organizations.models import (
     OrganizationMembership,
     Role,
 )
+from app.modules.organizations.service import remove_membership
 
 # Read test database URLs from environment or standard defaults
 INTEGRATION_DB_URL = os.getenv(
@@ -1976,3 +1977,138 @@ def test_postgres_vector_downgrade_preserves_external_dependent_objects_and_exte
         with sync_engine.begin() as conn:
             conn.execute(text("DROP TABLE IF EXISTS external_vector_dependent_table;"))
         sync_engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not postgres_is_live(),
+    reason="PostgreSQL service not reachable at INTEGRATION_DB_URL",
+)
+async def test_sole_admin_concurrency_serialization() -> None:
+    """Verify that concurrent operations cannot demote or remove the last active administrator (Finding 2)."""
+    engine = create_db_engine(INTEGRATION_DB_URL, pool_size=5, max_overflow=5)
+    session_factory = create_session_factory(engine)
+
+    tenant_id = generate_uuid7()
+    admin_1_id = generate_uuid7()
+    admin_2_id = generate_uuid7()
+    admin_role_id = generate_uuid7()
+
+    try:
+        # Step 1: Seed organization, org_admin role, and 2 active administrators
+        async with session_factory() as session:
+            await set_tenant_context(session, tenant_id)
+            org = Organization(
+                id=tenant_id,
+                name=f"Sole Admin Concurrency Org {tenant_id.hex[:6]}",
+                slug=f"sole-admin-org-{tenant_id.hex[:6]}",
+                status="active",
+            )
+            session.add(org)
+
+            # Check if system org_admin role exists, or insert test role
+            role_stmt = select(Role).where(Role.name == "org_admin")
+            role = (await session.execute(role_stmt)).scalars().first()
+            if not role:
+                role = Role(
+                    id=admin_role_id,
+                    name="org_admin",
+                    description="Organization Administrator",
+                    tenant_id=None,
+                    is_system=True,
+                )
+                session.add(role)
+            else:
+                admin_role_id = role.id
+
+            user_1 = User(
+                id=admin_1_id,
+                email=f"admin1_{admin_1_id.hex[:6]}@example.com",
+                password_hash=hash_password("SuperSecret123!"),
+                first_name="Admin",
+                last_name="One",
+                is_active=True,
+                is_super_admin=False,
+            )
+            user_2 = User(
+                id=admin_2_id,
+                email=f"admin2_{admin_2_id.hex[:6]}@example.com",
+                password_hash=hash_password("SuperSecret123!"),
+                first_name="Admin",
+                last_name="Two",
+                is_active=True,
+                is_super_admin=False,
+            )
+            session.add_all([user_1, user_2])
+            await session.flush()
+
+            mem_1 = OrganizationMembership(
+                id=generate_uuid7(),
+                tenant_id=tenant_id,
+                user_id=admin_1_id,
+                role_id=admin_role_id,
+                is_active=True,
+            )
+            mem_2 = OrganizationMembership(
+                id=generate_uuid7(),
+                tenant_id=tenant_id,
+                user_id=admin_2_id,
+                role_id=admin_role_id,
+                is_active=True,
+            )
+            session.add_all([mem_1, mem_2])
+            await session.commit()
+
+        # Step 2: Concurrently execute two simultaneous membership removals
+        # Task 1 tries to remove Admin 1 (with Admin 2 acting as actor)
+        # Task 2 tries to remove Admin 2 (with Admin 1 acting as actor)
+        async def remove_op_1() -> bool:
+            async with session_factory() as session:
+                await set_tenant_context(session, tenant_id)
+                return await remove_membership(
+                    db=session,
+                    tenant_id=tenant_id,
+                    target_user_id=admin_1_id,
+                    actor_user_id=admin_2_id,
+                )
+
+        async def remove_op_2() -> bool:
+            async with session_factory() as session:
+                await set_tenant_context(session, tenant_id)
+                return await remove_membership(
+                    db=session,
+                    tenant_id=tenant_id,
+                    target_user_id=admin_2_id,
+                    actor_user_id=admin_1_id,
+                )
+
+        results = await asyncio.gather(remove_op_1(), remove_op_2(), return_exceptions=True)
+
+        successes = [r for r in results if r is True]
+        failures = [r for r in results if isinstance(r, AuthorizationException)]
+
+        assert len(successes) == 1, f"Exactly one simultaneous removal must succeed, got {results}"
+        assert (
+            len(failures) == 1
+        ), f"Exactly one simultaneous removal must be rejected, got {results}"
+        assert failures[0].error_code == "SOLE_ADMIN_PROTECTION_VIOLATION"
+
+        # Step 3: Verify that in the database, exactly ONE active administrator remains
+        async with session_factory() as session:
+            await set_tenant_context(session, tenant_id)
+            count_stmt = (
+                select(func.count(OrganizationMembership.id))
+                .join(Role, Role.id == OrganizationMembership.role_id)
+                .where(
+                    OrganizationMembership.tenant_id == tenant_id,
+                    OrganizationMembership.is_active.is_(True),
+                    Role.name == "org_admin",
+                )
+            )
+            remaining_admins = (await session.execute(count_stmt)).scalar()
+            assert (
+                remaining_admins == 1
+            ), f"Expected exactly 1 admin remaining, got {remaining_admins}"
+
+    finally:
+        await engine.dispose()

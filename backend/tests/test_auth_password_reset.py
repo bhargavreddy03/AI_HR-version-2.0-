@@ -256,3 +256,82 @@ async def test_password_reset_token_concurrency_atomic_consumption(
     assert len(successes) == 1, f"Exactly one concurrent request must succeed, got {results}"
     assert len(failures) == 1, f"Exactly one concurrent request must fail, got {results}"
     assert failures[0].error_code == "RESET_TOKEN_INVALID"
+
+
+@pytest.mark.asyncio
+async def test_password_reset_token_stale_version_invalidation(
+    test_settings: Settings,
+) -> None:
+    """Verify that consuming one password reset token invalidates all previously issued reset tokens (Finding 1)."""
+    import json
+
+    from app.core.errors import AuthenticationException
+    from app.modules.auth.crypto import generate_secure_token, hash_token
+    from app.modules.auth.service import confirm_password_reset
+
+    mock_db = AsyncMock()
+    mock_redis = AsyncMock()
+    stored_redis_data: dict[str, str] = {}
+
+    async def mock_redis_getdel(key: str) -> str | None:
+        return stored_redis_data.pop(key, None)
+
+    mock_redis.getdel = mock_redis_getdel
+
+    user_id = uuid.uuid4()
+    mock_user = MagicMock()
+    mock_user.id = user_id
+    mock_user.email = "stale_test@example.com"
+    mock_user.is_active = True
+    mock_user.token_version = 1
+    mock_user.password_hash = "old_hash"
+
+    # User requests two reset tokens before resetting password
+    raw_token_1 = generate_secure_token(48)
+    token_hash_1 = hash_token(raw_token_1)
+    stored_redis_data[f"password_reset:{token_hash_1}"] = json.dumps(
+        {"user_id": str(user_id), "email": mock_user.email, "token_version": 1}
+    )
+
+    raw_token_2 = generate_secure_token(48)
+    token_hash_2 = hash_token(raw_token_2)
+    stored_redis_data[f"password_reset:{token_hash_2}"] = json.dumps(
+        {"user_id": str(user_id), "email": mock_user.email, "token_version": 1}
+    )
+
+    mock_user_query = MagicMock()
+    mock_user_query.scalar_one_or_none.return_value = mock_user
+
+    mock_session_query = MagicMock()
+    mock_session_query.scalars.return_value.all.return_value = []
+
+    mock_db.execute.side_effect = [
+        mock_user_query,
+        mock_session_query,
+        mock_user_query,
+    ]
+
+    # 1. First reset succeeds using token 1 -> increments user.token_version to 2
+    success = await confirm_password_reset(
+        mock_db,
+        mock_redis,
+        raw_token_1,
+        "FirstNewPassword2026#!",
+        "127.0.0.1",
+        test_settings,
+    )
+    assert success is True
+    assert mock_user.token_version == 2
+
+    # 2. Second reset attempt using token 2 (stale token_version=1) must be rejected
+    with pytest.raises(AuthenticationException) as exc_info:
+        await confirm_password_reset(
+            mock_db,
+            mock_redis,
+            raw_token_2,
+            "SecondNewPassword2026#!",
+            "127.0.0.1",
+            test_settings,
+        )
+    assert exc_info.value.error_code == "RESET_TOKEN_INVALID"
+    assert "invalid or has expired" in exc_info.value.message

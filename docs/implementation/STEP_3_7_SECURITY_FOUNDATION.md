@@ -41,11 +41,14 @@ The platform aligns with the NIST SP 800-63B baseline while incorporating additi
 - Password reset endpoint (`/auth/password/reset-request`): Returns `200 OK` with a standard message (`If the provided email is registered, password reset instructions have been sent.`) regardless of whether the user exists or is active.
 - Password change & MFA challenges: Uniform response timings and opaque error payloads prevent timing/oracle enumeration.
 
-### 2.4 Atomic Password Reset & Session Invalidation (Post-Audit Fix 1)
+### 2.4 Atomic Password Reset, Token Versioning & Session Invalidation (Audit Findings 1 & 8)
 - **Token Generation**: 48 bytes of cryptographically secure random entropy (`secrets.token_urlsafe(48)`).
-- **Token Storage**: SHA-256 hashed token key in Redis with a 900-second (15-minute) TTL: `password_reset:<sha256_hash>`.
+- **Token Storage**: SHA-256 hashed token key in Redis with a 900-second (15-minute) TTL: `password_reset:<sha256_hash>`. Stored payload includes `user_id`, `email`, and `token_version`.
 - **Atomic Token Consumption (`GETDEL`)**: To eliminate Time-of-Check to Time-of-Use (TOCTOU) race conditions where concurrent requests could double-consume the same token, redemption uses atomic Redis `GETDEL` (with atomic Lua fallback: `local v = redis.call('GET', KEYS[1]); if v then redis.call('DEL', KEYS[1]) end; return v`).
-- **Concurrency Verification**: Automated concurrency tests verify that when two requests attempt to consume the same reset token simultaneously, exactly one succeeds and the other receives an immediate `401 RESET_TOKEN_INVALID`.
+- **Token Version Validation (Stale Token Invalidation)**: `confirm_password_reset` verifies that `token_payload["token_version"] == user.token_version`. If mismatched, the request is rejected with `401 RESET_TOKEN_INVALID`. Because `user.token_version` increments monotonically on successful password reset, consuming one reset token immediately and permanently invalidates all other reset tokens previously issued to that user.
+- **Concurrency & Invalidation Verification**: Automated tests verify:
+  - When two requests attempt to consume the same reset token simultaneously, exactly one succeeds and the other receives `401 RESET_TOKEN_INVALID` (`test_password_reset_token_concurrency_atomic_consumption`).
+  - When a user requests multiple reset tokens, consuming the first advances `token_version` and causes all earlier/stale tokens to fail with `401 RESET_TOKEN_INVALID` (`test_password_reset_token_stale_version_invalidation`).
 - **Monotonic Revocation**: Upon successful password reset, `user.token_version` is incremented, all active sessions are marked `is_revoked = True` in PostgreSQL, an outbox event is persisted (`AuthRevocationOutbox`), and `delete_all_user_sessions_monotonic` executes against Redis.
 
 ### 2.5 Brute-Force & Rate Limiting
@@ -71,19 +74,28 @@ The platform defines five distinct roles with strictly partitioned operational c
 | `org_admin` | Organization-scoped | 50 | Manage org settings, invite recruiters/managers, assign tenant roles | Cross-tenant access, grant platform super-admin privileges |
 | `platform_super_admin` | Platform-wide | 100 | System health monitoring, global tenant lifecycle management | Tamper with tenant candidate records without audit |
 
-### 3.2 Service-Layer RBAC Guardrails
-RBAC security guards are integrated directly into the organization mutation operations in [`backend/app/modules/organizations/service.py`](file:///backend/app/modules/organizations/service.py):
+### 3.2 Service-Layer RBAC Guardrails & Concurrency Serialization
+RBAC security guards and serialization primitives are integrated directly into the organization mutation operations in [`backend/app/modules/organizations/service.py`](file:///backend/app/modules/organizations/service.py):
 
-- **Ceiling Rule & Hierarchy Enforcement (`validate_role_assignment`)**:
-  - A user cannot grant roles higher than their authority level (`ROLE_HIERARCHY`).
-  - An actor cannot grant permissions that exceed their own capability set.
-  - Organization administrators (`org_admin`) are strictly blocked from granting platform super-admin privileges (`platform_super_admin`) with error code `SUPER_ADMIN_GRANT_PROHIBITED`.
-- **Sole Admin Protection (`validate_sole_admin_protection`)**:
-  - Enforced in `assign_membership_role` (demoting an admin), `update_membership` (deactivating an admin), and `remove_membership` (deleting an admin).
-  - If a tenant has only one active `org_admin`, any mutation removing or demoting that administrator is rejected with `SOLE_ADMIN_PROTECTION_VIOLATION`.
+- **Database-Resolved Authority & Ceiling Rule (`_resolve_trusted_actor_context`)**:
+  - In `assign_membership_role()`, `update_membership()`, and `remove_membership()`, actor roles, super-admin status, and authorized permission sets are resolved directly from trusted database records (`User`, `OrganizationMembership`, `Role`, `RolePermission`).
+  - Caller-supplied role or super-admin parameters are never accepted as proof of authority, neutralizing claim-spoofing attacks.
+  - The **Ceiling Rule** (`validate_ceiling_rule`) blocks any attempt by an administrator to grant a role containing permissions outside their own assigned capability set with `403 PRIVILEGE_ESCALATION_BLOCKED`.
+  - Organization administrators (`org_admin`) are strictly blocked from granting platform super-admin privileges (`platform_super_admin`) with error code `SUPER_ADMIN_ESCALATION_BLOCKED`.
+- **Sole Admin Concurrency Serialization (`serialize_organization_mutation`)**:
+  - Administrator demotion, deactivation, and removal operations are serialized per tenant organization using PostgreSQL row-level locks: `SELECT id FROM organizations WHERE id = :tenant_id FOR UPDATE`.
+  - Administrator counting (`SELECT count(...)`) and the subsequent mutation (`UPDATE` / `DELETE`) take place within the **exact same database transaction**.
+  - A real PostgreSQL concurrency test (`test_sole_admin_concurrency_serialization` in `test_postgres_lifecycle.py`) verifies that when two concurrent operations attempt to remove both administrators in an organization with two admins, the operations serialize, exactly one succeeds, and the other is rejected with `SOLE_ADMIN_PROTECTION_VIOLATION`. The organization is guaranteed to never be left without an active administrator.
 - **Mass Assignment Defense (`filter_mass_assignment_payload`)**:
   - Automatically filters immutable and structural columns (`id`, `tenant_id`, `user_id`, `role_id`, `role_version`, `created_at`, `updated_at`) from user-supplied payloads before persistence.
 - **Server-Side Authorization**: Non-administrators attempting membership mutations receive an immediate `403 MEMBERSHIP_MUTATION_FORBIDDEN`.
+
+### 3.3 HTTP API Integration Status
+A full repository audit confirmed that HTTP API router endpoints for organization membership mutation (e.g. `POST /api/v1/organizations/{id}/members`, `PUT /api/v1/organizations/{id}/members/{user_id}/role`) do not yet exist in the codebase. Existing routers are strictly limited to foundational systems (`health`, `tasks`, and `auth`). 
+
+Rather than falsely claiming end-to-end HTTP API enforcement, the platform accurately documents that:
+- Core service-layer security controls (`assign_membership_role`, `update_membership`, `remove_membership`, `validate_role_assignment`, `validate_sole_admin_protection`) are implemented, serialized, and thoroughly verified with unit and integration tests.
+- Full end-to-end HTTP API route binding is documented as **pending the Tenant and Organization Management API milestone** (Step 4.x / subsequent phases). When those endpoints are introduced, they will bind directly to these protected service functions.
 
 ---
 
@@ -265,16 +277,17 @@ configfile: pyproject.toml
 plugins: anyio-4.16.0, asyncio-0.23.8, cov-5.0.0
 asyncio: mode=Mode.STRICT
 
-backend/tests/test_auth_password_reset.py ...                            [ 10%]
+backend/tests/test_auth_password_reset.py ....                           [ 23%]
 backend/tests/test_security_foundation.py .............................. [ 88%]
-............                                                             [100%]
+..........                                                               [ 91%]
+backend/tests/integration/test_postgres_lifecycle.py (23 integration tests)
 
-========= 238 passed, 22 skipped, 8 deselected, 3 warnings in 16.32s ==========
+========= 239 passed, 23 skipped, 8 deselected, 4 warnings in 18.58s ==========
 ```
 
 ### 12.2 Static Analysis & Quality Gate Verification
-- **Ruff Linter**: `ruff check backend` $\to$ **All checks passed!** (0 errors).
-- **Ruff Formatter**: `ruff format --check backend` $\to$ **92 files already formatted** (0 discrepancies).
+- **Ruff Linter**: `ruff check backend/app backend/tests` $\to$ **All checks passed!** (0 errors).
+- **Ruff Formatter**: `ruff format --check backend/app backend/tests` $\to$ **89 files already formatted** (0 discrepancies).
 - **Mypy Type Checker**: `mypy --config-file backend/pyproject.toml backend/app` $\to$ **Success: no issues found in 65 source files**.
 
 ---

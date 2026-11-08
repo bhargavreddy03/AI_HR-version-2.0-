@@ -163,19 +163,36 @@ def validate_role_assignment(
         )
 
 
+async def serialize_tenant_for_admin_mutation(db: AsyncSession, tenant_id: UUID) -> None:
+    """Acquire exclusive row-level lock on the organization to serialize administrator mutations (Finding 2)."""
+    from app.modules.organizations.models import Organization
+
+    org_stmt = select(Organization.id).where(Organization.id == tenant_id).with_for_update()
+    await db.execute(org_stmt)
+
+
 async def validate_sole_admin_protection(
     db: AsyncSession,
     tenant_id: UUID,
     target_user_id: UUID,
+    serialize: bool = False,
 ) -> None:
     """Ensure an organization cannot be left without at least one active administrator.
+
+    Serializes administrator mutations per organization when serialize=True to eliminate race conditions,
+    and performs administrator counting and target validation within the same transaction.
 
     Raises:
         AuthorizationException: If target_user_id is the sole active admin and is being deactivated or demoted.
     """
-    from app.modules.organizations.models import OrganizationMembership, Role
+    from app.modules.organizations.models import Organization, OrganizationMembership, Role
 
-    # Count active org_admin memberships for this tenant
+    if serialize:
+        # Acquire row-level lock on the tenant organization record to serialize admin mutations
+        org_stmt = select(Organization.id).where(Organization.id == tenant_id).with_for_update()
+        await db.execute(org_stmt)
+
+    # Count active org_admin memberships for this tenant within the serialized transaction
     stmt = (
         select(func.count(OrganizationMembership.id))
         .join(Role, Role.id == OrganizationMembership.role_id)
@@ -185,7 +202,8 @@ async def validate_sole_admin_protection(
             Role.name == ROLE_ORG_ADMIN,
         )
     )
-    admin_count = (await db.execute(stmt)).scalar() or 0
+    raw_count = (await db.execute(stmt)).scalar()
+    admin_count = int(raw_count) if raw_count is not None else 0
 
     if admin_count <= 1:
         # Check if the target user is currently an active org_admin
