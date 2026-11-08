@@ -181,22 +181,107 @@ jobs:
           docker compose --env-file .env -f infrastructure/docker/docker-compose.yml config --quiet
           echo "SUCCESS: Production compose config validated successfully with explicit secrets."
 
-      - name: Smoke Test Docker Compose Stack Startup and Port Isolation
+      - name: Smoke Test Docker Compose Stack Startup, Port Isolation, and Security
         run: |
+          set -euo pipefail
+          trap 'docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml down -v --remove-orphans' EXIT
+
+          echo "Starting dev stack (postgres and redis)..."
           docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml up -d postgres redis
-          # Wait up to 30 seconds for postgres and redis to be ready
-          for i in {1..30}; do
-            if docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml exec -T postgres pg_isready -U postgres > /dev/null 2>&1; then
-              echo "Postgres is ready and accepting connections."
+
+          echo "Waiting for PostgreSQL container to become healthy..."
+          PG_READY=false
+          for i in $(seq 1 45); do
+            PG_STATUS=$(docker inspect --format='{{json .State.Health.Status}}' ai_hr_postgres 2>/dev/null || echo '""')
+            if [ "$PG_STATUS" = '"healthy"' ]; then
+              echo "PostgreSQL container is healthy."
+              PG_READY=true
               break
             fi
             sleep 1
           done
-          # Verify Redis authentication with development secret
-          docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml exec -T redis redis-cli -a local_development_redis_secret_only ping
-          # Verify teardown
-          docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml down -v
-          echo "SUCCESS: Container smoke test completed successfully."
+
+          if [ "$PG_READY" != "true" ]; then
+            echo "ERROR: PostgreSQL container failed to become healthy within 45s timeout!"
+            docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml logs postgres
+            exit 1
+          fi
+
+          echo "Waiting for Redis container to become healthy..."
+          REDIS_READY=false
+          for i in $(seq 1 30); do
+            REDIS_STATUS=$(docker inspect --format='{{json .State.Health.Status}}' ai_hr_redis 2>/dev/null || echo '""')
+            if [ "$REDIS_STATUS" = '"healthy"' ]; then
+              echo "Redis container is healthy."
+              REDIS_READY=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$REDIS_READY" != "true" ]; then
+            echo "ERROR: Redis container failed to become healthy within 30s timeout!"
+            docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml logs redis
+            exit 1
+          fi
+
+          DEV_SUPER_PASS="dev_postgres_superuser_secret"
+          DEV_REDIS_PASS="local_development_redis_secret_only"
+
+          echo "1. Verifying pgvector extension in ai_hr_db..."
+          EXT_CHECK=$(docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml exec -T -e PGPASSWORD="$DEV_SUPER_PASS" postgres psql -U postgres -d ai_hr_db -tA -c "SELECT extname FROM pg_extension WHERE extname = 'vector';")
+          if [ "$EXT_CHECK" != "vector" ]; then
+            echo "ERROR: pgvector extension not found in ai_hr_db!"
+            exit 1
+          fi
+          echo "pgvector extension verified."
+
+          echo "2. Verifying restricted attributes on migration and app users..."
+          ROLES_CHECK=$(docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml exec -T -e PGPASSWORD="$DEV_SUPER_PASS" postgres psql -U postgres -d ai_hr_db -tA -c "SELECT rolname, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole FROM pg_roles WHERE rolname IN ('aihr_migration_user', 'aihr_app_user') ORDER BY rolname;")
+          echo "$ROLES_CHECK"
+          echo "$ROLES_CHECK" | grep -q "aihr_app_user|f|f|f|f" || { echo "ERROR: aihr_app_user has unexpected privileges!"; exit 1; }
+          echo "$ROLES_CHECK" | grep -q "aihr_migration_user|f|f|f|f" || { echo "ERROR: aihr_migration_user has unexpected privileges!"; exit 1; }
+          echo "Database user restricted attributes verified."
+
+          echo "3. Verifying runtime app user owns 0 tables..."
+          APP_TABLE_COUNT=$(docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml exec -T -e PGPASSWORD="$DEV_SUPER_PASS" postgres psql -U postgres -d ai_hr_db -tA -c "SELECT count(*) FROM pg_tables WHERE tableowner = 'aihr_app_user';")
+          if [ "$APP_TABLE_COUNT" != "0" ]; then
+            echo "ERROR: aihr_app_user owns $APP_TABLE_COUNT tables; must be 0!"
+            exit 1
+          fi
+          echo "App user owns 0 tables verified."
+
+          echo "4. Verifying Redis authentication (authenticated and unauthenticated)..."
+          AUTH_PING=$(docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml exec -T redis redis-cli -a "$DEV_REDIS_PASS" ping 2>&1)
+          echo "Authenticated ping response: $AUTH_PING"
+          echo "$AUTH_PING" | grep -q "PONG" || { echo "ERROR: Authenticated ping did not return PONG!"; exit 1; }
+
+          UNAUTH_PING=$(docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml exec -T redis redis-cli ping 2>&1 || true)
+          echo "Unauthenticated ping response: $UNAUTH_PING"
+          echo "$UNAUTH_PING" | grep -q "NOAUTH" || { echo "ERROR: Unauthenticated ping did not fail with NOAUTH!"; exit 1; }
+          echo "Redis authentication enforcement verified."
+
+          echo "5. Verifying development stack host port bindings are bound to 127.0.0.1 loopback only..."
+          PG_PORTS=$(docker inspect ai_hr_postgres --format='{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostIp}}:{{.HostPort}} {{end}}{{end}}')
+          REDIS_PORTS=$(docker inspect ai_hr_redis --format='{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostIp}}:{{.HostPort}} {{end}}{{end}}')
+          echo "ai_hr_postgres host ports: $PG_PORTS"
+          echo "ai_hr_redis host ports: $REDIS_PORTS"
+
+          if echo "$PG_PORTS $REDIS_PORTS" | grep -q "0.0.0.0"; then
+            echo "ERROR: Insecure wildcard host port binding (0.0.0.0) detected!"
+            exit 1
+          fi
+
+          echo "$PG_PORTS" | grep -q "127.0.0.1:5432" || { echo "ERROR: ai_hr_postgres is not bound to 127.0.0.1:5432!"; exit 1; }
+          echo "$REDIS_PORTS" | grep -q "127.0.0.1:6379" || { echo "ERROR: ai_hr_redis is not bound to 127.0.0.1:6379!"; exit 1; }
+          echo "Host loopback port bindings verified."
+
+          echo "SUCCESS: All container smoke tests and security verifications passed."
+
+      - name: Teardown Docker Compose Development Stack
+        if: always()
+        run: |
+          docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml down -v --remove-orphans || true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

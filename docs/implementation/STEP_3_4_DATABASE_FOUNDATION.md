@@ -85,8 +85,12 @@ In strict conformance with Architecture Document 04 Section 1:
   - Used strictly by Alembic for DDL migrations (`DATABASE_MIGRATION_URL` / `DATABASE_SYNC_URL`).
 - **`aihr_app_user` (Restricted Application Runtime Role)**:
   - Created with `NOSUPERUSER`, `NOBYPASSRLS`, `NOCREATEDB`, `NOCREATEROLE`.
-- **Zero Hardcoded Role Credentials & Controlled Reconciliation**:
+- **Zero Hardcoded Role Credentials, Socket Detection & Controlled Reconciliation**:
   - `infrastructure/scripts/init-db.sql` and `infrastructure/scripts/init-db.sh` contain no hardcoded password literals.
+  - Distinguishes Docker container entrypoint initialization (`IS_DOCKER_ENTRYPOINT=true`) vs external execution: inside `/docker-entrypoint-initdb.d/`, connects directly via local Unix domain socket (`/var/run/postgresql`) without passing external service hostnames.
+  - Role distinctness validation: immediately fails if `POSTGRES_SUPERUSER`, `POSTGRES_MIGRATION_USER`, and `POSTGRES_APP_USER` collide, preventing accidental privilege escalation or ownership aliasing.
+  - `init-db.sql` asserts mutual distinctness in a PL/pgSQL block before creating or altering any roles, schemas, or privileges.
+  - Alembic migrations dynamically resolve the unprivileged runtime role from `app.core.config.get_settings()` (with environment variable fallback), validate identifier syntax, and reject collision with superuser or migration roles.
   - Ingests configured credentials directly from environment variables (`POSTGRES_MIGRATION_PASSWORD`, `POSTGRES_PASSWORD`, `PGPASSWORD`) via psql `\getenv`.
   - Employs safely quoted psql identifiers (`:"effective_mig_user"`, `:"effective_app_user"`) and string literals (`:'mig_password'`, `:'app_password'`).
   - Outside development (`ENVIRONMENT != development`), `init-db.sh` strictly forbids silent fallbacks: missing bootstrap, migration, or runtime secrets cause immediate failure with a clear error message and zero secret exposure.
@@ -96,6 +100,12 @@ In strict conformance with Architecture Document 04 Section 1:
   - Granted restricted DML permissions (`SELECT`, `INSERT`, `UPDATE`, `DELETE`) via `ALTER DEFAULT PRIVILEGES`.
   - Used by the FastAPI runtime and Celery background workers (`DATABASE_URL`).
   - Fully subject to PostgreSQL Row-Level Security at all times.
+
+### 4.2 In-Memory Cache & Message Broker Authentication (Redis 7)
+- **Mandatory Authentication**: Redis 7 is deployed with mandatory authentication (`--requirepass`) across both production and development environments.
+- **Production Secret Validation**: In production/staging, `REDIS_PASSWORD` must be explicitly configured and non-empty; placeholder values are strictly rejected.
+- **URL & Broker Consistency**: Pydantic configuration (`app.core.config.Settings`) parses and enforces that `REDIS_URL`, `CELERY_BROKER_URL`, and `CELERY_RESULT_BACKEND` include matching authentication credentials whenever `REDIS_PASSWORD` is configured. Unauthenticated Redis URLs or password mismatches are immediately rejected at application startup.
+- **Connection Pool Authentication**: Asynchronous Redis pools in `app.core.redis.create_redis_pool` explicitly pass `password=settings.REDIS_PASSWORD` to ensure secure connections across all environments.
 
 ### 4.2 Two-Tier Row-Level Security (RLS) Policy Model
 Conforming to Architecture Document 04 Section 2, all tenant-scoped tables implement:
@@ -193,7 +203,7 @@ Conforming to Architecture Document 05 Section 2.B & 2.C:
 
 The database test suite covers all categories specified in the requirements:
 
-### Unit Tests (`backend/tests/test_database.py`) — 32 Tests
+### Unit Tests (`backend/tests/test_database.py`) — 37 Tests
 1. `test_metadata_naming_conventions`: Confirms canonical PostgreSQL naming conventions.
 2. `test_base_mixins_columns`: Verifies `TimestampMixin` and `TenantScopedMixin`.
 3. `test_timezone_aware_timestamp_handling`: Verifies timezone-aware UTC datetime generation.
@@ -226,6 +236,20 @@ The database test suite covers all categories specified in the requirements:
 30. `test_env_example_contains_no_development_credentials_and_no_development_environment`: Verifies `.env.example` contains zero development passwords and requires explicit environment configuration.
 31. `test_env_dev_example_contains_development_configuration`: Verifies `.env.dev.example` provides complete local development defaults and Docker Compose commands.
 32. `test_docker_compose_enforces_mandatory_secrets_and_rejects_missing_values`: Verifies main `docker-compose.yml` enforces explicit secrets via `${VAR:?error}` syntax and rejects silent fallbacks.
+33. `test_init_db_sh_role_collision_rejection`: Verifies `init-db.sh` validates role distinctness and rejects collisions between superuser, migration, and runtime users.
+34. `test_init_db_sql_role_collision_check`: Verifies `init-db.sql` includes a strict role distinctness PL/pgSQL assertion before role creation or privilege grants.
+35. `test_alembic_migration_role_collision_rejection`: Verifies Alembic migrations reject runtime role colliding with superuser or migration role.
+36. `test_alembic_custom_app_role_resolution`: Verifies Alembic `_get_app_role()` dynamically resolves from `get_settings()` and validates identifier syntax.
+37. `test_create_redis_pool_passes_password_when_configured`: Verifies Redis pool creation passes configured authentication password.
+
+### Configuration Tests (`backend/tests/test_config.py`) — 21 Tests
+Extensive testing for environment resolution, production security rules, and Redis/Celery URL password matching:
+- Validates production rejections for insecure defaults (`test_production_rejects_insecure_defaults`).
+- Validates production acceptance with full secrets (`test_production_accepts_valid_secrets`).
+- Validates Redis authentication configuration in development (`test_redis_authentication_in_dev`).
+- Validates production rejection of missing `REDIS_PASSWORD` (`test_production_rejects_missing_redis_password`).
+- Validates rejection of unauthenticated `REDIS_URL` or Celery broker URLs when `REDIS_PASSWORD` is configured (`test_redis_password_requires_matching_redis_url_password`, `test_redis_password_requires_matching_celery_broker_url_password`).
+- Validates URL-encoded password matching (`test_redis_password_matches_url_encoded_password`).
 
 ### Integration Tests (`backend/tests/integration/test_postgres_lifecycle.py`) — 22 Tests
 1. `test_postgres_connection_and_session_lifecycle`: Live connectivity and query execution.

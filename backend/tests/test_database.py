@@ -920,3 +920,140 @@ def test_get_engine_disposes_previous_engine_on_url_change() -> None:
         engine2 = get_engine(s2)
         assert engine1 is not engine2
         mock_dispose.assert_called_once()
+
+
+def test_init_db_sh_rejects_role_collisions() -> None:
+    """Verify infrastructure/scripts/init-db.sh aborts immediately upon role collision."""
+    bash = _find_bash()
+    if not bash:
+        pytest.skip("Bash not available on test runner host")
+
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    sh_path = repo_root / "infrastructure" / "scripts" / "init-db.sh"
+    assert sh_path.exists()
+
+    # Case 1: Superuser == Migration user collision
+    collision_env = {
+        "PATH": os.environ.get("PATH", ""),
+        "ENVIRONMENT": "development",
+        "POSTGRES_SUPERUSER": "shared_collision_role",
+        "POSTGRES_MIGRATION_USER": "shared_collision_role",
+        "POSTGRES_APP_USER": "distinct_app_role",
+    }
+    proc = subprocess.run(
+        [bash, str(sh_path)],
+        env=collision_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "Role collision detected" in proc.stderr
+
+    # Case 2: Migration user == Application user collision
+    collision_env2 = {
+        "PATH": os.environ.get("PATH", ""),
+        "ENVIRONMENT": "development",
+        "POSTGRES_SUPERUSER": "postgres_super",
+        "POSTGRES_MIGRATION_USER": "colliding_user",
+        "POSTGRES_APP_USER": "colliding_user",
+    }
+    proc2 = subprocess.run(
+        [bash, str(sh_path)],
+        env=collision_env2,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc2.returncode != 0
+    assert "Role collision detected" in proc2.stderr
+
+
+def test_init_db_sql_contains_role_collision_enforcement() -> None:
+    """Verify init-db.sql contains PL/pgSQL block rejecting role collisions."""
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    sql_path = repo_root / "infrastructure" / "scripts" / "init-db.sql"
+    content = sql_path.read_text(encoding="utf-8")
+
+    assert "Role collision: migration role" in content
+    assert "Role collision: application runtime role" in content
+
+
+def test_alembic_migrations_reject_role_collision() -> None:
+    """Verify _get_app_role in migration files strictly rejects role collisions with superuser or migration user."""
+    import importlib.util
+
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    m001_path = repo_root / "backend" / "alembic" / "versions" / "001_initial_auth_and_identity.py"
+
+    spec = importlib.util.spec_from_file_location("m001_module", m001_path)
+    assert spec and spec.loader
+    m001 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m001)
+
+    # When role collides with superuser
+    with patch.dict(
+        os.environ,
+        {"POSTGRES_USER": "postgres", "POSTGRES_SUPERUSER": "postgres"},
+        clear=False,
+    ):
+        with patch("app.core.config.get_settings") as mock_settings:
+            mock_settings.return_value = MagicMock(
+                POSTGRES_APP_USER="postgres", POSTGRES_USER="postgres"
+            )
+            with pytest.raises(ValueError, match="Role collision detected"):
+                m001._get_app_role()
+
+    # When role collides with migration user
+    with patch.dict(
+        os.environ,
+        {
+            "POSTGRES_USER": "aihr_migration_user",
+            "POSTGRES_MIGRATION_USER": "aihr_migration_user",
+        },
+        clear=False,
+    ):
+        with patch("app.core.config.get_settings") as mock_settings:
+            mock_settings.return_value = MagicMock(
+                POSTGRES_APP_USER="aihr_migration_user",
+                POSTGRES_USER="aihr_migration_user",
+            )
+            with pytest.raises(ValueError, match="Role collision detected"):
+                m001._get_app_role()
+
+
+def test_alembic_migrations_resolve_from_settings() -> None:
+    """Verify _get_app_role resolves custom application role from Pydantic settings."""
+    import importlib.util
+
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    m002_path = (
+        repo_root / "backend" / "alembic" / "versions" / "002_database_foundation_and_pgvector.py"
+    )
+
+    spec = importlib.util.spec_from_file_location("m002_module", m002_path)
+    assert spec and spec.loader
+    m002 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m002)
+
+    with patch("app.core.config.get_settings") as mock_settings:
+        mock_settings.return_value = MagicMock(
+            POSTGRES_APP_USER="custom_enterprise_app_role", POSTGRES_USER="fallback_user"
+        )
+        resolved_role = m002._get_app_role()
+        assert resolved_role == "custom_enterprise_app_role"
+
+
+def test_redis_client_authenticated_connection_pool() -> None:
+    """Verify create_redis_pool incorporates REDIS_PASSWORD into connection kwargs."""
+    from app.core.redis import create_redis_pool
+
+    dev_pass = "local_development_redis_secret_only"
+    settings = Settings(
+        REDIS_PASSWORD=dev_pass,
+        REDIS_URL=f"redis://:{dev_pass}@localhost:6379/0",
+        CELERY_BROKER_URL=f"redis://:{dev_pass}@localhost:6379/1",
+        CELERY_RESULT_BACKEND=f"redis://:{dev_pass}@localhost:6379/2",
+    )
+    pool = create_redis_pool(settings)
+    assert pool.connection_kwargs.get("password") == dev_pass

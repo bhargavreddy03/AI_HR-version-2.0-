@@ -219,6 +219,7 @@ def test_production_rejects_inconsistent_database_username() -> None:
 def test_production_settings_accept_consistent_secure_credentials() -> None:
     """Verify that production environment initializes when provided valid, consistent credentials."""
     secure_pass = "production_db_password_strong_123!"
+    secure_redis_pass = "production_ultra_secure_redis_password_32_chars!"
     settings = Settings(
         ENVIRONMENT="production",
         JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
@@ -228,17 +229,23 @@ def test_production_settings_accept_consistent_secure_credentials() -> None:
         POSTGRES_PASSWORD=secure_pass,
         DATABASE_URL=f"postgresql+asyncpg://prod_app_user:{secure_pass}@db.prod.internal:5432/ai_hr_db",
         DATABASE_SYNC_URL=f"postgresql://prod_app_user:{secure_pass}@db.prod.internal:5432/ai_hr_db",
+        REDIS_PASSWORD=secure_redis_pass,
+        REDIS_URL=f"redis://:{secure_redis_pass}@db.prod.internal:6379/0",
+        CELERY_BROKER_URL=f"redis://:{secure_redis_pass}@db.prod.internal:6379/1",
+        CELERY_RESULT_BACKEND=f"redis://:{secure_redis_pass}@db.prod.internal:6379/2",
         COOKIE_SECURE=True,
     )
     assert settings.ENVIRONMENT == "production"
     assert settings.COOKIE_SECURE is True
     assert settings.POSTGRES_PASSWORD == secure_pass
+    assert settings.REDIS_PASSWORD == secure_redis_pass
 
 
 def test_production_settings_migration_role_validation() -> None:
     """Verify that when separate migration credentials are provided in production, they are strictly validated."""
     secure_pass = "a_very_secure_runtime_password_123456!"
     secure_mig_pass = "a_very_secure_migration_password_654321!"
+    secure_redis_pass = "production_ultra_secure_redis_password_32_chars!"
     settings = Settings(
         ENVIRONMENT="production",
         JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
@@ -251,6 +258,10 @@ def test_production_settings_migration_role_validation() -> None:
         DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
         DATABASE_MIGRATION_URL=f"postgresql+asyncpg://aihr_migration_user:{secure_mig_pass}@localhost:5432/ai_hr_db",
         DATABASE_SYNC_URL=f"postgresql://aihr_migration_user:{secure_mig_pass}@localhost:5432/ai_hr_db",
+        REDIS_PASSWORD=secure_redis_pass,
+        REDIS_URL=f"redis://:{secure_redis_pass}@localhost:6379/0",
+        CELERY_BROKER_URL=f"redis://:{secure_redis_pass}@localhost:6379/1",
+        CELERY_RESULT_BACKEND=f"redis://:{secure_redis_pass}@localhost:6379/2",
         COOKIE_SECURE=True,
     )
     assert settings.POSTGRES_USER == "aihr_app_user"
@@ -335,6 +346,8 @@ def test_production_settings_accept_url_encoded_special_characters() -> None:
 
     raw_pass = "P@ssw0rd:Secret/Special#2026!"
     encoded_pass = quote_plus(raw_pass)
+    secure_redis_pass = "P@ssw0rd:Redis/Special#2026!"
+    encoded_redis_pass = quote_plus(secure_redis_pass)
     settings = Settings(
         ENVIRONMENT="production",
         JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
@@ -344,9 +357,14 @@ def test_production_settings_accept_url_encoded_special_characters() -> None:
         POSTGRES_PASSWORD=raw_pass,
         DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{encoded_pass}@localhost:5432/ai_hr_db",
         DATABASE_SYNC_URL=f"postgresql://aihr_app_user:{encoded_pass}@localhost:5432/ai_hr_db",
+        REDIS_PASSWORD=secure_redis_pass,
+        REDIS_URL=f"redis://:{encoded_redis_pass}@localhost:6379/0",
+        CELERY_BROKER_URL=f"redis://:{encoded_redis_pass}@localhost:6379/1",
+        CELERY_RESULT_BACKEND=f"redis://:{encoded_redis_pass}@localhost:6379/2",
         COOKIE_SECURE=True,
     )
     assert settings.POSTGRES_PASSWORD == raw_pass
+    assert settings.REDIS_PASSWORD == secure_redis_pass
 
 
 def test_production_settings_reject_inconsistent_database_host() -> None:
@@ -377,7 +395,7 @@ def test_production_settings_reject_insecure_redis_password() -> None:
     secure_pass = "a_very_secure_runtime_password_123456!"
     with pytest.raises(
         ValueError,
-        match="Insecure default REDIS_PASSWORD detected for production/staging",
+        match="Insecure default or missing REDIS_PASSWORD detected",
     ):
         Settings(
             ENVIRONMENT="production",
@@ -390,6 +408,49 @@ def test_production_settings_reject_insecure_redis_password() -> None:
             DATABASE_SYNC_URL=f"postgresql://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
             REDIS_PASSWORD="local_development_redis_secret_only",
             REDIS_URL="redis://:local_development_redis_secret_only@localhost:6379/0",
+            COOKIE_SECURE=True,
+        )
+
+
+def test_production_settings_reject_missing_redis_password() -> None:
+    """Verify rejection when REDIS_PASSWORD is missing/empty in production."""
+    secure_pass = "a_very_secure_runtime_password_123456!"
+    with pytest.raises(
+        ValueError,
+        match="Insecure default or missing REDIS_PASSWORD detected",
+    ):
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
+            MFA_ENCRYPTION_KEY="production_ultra_secure_mfa_encryption_key_32_bytes_long!",
+            BACKUP_CODE_PEPPER="production_ultra_secure_backup_pepper_32_bytes_long!",
+            POSTGRES_USER="aihr_app_user",
+            POSTGRES_PASSWORD=secure_pass,
+            DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            DATABASE_SYNC_URL=f"postgresql://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            REDIS_PASSWORD="",
+            COOKIE_SECURE=True,
+        )
+
+
+def test_production_settings_reject_redis_url_without_password() -> None:
+    """Verify rejection when REDIS_URL has no password while REDIS_PASSWORD is configured."""
+    secure_pass = "a_very_secure_runtime_password_123456!"
+    with pytest.raises(
+        ValueError,
+        match="Redis authentication required: REDIS_URL must contain password matching REDIS_PASSWORD",
+    ):
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
+            MFA_ENCRYPTION_KEY="production_ultra_secure_mfa_encryption_key_32_bytes_long!",
+            BACKUP_CODE_PEPPER="production_ultra_secure_backup_pepper_32_bytes_long!",
+            POSTGRES_USER="aihr_app_user",
+            POSTGRES_PASSWORD=secure_pass,
+            DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            DATABASE_SYNC_URL=f"postgresql://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            REDIS_PASSWORD="a_very_secure_production_redis_password_123!",
+            REDIS_URL="redis://localhost:6379/0",  # No password in URL
             COOKIE_SECURE=True,
         )
 
@@ -413,4 +474,86 @@ def test_production_settings_reject_mismatched_redis_password() -> None:
             REDIS_PASSWORD="a_very_secure_production_redis_password_123!",
             REDIS_URL="redis://:different_production_redis_password_456!@localhost:6379/0",
             COOKIE_SECURE=True,
+        )
+
+
+def test_production_settings_reject_celery_broker_url_without_password() -> None:
+    """Verify rejection when CELERY_BROKER_URL has no password while REDIS_PASSWORD is configured."""
+    secure_pass = "a_very_secure_runtime_password_123456!"
+    secure_redis = "a_very_secure_production_redis_password_123!"
+    with pytest.raises(
+        ValueError,
+        match="Redis authentication required: CELERY_BROKER_URL must contain password matching REDIS_PASSWORD",
+    ):
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
+            MFA_ENCRYPTION_KEY="production_ultra_secure_mfa_encryption_key_32_bytes_long!",
+            BACKUP_CODE_PEPPER="production_ultra_secure_backup_pepper_32_bytes_long!",
+            POSTGRES_USER="aihr_app_user",
+            POSTGRES_PASSWORD=secure_pass,
+            DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            DATABASE_SYNC_URL=f"postgresql://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            REDIS_PASSWORD=secure_redis,
+            REDIS_URL=f"redis://:{secure_redis}@localhost:6379/0",
+            CELERY_BROKER_URL="redis://localhost:6379/1",  # No password
+            COOKIE_SECURE=True,
+        )
+
+
+def test_production_settings_reject_celery_result_backend_mismatched_password() -> None:
+    """Verify rejection when CELERY_RESULT_BACKEND password does not match REDIS_PASSWORD."""
+    secure_pass = "a_very_secure_runtime_password_123456!"
+    secure_redis = "a_very_secure_production_redis_password_123!"
+    with pytest.raises(
+        ValueError,
+        match="CELERY_RESULT_BACKEND password does not match REDIS_PASSWORD",
+    ):
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
+            MFA_ENCRYPTION_KEY="production_ultra_secure_mfa_encryption_key_32_bytes_long!",
+            BACKUP_CODE_PEPPER="production_ultra_secure_backup_pepper_32_bytes_long!",
+            POSTGRES_USER="aihr_app_user",
+            POSTGRES_PASSWORD=secure_pass,
+            DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            DATABASE_SYNC_URL=f"postgresql://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            REDIS_PASSWORD=secure_redis,
+            REDIS_URL=f"redis://:{secure_redis}@localhost:6379/0",
+            CELERY_BROKER_URL=f"redis://:{secure_redis}@localhost:6379/1",
+            CELERY_RESULT_BACKEND="redis://:mismatched_celery_pass@localhost:6379/2",
+            COOKIE_SECURE=True,
+        )
+
+
+def test_development_redis_authentication() -> None:
+    """Verify development environment enforces Redis password consistency when configured."""
+    dev_pass = "local_development_redis_secret_only"
+    # Valid matching development configuration
+    settings = Settings(
+        ENVIRONMENT="development",
+        REDIS_PASSWORD=dev_pass,
+        REDIS_URL=f"redis://:{dev_pass}@localhost:6379/0",
+        CELERY_BROKER_URL=f"redis://:{dev_pass}@localhost:6379/1",
+        CELERY_RESULT_BACKEND=f"redis://:{dev_pass}@localhost:6379/2",
+    )
+    assert settings.REDIS_PASSWORD == dev_pass
+
+    # Mismatched URL in development is rejected
+    with pytest.raises(ValueError, match="REDIS_URL password does not match REDIS_PASSWORD"):
+        Settings(
+            ENVIRONMENT="development",
+            REDIS_PASSWORD=dev_pass,
+            REDIS_URL="redis://:different_dev_pass@localhost:6379/0",
+        )
+
+    # Missing password in URL when REDIS_PASSWORD configured in dev is rejected
+    with pytest.raises(
+        ValueError,
+        match="Redis authentication required: REDIS_URL must contain password matching REDIS_PASSWORD",
+    ):
+        Settings(
+            ENVIRONMENT="development",
+            REDIS_PASSWORD=dev_pass,
+            REDIS_URL="redis://localhost:6379/0",
         )

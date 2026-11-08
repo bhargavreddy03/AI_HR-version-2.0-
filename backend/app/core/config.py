@@ -325,29 +325,76 @@ class Settings(BaseSettings):
                         "Database configuration mismatch: DATABASE_MIGRATION_URL database does not match DATABASE_URL database"
                     )
 
-            # 7. Redis Authentication Consistency
-            if self.REDIS_PASSWORD:
-                if (
-                    "local_development" in self.REDIS_PASSWORD
-                    or self.REDIS_PASSWORD in INSECURE_PASSWORDS
-                ):
-                    raise ValueError(
-                        "Insecure default REDIS_PASSWORD detected for production/staging"
-                    )
-                try:
-                    r_url = make_url(self.REDIS_URL)
-                    if r_url.password and unquote(r_url.password) != self.REDIS_PASSWORD:
-                        raise ValueError(
-                            "Redis credential mismatch: REDIS_URL password does not match REDIS_PASSWORD"
-                        )
-                except Exception as exc:
-                    if not isinstance(exc, ValueError):
-                        raise ValueError(f"Invalid REDIS_URL configuration: {exc}") from exc
-                    raise
-
-            # 8. Cookie Security
+            # 7. Cookie Security
             if not self.COOKIE_SECURE:
                 raise ValueError("COOKIE_SECURE must be True in production/staging environments")
+
+            # 8. Production Redis Security
+            if (
+                not self.REDIS_PASSWORD
+                or "local_development" in self.REDIS_PASSWORD
+                or self.REDIS_PASSWORD in INSECURE_PASSWORDS
+            ):
+                raise ValueError(
+                    "Insecure default or missing REDIS_PASSWORD detected for production/staging (explicit strong secret required)"
+                )
+
+        # General Redis URL & Celery Consistency Validation (Enforced in ALL environments when REDIS_PASSWORD is set)
+        if self.REDIS_PASSWORD:
+            try:
+                r_url = make_url(self.REDIS_URL)
+                redis_url_pass = unquote(r_url.password or "")
+                if not redis_url_pass:
+                    raise ValueError(
+                        "Redis authentication required: REDIS_URL must contain password matching REDIS_PASSWORD"
+                    )
+                if redis_url_pass != self.REDIS_PASSWORD:
+                    raise ValueError(
+                        "Redis credential mismatch: REDIS_URL password does not match REDIS_PASSWORD"
+                    )
+            except Exception as exc:
+                if not isinstance(exc, ValueError):
+                    raise ValueError(f"Invalid REDIS_URL configuration: {exc}") from exc
+                raise
+
+            if self.CELERY_BROKER_URL:
+                try:
+                    cb_url = make_url(self.CELERY_BROKER_URL)
+                    if cb_url.drivername in ("redis", "rediss"):
+                        cb_pass = unquote(cb_url.password or "")
+                        if not cb_pass:
+                            raise ValueError(
+                                "Redis authentication required: CELERY_BROKER_URL must contain password matching REDIS_PASSWORD"
+                            )
+                        if cb_pass != self.REDIS_PASSWORD:
+                            raise ValueError(
+                                "Redis credential mismatch: CELERY_BROKER_URL password does not match REDIS_PASSWORD"
+                            )
+                except Exception as exc:
+                    if not isinstance(exc, ValueError):
+                        raise ValueError(f"Invalid CELERY_BROKER_URL configuration: {exc}") from exc
+                    raise
+
+            if self.CELERY_RESULT_BACKEND:
+                try:
+                    cr_url = make_url(self.CELERY_RESULT_BACKEND)
+                    if cr_url.drivername in ("redis", "rediss"):
+                        cr_pass = unquote(cr_url.password or "")
+                        if not cr_pass:
+                            raise ValueError(
+                                "Redis authentication required: CELERY_RESULT_BACKEND must contain password matching REDIS_PASSWORD"
+                            )
+                        if cr_pass != self.REDIS_PASSWORD:
+                            raise ValueError(
+                                "Redis credential mismatch: CELERY_RESULT_BACKEND password does not match REDIS_PASSWORD"
+                            )
+                except Exception as exc:
+                    if not isinstance(exc, ValueError):
+                        raise ValueError(
+                            f"Invalid CELERY_RESULT_BACKEND configuration: {exc}"
+                        ) from exc
+                    raise
+
         return self
 
 

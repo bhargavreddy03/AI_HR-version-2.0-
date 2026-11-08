@@ -57,7 +57,22 @@ END $$;
 -- Compute effective names safely without hardcoded role dependencies
 SELECT (CASE WHEN :'super_user' = '' THEN 'postgres' ELSE :'super_user' END) AS effective_super_user \gset
 SELECT (CASE WHEN :'mig_user' = '' THEN 'aihr_migration_user' ELSE :'mig_user' END) AS effective_mig_user \gset
-SELECT (CASE WHEN :'app_user' = :'effective_super_user' OR :'app_user' = '' THEN 'aihr_app_user' ELSE :'app_user' END) AS effective_app_user \gset
+SELECT (CASE WHEN :'app_user' = '' THEN 'aihr_app_user' ELSE :'app_user' END) AS effective_app_user \gset
+
+-- Enforce strict role distinctness: bootstrap superuser, migration role, and runtime app role
+-- must all be distinct. Rejects role collision before altering roles, ownership, or privileges.
+DO $$
+BEGIN
+    IF :'effective_super_user' = :'effective_mig_user' THEN
+        RAISE EXCEPTION 'Role collision: migration role (%) cannot match bootstrap superuser (%)', :'effective_mig_user', :'effective_super_user';
+    END IF;
+    IF :'effective_super_user' = :'effective_app_user' THEN
+        RAISE EXCEPTION 'Role collision: application runtime role (%) cannot match bootstrap superuser (%)', :'effective_app_user', :'effective_super_user';
+    END IF;
+    IF :'effective_mig_user' = :'effective_app_user' THEN
+        RAISE EXCEPTION 'Role collision: application runtime role (%) cannot match migration role (%)', :'effective_app_user', :'effective_mig_user';
+    END IF;
+END $$;
 
 -- 3. Create or Reconcile Migration / Schema Owner Role
 -- Owns the schema and tables; executes DDL migrations.

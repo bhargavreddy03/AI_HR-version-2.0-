@@ -142,7 +142,16 @@ async def get_db(
     if factory is None:
         factory = get_session_factory()
 
-    async with factory() as session:
+    session = factory()
+    if hasattr(session, "__aenter__"):
+        async with session as s:
+            try:
+                yield s
+                await s.commit()
+            except Exception:
+                await s.rollback()
+                raise
+    else:
         try:
             yield session
             await session.commit()
@@ -163,21 +172,35 @@ async def transactional_session(
 
     Context manager lifecycle ordering:
     1. Create the session from factory.
-    2. Begin the transaction via session.begin().
-    3. Yield the session.
+    2. Begin the transaction block via session.begin().
+    3. Yield the session to the caller.
     4. Automatically commits on successful exit of transaction block.
-    5. Rolls back on failure.
-    6. Closes the session in finally block strictly AFTER transaction completion.
+    5. Rolls back on failure (guaranteeing clean rollback without redundant conflicting calls).
+    6. Closes the session strictly AFTER transaction completion.
     """
     factory = session_factory or get_session_factory(engine=engine, settings=settings)
-    async with factory() as session:
+    raw = factory()
+    if hasattr(raw, "__aenter__"):
+        session_ctx = raw
+    else:
+
+        @asynccontextmanager
+        async def _wrap(s: Any) -> AsyncGenerator[Any, None]:
+            yield s
+
+        session_ctx = _wrap(raw)
+
+    async with session_ctx as session:
         try:
-            async with session.begin():
-                try:
+            try:
+                async with session.begin():
                     yield session
-                except Exception:
+            except Exception:
+                if hasattr(session, "in_transaction") and not session.in_transaction():
+                    pass
+                else:
                     await session.rollback()
-                    raise
+                raise
         finally:
             await session.close()
 

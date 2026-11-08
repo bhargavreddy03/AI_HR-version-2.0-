@@ -23,12 +23,17 @@ _redis_client: Redis[Any] | None = None
 
 def create_redis_pool(settings: Settings) -> ConnectionPool[Any]:
     """Create a new Redis connection pool bound to settings."""
+    kwargs: dict[str, Any] = {
+        "max_connections": 20,
+        "socket_timeout": 3.0,
+        "socket_connect_timeout": 3.0,
+        "decode_responses": True,
+    }
+    if settings.REDIS_PASSWORD:
+        kwargs["password"] = settings.REDIS_PASSWORD
     return ConnectionPool.from_url(
         settings.REDIS_URL,
-        max_connections=20,
-        socket_timeout=3.0,
-        socket_connect_timeout=3.0,
-        decode_responses=True,
+        **kwargs,
     )
 
 

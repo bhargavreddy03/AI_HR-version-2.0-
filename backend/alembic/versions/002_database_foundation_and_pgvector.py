@@ -17,12 +17,40 @@ from alembic import op
 
 
 def _get_app_role() -> str:
-    """Return the configured runtime application role identifier safely."""
-    role = os.getenv("POSTGRES_APP_USER") or os.getenv("POSTGRES_USER")
-    if not role or role == "postgres":
+    """Return the configured runtime application role identifier safely.
+
+    Resolves from Pydantic settings if available, falling back to environment variables.
+    Strictly validates role identifier syntax and prevents collisions with the superuser
+    or migration schema-owner roles.
+    """
+    role: str | None = None
+    try:
+        from app.core.config import get_settings
+
+        settings = get_settings()
+        role = getattr(settings, "POSTGRES_APP_USER", None) or getattr(
+            settings, "POSTGRES_USER", None
+        )
+    except Exception:
+        pass
+
+    if not role:
+        role = os.getenv("POSTGRES_APP_USER") or os.getenv("POSTGRES_USER")
+
+    if not role:
         role = "aihr_app_user"
+
     if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", role):
         raise ValueError(f"Invalid runtime role identifier: {role}")
+
+    superuser = os.getenv("POSTGRES_SUPERUSER", "postgres")
+    mig_user = os.getenv("POSTGRES_MIGRATION_USER", "aihr_migration_user")
+    if role in (superuser, mig_user):
+        raise ValueError(
+            f"Role collision detected: runtime application role '{role}' cannot match "
+            f"superuser '{superuser}' or migration role '{mig_user}'."
+        )
+
     return role
 
 

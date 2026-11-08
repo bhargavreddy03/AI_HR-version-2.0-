@@ -43,13 +43,13 @@ services:
     env_file:
       - ${ENV_FILE:-../../.env}
     environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be explicitly set}
     volumes:
       - redis_data:/data
     command: >-
-      sh -c "if [ -n \"$${REDIS_PASSWORD}\" ]; then exec redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD}\"; else exec redis-server --appendonly yes; fi"
+      sh -c "exec redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD:?REDIS_PASSWORD must be explicitly set}\""
     healthcheck:
-      test: ["CMD-SHELL", "if [ -n \"$${REDIS_PASSWORD}\" ]; then redis-cli -a \"$${REDIS_PASSWORD}\" ping; else redis-cli ping; fi"]
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping"]
       interval: 10s
       timeout: 5s
       retries: 5

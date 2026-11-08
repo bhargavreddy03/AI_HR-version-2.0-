@@ -16,6 +16,12 @@ services:
       - POSTGRES_APP_PASSWORD=local_development_password_only
 
   redis:
+    environment:
+      - REDIS_PASSWORD=local_development_redis_secret_only
+    command: >-
+      sh -c "exec redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD:-local_development_redis_secret_only}\""
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD:-local_development_redis_secret_only}\" ping"]
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
 
