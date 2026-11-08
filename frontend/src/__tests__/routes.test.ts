@@ -33,11 +33,13 @@ describe("Route Handlers", () => {
 
       vi.stubGlobal(
         "fetch",
-        vi.fn().mockResolvedValue({
-          ok: true,
-          status: 200,
-          json: async () => mockBackendData,
-        })
+        vi.fn().mockImplementation(() =>
+          Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () => Promise.resolve(mockBackendData),
+          } as unknown as Response)
+        )
       );
 
       const response = await backendHealthGet();
@@ -51,10 +53,12 @@ describe("Route Handlers", () => {
     it("returns degraded status (502) when upstream backend returns non-200", async () => {
       vi.stubGlobal(
         "fetch",
-        vi.fn().mockResolvedValue({
-          ok: false,
-          status: 503,
-        })
+        vi.fn().mockImplementation(() =>
+          Promise.resolve({
+            ok: false,
+            status: 503,
+          } as unknown as Response)
+        )
       );
 
       const response = await backendHealthGet();
@@ -68,7 +72,7 @@ describe("Route Handlers", () => {
     it("returns disconnected status (503) when backend fetch throws network error", async () => {
       vi.stubGlobal(
         "fetch",
-        vi.fn().mockRejectedValue(new Error("Connection refused"))
+        vi.fn().mockImplementation(() => Promise.reject(new Error("Connection refused")))
       );
 
       const response = await backendHealthGet();
