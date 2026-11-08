@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import redis
@@ -24,7 +24,7 @@ from app.core.config import Settings
 from app.core.errors import ServiceUnavailableException
 from app.core.redis import create_redis_client, get_sync_redis_client
 from app.core.security import SecurityContext
-from app.core.tasks.idempotency import IdempotencyManager
+from app.core.tasks.idempotency import LUA_RECONCILE_DISPATCH, IdempotencyManager
 from app.core.tasks.system import system_ping
 from app.main import create_application
 from app.modules.auth.dependencies import require_authenticated_user
@@ -598,4 +598,116 @@ async def test_live_redis_full_state_transition_matrix() -> None:
         assert manager.complete(k7, {"ok": True}, task_id=t7, lock_token=legitimate_tok) is True
     finally:
         manager.force_delete(k7)
+        await async_redis.aclose()
+
+
+@pytest.mark.integration
+@skip_if_no_redis
+@pytest.mark.asyncio
+async def test_live_redis_started_race_preserves_dispatch_unknown_and_worker_completes() -> None:
+    """DEFECT 1 & 2 LIVE REDIS TEST:
+
+    1. Celery reports STARTED before worker acquires lock; API retry preserves DISPATCH_UNKNOWN in live Redis.
+    2. Worker subsequently acquires lock from DISPATCH_UNKNOWN and completes successfully.
+    3. Live Lua rejects mismatched task ID and 'standalone' task ID against existing record.
+    4. Live Lua rejects reconciliation with non-PENDING target status.
+    """
+    settings = Settings()
+    sync_redis = get_sync_redis_client(settings)
+    async_redis = create_redis_client(settings)
+    manager = IdempotencyManager(sync_client=sync_redis, settings=settings)
+
+    test_key = "live-started-race-" + uuid.uuid4().hex
+    task_id = "live-task-" + uuid.uuid4().hex
+    scoped_key = f"idempotency:task:{TENANT_A}:anon:system_ping:{test_key}"
+
+    try:
+        # Step 1: Initial submission registered in live Redis
+        reg_ok, _ = await IdempotencyManager.register_submission_async(
+            client=async_redis,
+            key=scoped_key,
+            task_id=task_id,
+            tenant_id=TENANT_A,
+            task_type="system_ping",
+        )
+        assert reg_ok is True
+
+        # Step 2: Dispatch encountered broker uncertainty -> records DISPATCH_UNKNOWN
+        rec_ok, _, _ = await IdempotencyManager.record_dispatch_unknown_async(
+            client=async_redis,
+            key=scoped_key,
+            expected_task_id=task_id,
+            error_msg="Temporary broker connection glitch",
+        )
+        assert rec_ok is True
+        d_unknown = await IdempotencyManager.get_async(async_redis, scoped_key)
+        assert d_unknown is not None and d_unknown["status"] == "DISPATCH_UNKNOWN"
+
+        # Step 3: API client retries while Celery reports STARTED
+        service = TaskService()
+        with patch("app.services.task_service.AsyncResult") as mock_ar_cls:
+            mock_ar = MagicMock()
+            mock_ar.state = "STARTED"
+            mock_ar_cls.return_value = mock_ar
+
+            submit_res = await service.submit_task(
+                task=system_ping,
+                args=("race-check",),
+                idempotency_key=test_key,
+                tenant_id=TENANT_A,
+                redis_client=async_redis,
+            )
+
+            assert submit_res.duplicate is True
+            assert submit_res.task_id == task_id
+            assert submit_res.status == "STARTED"
+
+        # Step 4: Verify live Redis record was NOT corrupted to "STARTED", remains DISPATCH_UNKNOWN
+        d_check = await IdempotencyManager.get_async(async_redis, scoped_key)
+        assert d_check is not None
+        assert d_check["status"] == "DISPATCH_UNKNOWN"
+        assert d_check["task_id"] == task_id
+
+        # Step 5: Test 4 & 5 - Verify mismatched task_id and 'standalone' cannot acquire
+        acq_mismatch, _, _ = manager.acquire(scoped_key, task_id="intruder-task-id", lock_ttl=60)
+        assert acq_mismatch is False
+
+        acq_standalone, _, _ = manager.acquire(scoped_key, task_id="standalone", lock_ttl=60)
+        assert acq_standalone is False
+
+        # Step 6: Test 3 - Verify live Lua rejects reconciliation with non-PENDING status
+        lua_invalid_res = await async_redis.eval(
+            LUA_RECONCILE_DISPATCH,
+            1,
+            f"idempotency:task:{scoped_key}",
+            task_id,
+            "STARTED",
+            "360",
+            "now",
+        )
+        assert lua_invalid_res[0] == 0
+        assert lua_invalid_res[1] == "INVALID_TARGET_STATUS"
+
+        # Step 7: Worker arrives with matching task_id and acquires lock from DISPATCH_UNKNOWN
+        acq_worker, lock_token, _ = manager.acquire(scoped_key, task_id=task_id, lock_ttl=60)
+        assert acq_worker is True
+        assert lock_token is not None
+
+        # Step 8: Worker completes execution and stores result in live Redis
+        completed = manager.complete(
+            key=scoped_key,
+            result={"status": "pong", "message": "race-check-completed"},
+            task_id=task_id,
+            lock_token=lock_token,
+        )
+        assert completed is True
+
+        # Step 9: Verify final state is COMPLETED with intact result
+        final_d = await IdempotencyManager.get_async(async_redis, scoped_key)
+        assert final_d is not None
+        assert final_d["status"] == "COMPLETED"
+        assert final_d["result"]["message"] == "race-check-completed"
+
+    finally:
+        manager.force_delete(scoped_key)
         await async_redis.aclose()

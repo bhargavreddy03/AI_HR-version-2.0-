@@ -122,6 +122,7 @@ Idempotency keys are tracked in Redis under strictly scoped keys `idempotency:ta
 3. **Worker Acquisition (`LUA_ACQUIRE`)**:
    - Generates a unique `lock_token` (UUID).
    - When worker begins execution, transitions state from `PENDING` (or recoverable `DISPATCH_UNKNOWN` matching `task_id`) to `PROCESSING`, assigns the `lock_token`, and sets the active worker execution lease (`bounded_lock_ttl >= 360s`).
+   - **Strict Task-ID Matching (No Bypass)**: Enforces exact task ID equality (`data.task_id == task_id`). Generic wildcards such as `"standalone"` are strictly forbidden. Direct non-Celery invocations generate isolated `direct:{uuid}` IDs that can never hijack an existing Celery submission. Bound Celery tasks missing an active request ID fail closed immediately with `PermanentTaskError`.
    - If key is already `PROCESSING` by another worker or `COMPLETED`: rejects acquisition, returning the existing record and suppressing duplicate execution.
 4. **Fail-Closed Execution Model (`@idempotent_task`)**:
    - Underlying task execution (`fn`) is **strictly permitted if and only if** Redis confirms successful lock acquisition and returns a valid `lock_token`.
@@ -139,16 +140,21 @@ Idempotency keys are tracked in Redis under strictly scoped keys `idempotency:ta
      - Transient network drops are retried within a bounded window (up to `max_consecutive_network_failures=3`).
      - Explicit Redis rejections (`TOKEN_MISMATCH`, `KEY_EXPIRED`) immediately mark ownership lost.
      - If lock ownership was confirmed lost during execution or if `complete()` returns failure, the task aborts and raises `PermanentTaskError` rather than claiming false success.
-6. **Safe Broker Dispatch Failure & Atomic Reconciliation (`DISPATCH_UNKNOWN`)**:
+6. **Safe Broker Dispatch Failure & Strict State Machine Isolation (`DISPATCH_UNKNOWN`)**:
    - If Celery broker dispatch raises an exception (e.g., broker timeout or connection drop where broker may have already accepted the message), the idempotency record is **not** deleted.
    - The state is conditionally updated to `DISPATCH_UNKNOWN` via `LUA_RECORD_DISPATCH_UNKNOWN`:
      - Verifies `expected_task_id`.
      - **Never overwrites** active or terminal states (`PROCESSING`, `COMPLETED`, `FAILED`).
      - **Never overwrites** if an active worker `lock_token` has already been assigned.
      - Preserves completed task results even if the worker finished before the API publisher timed out.
-   - When the client retries with the same `Idempotency-Key`, `TaskService` inspects the Celery result backend and broker:
-     - If the task was already received and is executing/finished (`STARTED`, `SUCCESS`, `FAILURE`, `RETRY`), it reconciles to that status and returns `duplicate=True` without redispatching.
-     - If the task was not yet picked up, it re-dispatches using the **exact same** `task_id` and reconciles status via `LUA_RECONCILE_DISPATCH` with `expected_task_id` verification.
+   - **Separation of Celery Execution States and Redis Idempotency Machine**:
+     - Celery execution states (`STARTED`, `SUCCESS`, `FAILURE`, `RETRY`, `REVOKED`) are **never written** into the Redis idempotency state machine.
+     - When Celery reports `STARTED`, `TaskService` returns the task as duplicate without mutating Redis `DISPATCH_UNKNOWN`, allowing the worker to subsequently acquire the Redis lock and execute.
+     - When Celery reports `SUCCESS`, `FAILURE`, or `RETRY`, `TaskService` returns the duplicate result preserving the authoritative Redis record without redispatching.
+   - **Strict Reconciliation (`LUA_RECONCILE_DISPATCH`)**:
+     - Atomically restricts reconciliation transitions strictly to `DISPATCH_UNKNOWN → PENDING` (rejecting any other target status).
+     - Verifies current status is exactly `DISPATCH_UNKNOWN`, `expected_task_id` matches, and no active worker lock token exists.
+     - If worker acquired concurrently, reconciliation is safely rejected and redispatch is skipped.
 7. **Completion Protection (`LUA_COMPLETE`)**:
    - Atomically sets status to `COMPLETED` and stores the serialized result with retention TTL (`result_ttl = 86400s`, 24 hours) **strictly if** the record's `lock_token` matches the current worker.
    - Stale or expired workers can never overwrite new lock holders.

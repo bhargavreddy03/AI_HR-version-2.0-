@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.core.tasks.idempotency import IdempotencyManager
 from app.services.task_service import TaskService
 
 
@@ -492,3 +493,102 @@ async def test_record_dispatch_unknown_preserves_completed_task() -> None:
     assert res.duplicate is True
     assert res.status == "COMPLETED"
     assert res.task_id is not None
+
+
+@pytest.mark.asyncio
+async def test_celery_started_does_not_mutate_dispatch_unknown() -> None:
+    """Verify that when Celery reports STARTED for DISPATCH_UNKNOWN, Redis record is NOT mutated."""
+    mock_celery = MagicMock()
+    mock_task = MagicMock()
+    mock_task.name = "started_task"
+
+    mock_redis = AsyncMock()
+    unknown_payload = json.dumps(
+        {
+            "status": "DISPATCH_UNKNOWN",
+            "task_id": "started-task-id-123",
+            "tenant_id": None,
+        }
+    )
+    # Registration returns existing DISPATCH_UNKNOWN record
+    mock_redis.eval.return_value = [0, unknown_payload]
+
+    service = TaskService(app_celery=mock_celery)
+
+    with patch("app.services.task_service.AsyncResult") as mock_ar_cls:
+        mock_ar = MagicMock()
+        mock_ar.state = "STARTED"
+        mock_ar_cls.return_value = mock_ar
+
+        res = await service.submit_task(
+            task=mock_task,
+            idempotency_key="started-idem-key",
+            redis_client=mock_redis,
+        )
+
+        assert res.duplicate is True
+        assert res.task_id == "started-task-id-123"
+        assert res.status == "STARTED"
+
+        # mock_redis.eval must have been called ONLY once for register_submission_async
+        # reconcile_dispatch_async must NOT be called, preserving DISPATCH_UNKNOWN for worker acquisition
+        assert mock_redis.eval.call_count == 1
+        mock_task.apply_async.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_celery_retry_preserves_redis_idempotency_record() -> None:
+    """Verify that when Celery reports RETRY for DISPATCH_UNKNOWN, Redis is not overwritten with Celery state."""
+    mock_celery = MagicMock()
+    mock_task = MagicMock()
+    mock_task.name = "retrying_task"
+
+    mock_redis = AsyncMock()
+    unknown_payload = json.dumps(
+        {
+            "status": "DISPATCH_UNKNOWN",
+            "task_id": "retry-task-id-456",
+            "tenant_id": None,
+        }
+    )
+    mock_redis.eval.return_value = [0, unknown_payload]
+
+    service = TaskService(app_celery=mock_celery)
+
+    with patch("app.services.task_service.AsyncResult") as mock_ar_cls:
+        mock_ar = MagicMock()
+        mock_ar.state = "RETRY"
+        mock_ar_cls.return_value = mock_ar
+
+        res = await service.submit_task(
+            task=mock_task,
+            idempotency_key="retry-idem-key",
+            redis_client=mock_redis,
+        )
+
+        assert res.duplicate is True
+        assert res.task_id == "retry-task-id-456"
+        assert res.status == "RETRY"
+
+        # Never overwrite Redis with "RETRY" string
+        assert mock_redis.eval.call_count == 1
+        mock_task.apply_async.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_rejects_non_pending_target_status() -> None:
+    """Verify that reconcile_dispatch_async rejects any target status other than PENDING."""
+    mock_redis = AsyncMock()
+
+    for invalid_target in ("STARTED", "SUCCESS", "FAILURE", "RETRY", "REVOKED", "PROCESSING"):
+        ok, reason, payload = await IdempotencyManager.reconcile_dispatch_async(
+            client=mock_redis,
+            key="test-key",
+            expected_task_id="task-123",
+            new_status=invalid_target,
+        )
+        assert ok is False
+        assert reason == "INVALID_TARGET_STATUS"
+        assert payload is None
+        # Must not call Redis eval for invalid target states
+        mock_redis.eval.assert_not_called()

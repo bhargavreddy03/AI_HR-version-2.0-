@@ -537,3 +537,82 @@ def test_idempotent_task_aborts_if_lock_ownership_lost_during_execution() -> Non
             long_task(idempotency_key="ownership-loss-key")
 
         assert "lock ownership lost during execution" in str(exc_info.value)
+
+
+def test_worker_with_mismatched_task_id_cannot_acquire_pending_or_dispatch_unknown() -> None:
+    """DEFECT 2: Verify worker with mismatched task_id cannot acquire existing PENDING or DISPATCH_UNKNOWN record."""
+    mock_redis = MagicMock()
+    # Acquire returns failure because task_id does not match registered_task_1
+    pending_payload = json.dumps({"status": "PENDING", "task_id": "registered-task-1"})
+    mock_redis.eval.return_value = [0, None, pending_payload]
+
+    execution_count = 0
+
+    class MismatchedWorkerTask:
+        def __init__(self) -> None:
+            self.request = MagicMock(id="intruder-task-2", headers={})
+            self.name = "mismatched_task"
+
+    fake_task = MismatchedWorkerTask()
+
+    @idempotent_task(key_param="idempotency_key")
+    def sample_task(self: Any, idempotency_key: str | None = None) -> str:
+        nonlocal execution_count
+        execution_count += 1
+        return "intruder-executed"
+
+    with patch("app.core.tasks.idempotency.get_sync_redis_client", return_value=mock_redis):
+        res = sample_task(fake_task, idempotency_key="mismatch-key")
+        # Duplicate execution suppressed; fn must NEVER execute
+        assert res["status"] == "duplicate_execution_suppressed"
+        assert res["original_task_id"] == "registered-task-1"
+        assert execution_count == 0
+
+
+def test_standalone_task_id_cannot_bypass_task_id_matching() -> None:
+    """DEFECT 2: Verify invocation with task_id='standalone' cannot bypass task_id matching for existing submission."""
+    mock_redis = MagicMock()
+    # When Lua executes, data.task_id == task_id fails because 'registered-task-1' != 'standalone'
+    pending_payload = json.dumps({"status": "PENDING", "task_id": "registered-task-1"})
+    mock_redis.eval.return_value = [0, None, pending_payload]
+
+    execution_count = 0
+
+    class StandaloneWorkerTask:
+        def __init__(self) -> None:
+            self.request = MagicMock(id="standalone", headers={})
+            self.name = "standalone_task"
+
+    fake_task = StandaloneWorkerTask()
+
+    @idempotent_task(key_param="idempotency_key")
+    def sample_task(self: Any, idempotency_key: str | None = None) -> str:
+        nonlocal execution_count
+        execution_count += 1
+        return "standalone-executed"
+
+    with patch("app.core.tasks.idempotency.get_sync_redis_client", return_value=mock_redis):
+        res = sample_task(fake_task, idempotency_key="standalone-bypass-key")
+        assert res["status"] == "duplicate_execution_suppressed"
+        assert res["original_task_id"] == "registered-task-1"
+        assert execution_count == 0
+
+
+def test_bound_celery_task_missing_request_id_fails_closed() -> None:
+    """DEFECT 2: Verify bound Celery task without a valid request ID fails closed with PermanentTaskError."""
+
+    class MissingIdTask:
+        def __init__(self) -> None:
+            self.request = MagicMock(id=None, headers={})
+            self.name = "missing_id_task"
+
+    fake_task = MissingIdTask()
+
+    @idempotent_task(key_param="idempotency_key")
+    def sample_task(self: Any, idempotency_key: str | None = None) -> str:
+        return "should-never-run"
+
+    with pytest.raises(PermanentTaskError) as exc_info:
+        sample_task(fake_task, idempotency_key="missing-req-id-key")
+
+    assert "Celery request ID is required" in str(exc_info.value)

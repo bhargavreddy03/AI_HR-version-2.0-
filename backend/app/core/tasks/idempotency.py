@@ -115,7 +115,7 @@ if not val then
 end
 
 local data = cjson.decode(val)
-if (data.status == "PENDING" or data.status == "DISPATCH_UNKNOWN") and (data.task_id == task_id or task_id == "standalone") then
+if (data.status == "PENDING" or data.status == "DISPATCH_UNKNOWN") and (task_id and task_id ~= "" and data.task_id == task_id) then
     data.status = "PROCESSING"
     data.lock_token = lock_token
     data.started_at = now_str
@@ -200,7 +200,7 @@ redis.call('SET', key, new_payload, 'EX', ttl)
 return {1, "RECORDED", new_payload}
 """
 
-# Atomic conditional state reconciliation: updates DISPATCH_UNKNOWN back to PENDING or active state
+# Atomic conditional state reconciliation: strictly updates DISPATCH_UNKNOWN back to PENDING
 LUA_RECONCILE_DISPATCH = """
 local key = KEYS[1]
 local expected_task_id = ARGV[1]
@@ -208,22 +208,29 @@ local new_status = ARGV[2]
 local ttl = tonumber(ARGV[3])
 local now_str = ARGV[4]
 
+-- Validate target state: strictly restrict to PENDING
+if not new_status or new_status ~= "PENDING" then
+    return {0, "INVALID_TARGET_STATUS", cjson.null}
+end
+
 local val = redis.call('GET', key)
 if not val then
     return {0, "KEY_NOT_FOUND", cjson.null}
 end
 
 local data = cjson.decode(val)
-if expected_task_id and expected_task_id ~= "" and data.task_id ~= expected_task_id then
+
+-- Verify current state is exactly DISPATCH_UNKNOWN
+if data.status ~= "DISPATCH_UNKNOWN" then
+    return {0, "INVALID_CURRENT_STATUS_" .. tostring(data.status), val}
+end
+
+-- Strictly verify matching expected task ID
+if not expected_task_id or expected_task_id == "" or data.task_id ~= expected_task_id then
     return {0, "TASK_ID_MISMATCH", val}
 end
 
--- Strictly protect active and terminal states: never overwrite with PENDING, never wipe lock_token
-if data.status == "PROCESSING" or data.status == "COMPLETED" or data.status == "FAILED" then
-    return {0, "IMMUTABLE_STATE_" .. data.status, val}
-end
-
--- If key has an active worker lock token, never overwrite it
+-- Strictly protect if an active worker lock token has already been assigned
 if data.lock_token and data.lock_token ~= cjson.null and data.lock_token ~= "" then
     return {0, "ACTIVE_LOCK_PRESENT", val}
 end
@@ -823,7 +830,16 @@ class IdempotencyManager:
         new_status: str = "PENDING",
         ttl: int = DEFAULT_SUBMISSION_TTL,
     ) -> tuple[bool, str, dict[str, Any] | None]:
-        """Atomically reconcile DISPATCH_UNKNOWN state conditional on task ID and current status."""
+        """Atomically reconcile DISPATCH_UNKNOWN state strictly back to PENDING conditional on task ID.
+
+        - Restricts target state strictly to PENDING.
+        - Validates current state is DISPATCH_UNKNOWN.
+        - Verifies expected_task_id matches.
+        - Protects active worker lock tokens.
+        """
+        if new_status != "PENDING":
+            return False, "INVALID_TARGET_STATUS", None
+
         redis_key = f"{IDEMPOTENCY_PREFIX}{key}" if not key.startswith(IDEMPOTENCY_PREFIX) else key
         now_str = datetime.now(UTC).isoformat()
         try:
@@ -986,7 +1002,14 @@ def idempotent_task(
 
             task_inst = args[0] if (args and hasattr(args[0], "request")) else None
             req = getattr(task_inst, "request", None) if task_inst else None
-            task_id = getattr(req, "id", None) or "standalone"
+            if task_inst is not None:
+                task_id = getattr(req, "id", None) or kwargs.get("task_id")
+                if not task_id or not str(task_id).strip():
+                    raise PermanentTaskError(
+                        f"Celery request ID is required for idempotent task execution of {getattr(task_inst, 'name', fn.__name__)}."
+                    )
+            else:
+                task_id = kwargs.get("task_id") or f"direct:{uuid.uuid4().hex}"
             req_headers = getattr(req, "headers", None) or {}
 
             # Determine scoped key from Celery headers or runtime arguments

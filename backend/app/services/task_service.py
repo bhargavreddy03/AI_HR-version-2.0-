@@ -148,13 +148,17 @@ class TaskService:
                         return str(res.state)
 
                     current_state = await asyncio.to_thread(_check_task_state)
+                    # Never write Celery execution states into the Redis idempotency state machine.
+                    # 1. When Celery reports STARTED, the worker is executing or about to acquire.
+                    #    Return existing task as duplicate WITHOUT mutating Redis DISPATCH_UNKNOWN,
+                    #    allowing the worker to subsequently acquire from DISPATCH_UNKNOWN.
+                    # 2. When Celery reports SUCCESS, FAILURE, or RETRY, the task has already executed or is retrying.
+                    #    Return duplicate without mutating Redis record or incorrectly redispatching.
                     if current_state in ("STARTED", "SUCCESS", "FAILURE", "RETRY"):
-                        await IdempotencyManager.reconcile_dispatch_async(
-                            client=redis_client,
-                            key=scoped_key,
-                            expected_task_id=existing_task_id,
-                            new_status=current_state,
-                            ttl=DEFAULT_SUBMISSION_TTL,
+                        logger.info(
+                            "Task %s has Celery state %s; returning duplicate without mutating Redis record.",
+                            existing_task_id,
+                            current_state,
                         )
                         return TaskSubmissionResult(
                             task_id=existing_task_id,
@@ -163,8 +167,8 @@ class TaskService:
                             duplicate=True,
                         )
 
-                    # FINDING 2: Atomically reconcile to PENDING before re-dispatching.
-                    # Verify task ID and ensure worker has not already acquired (PROCESSING/COMPLETED).
+                    # Atomically reconcile DISPATCH_UNKNOWN strictly to PENDING before re-dispatching.
+                    # Verify task ID and ensure worker has not already acquired concurrently.
                     (
                         reconciled,
                         reason,
