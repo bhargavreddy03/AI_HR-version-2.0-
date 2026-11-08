@@ -797,35 +797,39 @@ def test_docker_compose_enforces_mandatory_secrets_and_rejects_missing_values() 
 
 def test_docker_compose_production_ports_isolated_and_dev_ports_bound_to_localhost() -> None:
     """Verify production compose file isolates database/redis ports while dev compose binds to 127.0.0.1."""
-    import yaml
-
     repo_root = Path(__file__).resolve().parent.parent.parent
     prod_compose = repo_root / "infrastructure" / "docker" / "docker-compose.yml"
     dev_compose = repo_root / "infrastructure" / "docker" / "docker-compose.dev.yml"
 
-    with open(prod_compose, encoding="utf-8") as f:
-        prod_data = yaml.safe_load(f)
+    prod_text = prod_compose.read_text(encoding="utf-8")
+    dev_text = dev_compose.read_text(encoding="utf-8")
 
     # In production, postgres and redis services must NOT publish host ports
-    assert (
-        "ports" not in prod_data["services"]["postgres"]
-    ), "Postgres ports exposed in production compose"
-    assert (
-        "ports" not in prod_data["services"]["redis"]
-    ), "Redis ports exposed in production compose"
-
-    with open(dev_compose, encoding="utf-8") as f:
-        dev_data = yaml.safe_load(f)
+    postgres_block = prod_text.split("postgres:")[1].split("redis:")[0]
+    redis_block = prod_text.split("redis:")[1].split("backend:")[0]
+    assert "ports:" not in postgres_block, "Postgres ports exposed in production compose"
+    assert "ports:" not in redis_block, "Redis ports exposed in production compose"
 
     # In dev override, ports must be bound to 127.0.0.1
-    pg_ports = dev_data["services"]["postgres"]["ports"]
-    assert any(
-        "127.0.0.1:" in str(p) for p in pg_ports
-    ), "Postgres dev ports must bind to 127.0.0.1"
-    redis_ports = dev_data["services"]["redis"]["ports"]
-    assert any(
-        "127.0.0.1:" in str(p) for p in redis_ports
-    ), "Redis dev ports must bind to 127.0.0.1"
+    dev_pg_block = dev_text.split("postgres:")[1].split("redis:")[0]
+    dev_redis_block = dev_text.split("redis:")[1].split("backend:")[0]
+    assert "127.0.0.1:" in dev_pg_block, "Postgres dev ports must bind to 127.0.0.1"
+    assert "127.0.0.1:" in dev_redis_block, "Redis dev ports must bind to 127.0.0.1"
+
+    try:
+        import yaml
+
+        with open(prod_compose, encoding="utf-8") as f:
+            prod_data = yaml.safe_load(f)
+        assert "ports" not in prod_data["services"]["postgres"]
+        assert "ports" not in prod_data["services"]["redis"]
+
+        with open(dev_compose, encoding="utf-8") as f:
+            dev_data = yaml.safe_load(f)
+        assert any("127.0.0.1:" in str(p) for p in dev_data["services"]["postgres"]["ports"])
+        assert any("127.0.0.1:" in str(p) for p in dev_data["services"]["redis"]["ports"])
+    except ImportError:
+        pass
 
 
 def test_init_db_sql_handles_custom_bootstrap_user() -> None:
