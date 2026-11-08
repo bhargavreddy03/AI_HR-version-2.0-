@@ -256,10 +256,12 @@ The database test suite covers all categories specified in the requirements:
 ## 8. Development & Production Deployment Workflows
 
 ### 8.1 Local Development Workflow
-Local development isolates development secrets and hot-reloading configurations in `.env.dev.example` and `docker-compose.dev.yml`:
+Local development provides two isolated environments: containerized development (where the backend runs inside Docker containers) and host-based development (where the backend runs on the developer workstation against dockerized infrastructure services):
 
+#### A. Containerized Development (Full Docker Compose Stack)
+Uses `.env.dev.example` with internal container network hostnames (`postgres`, `redis`):
 ```bash
-# 1. Copy local development environment template
+# 1. Copy containerized development environment template
 cp .env.dev.example .env.dev
 
 # 2. Launch complete local development stack (with live hot reload & debug logging)
@@ -267,6 +269,21 @@ docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -
 
 # 3. View logs
 docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml logs -f
+```
+
+#### B. Host-Based Development (Local Python / Next.js against Docker Services)
+Uses `.env.local.example` with host-accessible loopback bindings (`localhost:5432`, `localhost:6379`). Note that ports are strictly bound to `127.0.0.1` by `docker-compose.dev.yml` to prevent network exposure:
+```bash
+# 1. Launch only database and cache services
+docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml up -d postgres redis
+
+# 2. Copy host-based local environment template
+cp .env.local.example .env
+
+# 3. Run migrations and local FastAPI server
+cd backend
+alembic upgrade head
+uvicorn app.main:app --reload --port 8000
 ```
 
 ### 8.2 Production & Staging Deployment Workflow

@@ -85,13 +85,20 @@ def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSessi
 def get_engine(settings: Settings | None = None) -> AsyncEngine:
     """Return the global cached AsyncEngine instance or initialize a new one.
 
+    Safely disposes of any previous engine pool when database configuration changes.
     Preserves simple singleton defaults for standalone CLI and script execution.
     """
-    global _engine
+    global _engine, _session_factory
     cfg = settings or get_settings()
 
     if _engine is None or str(_engine.url) != cfg.DATABASE_URL:
+        if _engine is not None:
+            try:
+                _engine.sync_engine.dispose()
+            except Exception as exc:
+                logger.warning("Error disposing previous engine sync pool: %s", exc)
         _engine = create_db_engine(cfg)
+        _session_factory = None
 
     return _engine
 
@@ -154,18 +161,25 @@ async def transactional_session(
 ) -> AsyncGenerator[AsyncSession, None]:
     """Explicit transaction context manager for background workers, tasks, and scripts.
 
-    Commits on clean exit, rolls back on any exception, and closes the session.
+    Context manager lifecycle ordering:
+    1. Create the session from factory.
+    2. Begin the transaction via session.begin().
+    3. Yield the session.
+    4. Automatically commits on successful exit of transaction block.
+    5. Rolls back on failure.
+    6. Closes the session in finally block strictly AFTER transaction completion.
     """
     factory = session_factory or get_session_factory(engine=engine, settings=settings)
     async with factory() as session:
-        async with session.begin():
-            try:
-                yield session
-            except Exception:
-                await session.rollback()
-                raise
-            finally:
-                await session.close()
+        try:
+            async with session.begin():
+                try:
+                    yield session
+                except Exception:
+                    await session.rollback()
+                    raise
+        finally:
+            await session.close()
 
 
 async def check_database_health(
@@ -200,3 +214,17 @@ async def close_database_connections() -> None:
         await _engine.dispose()
         _engine = None
         _session_factory = None
+
+
+__all__ = [
+    "check_database_health",
+    "close_database_connections",
+    "create_db_engine",
+    "create_session_factory",
+    "dispose_app_database",
+    "get_db",
+    "get_engine",
+    "get_session_factory",
+    "register_pool_cleanup_listener",
+    "transactional_session",
+]

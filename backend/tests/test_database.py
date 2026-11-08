@@ -793,3 +793,126 @@ def test_docker_compose_enforces_mandatory_secrets_and_rejects_missing_values() 
 
     # Must not contain fallback development passwords
     assert "local_development_" not in content
+
+
+def test_docker_compose_production_ports_isolated_and_dev_ports_bound_to_localhost() -> None:
+    """Verify production compose file isolates database/redis ports while dev compose binds to 127.0.0.1."""
+    import yaml
+
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    prod_compose = repo_root / "infrastructure" / "docker" / "docker-compose.yml"
+    dev_compose = repo_root / "infrastructure" / "docker" / "docker-compose.dev.yml"
+
+    with open(prod_compose, encoding="utf-8") as f:
+        prod_data = yaml.safe_load(f)
+
+    # In production, postgres and redis services must NOT publish host ports
+    assert (
+        "ports" not in prod_data["services"]["postgres"]
+    ), "Postgres ports exposed in production compose"
+    assert (
+        "ports" not in prod_data["services"]["redis"]
+    ), "Redis ports exposed in production compose"
+
+    with open(dev_compose, encoding="utf-8") as f:
+        dev_data = yaml.safe_load(f)
+
+    # In dev override, ports must be bound to 127.0.0.1
+    pg_ports = dev_data["services"]["postgres"]["ports"]
+    assert any(
+        "127.0.0.1:" in str(p) for p in pg_ports
+    ), "Postgres dev ports must bind to 127.0.0.1"
+    redis_ports = dev_data["services"]["redis"]["ports"]
+    assert any(
+        "127.0.0.1:" in str(p) for p in redis_ports
+    ), "Redis dev ports must bind to 127.0.0.1"
+
+
+def test_init_db_sql_handles_custom_bootstrap_user() -> None:
+    """Verify init-db.sql dynamically configures default privileges for the bootstrap superuser."""
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    sql_path = repo_root / "infrastructure" / "scripts" / "init-db.sql"
+    content = sql_path.read_text(encoding="utf-8")
+
+    assert "\\getenv super_user POSTGRES_SUPERUSER" in content
+    assert ':"effective_super_user"' in content
+    assert 'FOR ROLE :"effective_super_user"' in content
+
+
+def test_alembic_migrations_dynamic_app_role() -> None:
+    """Verify migrations 001 and 002 use _get_app_role() and do not fall back to PUBLIC."""
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    m001 = repo_root / "backend" / "alembic" / "versions" / "001_initial_auth_and_identity.py"
+    m002 = (
+        repo_root / "backend" / "alembic" / "versions" / "002_database_foundation_and_pgvector.py"
+    )
+
+    c001 = m001.read_text(encoding="utf-8")
+    c002 = m002.read_text(encoding="utf-8")
+
+    assert "def _get_app_role()" in c001
+    assert "def _get_app_role()" in c002
+    assert (
+        "TO PUBLIC" not in c002
+    ), "Security finding: migration 002 must not grant privileges to PUBLIC"
+
+
+@pytest.mark.asyncio
+async def test_search_similar_candidate_documents_rejects_zero_magnitude_vector() -> None:
+    """Verify search_similar_candidate_documents rejects zero-magnitude query vectors."""
+    mock_session = AsyncMock(spec=AsyncSession)
+    mock_model = EmbeddingModel(
+        model_identifier="text-embedding-3-small",
+        provider="openai",
+        expected_dimensions=1536,
+        is_active=True,
+    )
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = mock_model
+    mock_session.execute.return_value = mock_result
+
+    with pytest.raises(InvalidSearchParameterException, match="zero magnitude"):
+        await search_similar_candidate_documents(
+            session=mock_session,
+            tenant_id=utc_now(),
+            query_vector=[0.0] * 1536,
+            model_identifier="text-embedding-3-small",
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_similar_candidate_documents_rejects_booleans_in_vector() -> None:
+    """Verify search_similar_candidate_documents rejects booleans inside query vector."""
+    mock_session = AsyncMock(spec=AsyncSession)
+    mock_model = EmbeddingModel(
+        model_identifier="text-embedding-3-small",
+        provider="openai",
+        expected_dimensions=1536,
+        is_active=True,
+    )
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = mock_model
+    mock_session.execute.return_value = mock_result
+
+    # Python bool is a subclass of int, so [True] * 1536 must be explicitly rejected
+    with pytest.raises(InvalidSearchParameterException, match="contains invalid non-finite value"):
+        await search_similar_candidate_documents(
+            session=mock_session,
+            tenant_id=utc_now(),
+            query_vector=[True] * 1536,  # type: ignore[arg-type]
+            model_identifier="text-embedding-3-small",
+        )
+
+
+def test_get_engine_disposes_previous_engine_on_url_change() -> None:
+    """Verify that get_engine disposes the old engine's pool when the connection URL changes."""
+    s1 = Settings(DATABASE_URL="postgresql+asyncpg://user:pass@localhost:5432/db1")
+    engine1 = get_engine(s1)
+
+    with patch.object(
+        engine1.sync_engine, "dispose", wraps=engine1.sync_engine.dispose
+    ) as mock_dispose:
+        s2 = Settings(DATABASE_URL="postgresql+asyncpg://user:pass@localhost:5432/db2")
+        engine2 = get_engine(s2)
+        assert engine1 is not engine2
+        mock_dispose.assert_called_once()

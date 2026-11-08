@@ -3,6 +3,7 @@ version: "3.9"
 services:
   # ----------------------------------------------------------------------------
   # Primary Relational Store: PostgreSQL 16 + pgvector
+  # (Ports NOT published in production; accessible only via private network)
   # ----------------------------------------------------------------------------
   postgres:
     image: pgvector/pgvector:pg16
@@ -19,10 +20,8 @@ services:
       POSTGRES_SUPERUSER_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?POSTGRES_SUPERUSER_PASSWORD must be set}
       POSTGRES_MIGRATION_USER: ${POSTGRES_MIGRATION_USER:-aihr_migration_user}
       POSTGRES_MIGRATION_PASSWORD: ${POSTGRES_MIGRATION_PASSWORD:?POSTGRES_MIGRATION_PASSWORD must be set}
-      POSTGRES_APP_USER: ${POSTGRES_USER:-aihr_app_user}
-      POSTGRES_APP_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-aihr_app_user}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ../scripts/init-db.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
@@ -35,18 +34,22 @@ services:
 
   # ----------------------------------------------------------------------------
   # In-Memory Cache & Message Broker: Redis 7
+  # (Ports NOT published in production; accessible only via private network)
   # ----------------------------------------------------------------------------
   redis:
     image: redis:7-alpine
     container_name: ai_hr_redis
     restart: unless-stopped
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
+    env_file:
+      - ${ENV_FILE:-../../.env}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     volumes:
       - redis_data:/data
-    command: ["redis-server", "--appendonly", "yes"]
+    command: >-
+      sh -c "if [ -n \"$${REDIS_PASSWORD}\" ]; then exec redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD}\"; else exec redis-server --appendonly yes; fi"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "if [ -n \"$${REDIS_PASSWORD}\" ]; then redis-cli -a \"$${REDIS_PASSWORD}\" ping; else redis-cli ping; fi"]
       interval: 10s
       timeout: 5s
       retries: 5

@@ -1,6 +1,7 @@
 """Application settings and environment configuration management using Pydantic v2."""
 
 from functools import lru_cache
+from urllib.parse import unquote
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -201,13 +202,13 @@ class Settings(BaseSettings):
                     "Insecure default POSTGRES_PASSWORD detected for production/staging"
                 )
 
-            # 3. DATABASE_URL Validation (Asynchronous URI)
+            # 4. DATABASE_URL Validation (Asynchronous URI)
             try:
                 db_url = make_url(self.DATABASE_URL)
             except Exception as exc:
                 raise ValueError(f"Invalid DATABASE_URL configuration: {exc}") from exc
 
-            db_password = db_url.password or ""
+            db_password = unquote(db_url.password or "")
             if (
                 not db_password
                 or db_password in INSECURE_PASSWORDS
@@ -220,18 +221,49 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "Database credential mismatch: DATABASE_URL password does not match POSTGRES_PASSWORD"
                 )
-            if self.POSTGRES_USER and db_url.username != self.POSTGRES_USER:
+            if (
+                "POSTGRES_USER" in self.model_fields_set
+                and self.POSTGRES_USER
+                and db_url.username != self.POSTGRES_USER
+            ):
                 raise ValueError(
                     "Database credential mismatch: DATABASE_URL username does not match POSTGRES_USER"
                 )
+            if (
+                "POSTGRES_HOST" in self.model_fields_set
+                and self.POSTGRES_HOST
+                and db_url.host
+                and db_url.host != self.POSTGRES_HOST
+            ):
+                raise ValueError(
+                    "Database configuration mismatch: DATABASE_URL host does not match POSTGRES_HOST"
+                )
+            if (
+                "POSTGRES_PORT" in self.model_fields_set
+                and self.POSTGRES_PORT
+                and db_url.port
+                and db_url.port != self.POSTGRES_PORT
+            ):
+                raise ValueError(
+                    "Database configuration mismatch: DATABASE_URL port does not match POSTGRES_PORT"
+                )
+            if (
+                "POSTGRES_DB" in self.model_fields_set
+                and self.POSTGRES_DB
+                and db_url.database
+                and db_url.database != self.POSTGRES_DB
+            ):
+                raise ValueError(
+                    "Database configuration mismatch: DATABASE_URL database does not match POSTGRES_DB"
+                )
 
-            # 4. DATABASE_SYNC_URL & Migration Credentials Validation
+            # 5. DATABASE_SYNC_URL & Migration Credentials Validation
             try:
                 sync_url = make_url(self.DATABASE_SYNC_URL)
             except Exception as exc:
                 raise ValueError(f"Invalid DATABASE_SYNC_URL configuration: {exc}") from exc
 
-            sync_password = sync_url.password or ""
+            sync_password = unquote(sync_url.password or "")
             if (
                 not sync_password
                 or sync_password in INSECURE_PASSWORDS
@@ -239,6 +271,20 @@ class Settings(BaseSettings):
             ):
                 raise ValueError(
                     "Insecure default or development password detected in DATABASE_SYNC_URL for production/staging"
+                )
+
+            # Validate sync_url host/port/database consistency
+            if sync_url.host and db_url.host and sync_url.host != db_url.host:
+                raise ValueError(
+                    "Database configuration mismatch: DATABASE_SYNC_URL host does not match DATABASE_URL host"
+                )
+            if sync_url.port and db_url.port and sync_url.port != db_url.port:
+                raise ValueError(
+                    "Database configuration mismatch: DATABASE_SYNC_URL port does not match DATABASE_URL port"
+                )
+            if sync_url.database and db_url.database and sync_url.database != db_url.database:
+                raise ValueError(
+                    "Database configuration mismatch: DATABASE_SYNC_URL database does not match DATABASE_URL database"
                 )
 
             # Validate sync_url against migration role if configured, otherwise runtime role
@@ -260,7 +306,7 @@ class Settings(BaseSettings):
                     f"Database credential mismatch: DATABASE_SYNC_URL username does not match POSTGRES_USER ({self.POSTGRES_USER})"
                 )
 
-            # Validate DATABASE_MIGRATION_URL if set
+            # 6. Validate DATABASE_MIGRATION_URL if set
             if self.DATABASE_MIGRATION_URL:
                 try:
                     mig_url = make_url(self.DATABASE_MIGRATION_URL)
@@ -269,7 +315,7 @@ class Settings(BaseSettings):
                         f"Invalid DATABASE_MIGRATION_URL configuration: {exc}"
                     ) from exc
 
-                mig_password = mig_url.password or ""
+                mig_password = unquote(mig_url.password or "")
                 if (
                     not mig_password
                     or mig_password in INSECURE_PASSWORDS
@@ -285,8 +331,48 @@ class Settings(BaseSettings):
                     raise ValueError(
                         f"Database credential mismatch: DATABASE_MIGRATION_URL username does not match POSTGRES_MIGRATION_USER ({self.POSTGRES_MIGRATION_USER})"
                     )
+                if (
+                    self.POSTGRES_MIGRATION_PASSWORD
+                    and mig_password != self.POSTGRES_MIGRATION_PASSWORD
+                ):
+                    raise ValueError(
+                        "Database credential mismatch: DATABASE_MIGRATION_URL password does not match POSTGRES_MIGRATION_PASSWORD"
+                    )
+                # Host/port/database consistency
+                if mig_url.host and db_url.host and mig_url.host != db_url.host:
+                    raise ValueError(
+                        "Database configuration mismatch: DATABASE_MIGRATION_URL host does not match DATABASE_URL host"
+                    )
+                if mig_url.port and db_url.port and mig_url.port != db_url.port:
+                    raise ValueError(
+                        "Database configuration mismatch: DATABASE_MIGRATION_URL port does not match DATABASE_URL port"
+                    )
+                if mig_url.database and db_url.database and mig_url.database != db_url.database:
+                    raise ValueError(
+                        "Database configuration mismatch: DATABASE_MIGRATION_URL database does not match DATABASE_URL database"
+                    )
 
-            # 5. Cookie Security
+            # 7. Redis Authentication Consistency
+            if self.REDIS_PASSWORD:
+                if (
+                    "local_development" in self.REDIS_PASSWORD
+                    or self.REDIS_PASSWORD in INSECURE_PASSWORDS
+                ):
+                    raise ValueError(
+                        "Insecure default REDIS_PASSWORD detected for production/staging"
+                    )
+                try:
+                    r_url = make_url(self.REDIS_URL)
+                    if r_url.password and unquote(r_url.password) != self.REDIS_PASSWORD:
+                        raise ValueError(
+                            "Redis credential mismatch: REDIS_URL password does not match REDIS_PASSWORD"
+                        )
+                except Exception as exc:
+                    if not isinstance(exc, ValueError):
+                        raise ValueError(f"Invalid REDIS_URL configuration: {exc}") from exc
+                    raise
+
+            # 8. Cookie Security
             if not self.COOKIE_SECURE:
                 raise ValueError("COOKIE_SECURE must be True in production/staging environments")
         return self

@@ -2,16 +2,22 @@ version: "3.9"
 
 services:
   postgres:
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     environment:
       - ENVIRONMENT=development
       - POSTGRES_SUPERUSER=postgres
       - POSTGRES_SUPERUSER_PASSWORD=local_development_super_password_only
+      - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=local_development_super_password_only
       - POSTGRES_MIGRATION_USER=aihr_migration_user
       - POSTGRES_MIGRATION_PASSWORD=local_development_migration_password_only
-      - POSTGRES_USER=aihr_app_user
       - POSTGRES_APP_USER=aihr_app_user
       - POSTGRES_APP_PASSWORD=local_development_password_only
+
+  redis:
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
 
   backend:
     volumes:

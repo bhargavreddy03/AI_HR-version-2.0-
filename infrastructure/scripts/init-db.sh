@@ -23,12 +23,15 @@ APP_ENV="${ENVIRONMENT:-${APP_ENV:-production}}"
 # In development mode, provide convenient local defaults if not already set.
 # Outside development (e.g. production, staging, testing), explicit credentials are strictly required.
 if [ "${APP_ENV}" = "development" ] || [ "${APP_ENV}" = "dev" ] || [ "${APP_ENV}" = "local" ]; then
+    export POSTGRES_SUPERUSER="${POSTGRES_SUPERUSER:-${POSTGRES_USER:-postgres}}"
+    export POSTGRES_SUPERUSER_PASSWORD="${POSTGRES_SUPERUSER_PASSWORD:-${PGPASSWORD:-local_development_super_password_only}}"
+    export PGPASSWORD="${POSTGRES_SUPERUSER_PASSWORD}"
     export POSTGRES_MIGRATION_USER="${POSTGRES_MIGRATION_USER:-aihr_migration_user}"
     export POSTGRES_MIGRATION_PASSWORD="${POSTGRES_MIGRATION_PASSWORD:-local_development_migration_password_only}"
-    export POSTGRES_USER="${POSTGRES_APP_USER:-${POSTGRES_USER:-aihr_app_user}}"
-    export POSTGRES_PASSWORD="${POSTGRES_APP_PASSWORD:-${POSTGRES_PASSWORD:-local_development_password_only}}"
+    export POSTGRES_APP_USER="${POSTGRES_APP_USER:-aihr_app_user}"
+    export POSTGRES_USER="${POSTGRES_APP_USER}"
+    export POSTGRES_APP_PASSWORD="${POSTGRES_APP_PASSWORD:-${POSTGRES_PASSWORD:-local_development_password_only}}"
     export POSTGRES_DB="${POSTGRES_DB:-ai_hr_db}"
-    export PGPASSWORD="${PGPASSWORD:-${POSTGRES_SUPERUSER_PASSWORD:-local_development_super_password_only}}"
 else
     # Outside development: fail immediately if required secrets are missing
     if [ -z "${POSTGRES_MIGRATION_PASSWORD}" ]; then
@@ -48,15 +51,18 @@ else
         exit 1
     fi
 
+    export POSTGRES_SUPERUSER="${POSTGRES_SUPERUSER:-${POSTGRES_USER:-postgres}}"
+    export POSTGRES_SUPERUSER_PASSWORD="${EFFECTIVE_SUPER_PASSWORD}"
+    export PGPASSWORD="${EFFECTIVE_SUPER_PASSWORD}"
     export POSTGRES_MIGRATION_USER="${POSTGRES_MIGRATION_USER:-aihr_migration_user}"
     export POSTGRES_MIGRATION_PASSWORD="${POSTGRES_MIGRATION_PASSWORD}"
-    export POSTGRES_USER="${POSTGRES_APP_USER:-${POSTGRES_USER:-aihr_app_user}}"
-    export POSTGRES_PASSWORD="${EFFECTIVE_APP_PASSWORD}"
+    export POSTGRES_APP_USER="${POSTGRES_APP_USER:-aihr_app_user}"
+    export POSTGRES_USER="${POSTGRES_APP_USER}"
+    export POSTGRES_APP_PASSWORD="${EFFECTIVE_APP_PASSWORD}"
     export POSTGRES_DB="${POSTGRES_DB:-ai_hr_db}"
-    export PGPASSWORD="${EFFECTIVE_SUPER_PASSWORD}"
 fi
 
-SUPERUSER="${POSTGRES_SUPERUSER:-postgres}"
+SUPERUSER="${POSTGRES_SUPERUSER}"
 DB_HOST="${PGHOST:-${POSTGRES_HOST:-}}"
 DB_PORT="${PGPORT:-${POSTGRES_PORT:-5432}}"
 

@@ -5,12 +5,25 @@ Revises: None
 Create Date: 2026-11-07 21:55:00.000000
 """
 
+import os
+import re
 from collections.abc import Sequence
 
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 from alembic import op
+
+
+def _get_app_role() -> str:
+    """Return the configured runtime application role identifier safely."""
+    role = os.getenv("POSTGRES_APP_USER") or os.getenv("POSTGRES_USER")
+    if not role or role == "postgres":
+        role = "aihr_app_user"
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", role):
+        raise ValueError(f"Invalid runtime role identifier: {role}")
+    return role
+
 
 # revision identifiers, used by Alembic.
 revision: str = "001_auth_identity"
@@ -570,14 +583,15 @@ def upgrade() -> None:
     )
     op.bulk_insert(perms_table, perms_data)
 
-    # 11. Grant runtime DML permissions to aihr_app_user
-    op.execute("""
+    # 11. Grant runtime DML permissions to configured runtime application role
+    app_role = _get_app_role()
+    op.execute(f"""
         DO $$
         BEGIN
-            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aihr_app_user') THEN
-                GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO aihr_app_user;
-                GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO aihr_app_user;
-                GRANT EXECUTE ON ALL ROUTINES IN SCHEMA public TO aihr_app_user;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{app_role}') THEN
+                GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "{app_role}";
+                GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO "{app_role}";
+                GRANT EXECUTE ON ALL ROUTINES IN SCHEMA public TO "{app_role}";
             END IF;
         END $$;
     """)

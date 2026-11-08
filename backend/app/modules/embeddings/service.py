@@ -63,10 +63,16 @@ class InvalidSearchParameterException(AppException):
         )
 
 
-def _validate_vector_elements(vector: list[float], field_name: str = "Vector") -> None:
-    """Validate that vector contains only finite numeric values (no NaN, Inf, or non-numeric types)."""
-    if not vector:
+def _validate_vector_elements(
+    vector: list[float], field_name: str = "Vector", check_zero_magnitude: bool = False
+) -> None:
+    """Validate that vector contains only finite numeric values (no NaN, Inf, booleans, or non-numeric types).
+
+    Optionally verifies that the vector has non-zero magnitude when used for cosine distance.
+    """
+    if not isinstance(vector, list) or not vector:
         raise InvalidSearchParameterException(f"{field_name} cannot be empty")
+    magnitude_sq = 0.0
     for i, val in enumerate(vector):
         if (
             not isinstance(val, int | float)
@@ -77,6 +83,12 @@ def _validate_vector_elements(vector: list[float], field_name: str = "Vector") -
             raise InvalidSearchParameterException(
                 f"{field_name} contains invalid non-finite value at index {i}: {val}"
             )
+        magnitude_sq += float(val) * float(val)
+
+    if check_zero_magnitude and magnitude_sq == 0.0:
+        raise InvalidSearchParameterException(
+            f"{field_name} cannot have zero magnitude for cosine distance operations"
+        )
 
 
 async def get_embedding_model(
@@ -110,7 +122,7 @@ async def store_candidate_document_embedding(
     3. The vector length strictly matches expected_dimensions.
     4. Populates exactly the matching typed vector column (1536, 1024, or 768).
     """
-    _validate_vector_elements(embedding, field_name="Embedding vector")
+    _validate_vector_elements(embedding, field_name="Embedding vector", check_zero_magnitude=True)
 
     model = await get_embedding_model(session, model_identifier)
     if not model.is_active:
@@ -152,7 +164,7 @@ async def store_job_embedding(
     embedding: list[float],
 ) -> JobEmbedding:
     """Store a tenant-scoped job embedding with model dimension verification."""
-    _validate_vector_elements(embedding, field_name="Embedding vector")
+    _validate_vector_elements(embedding, field_name="Embedding vector", check_zero_magnitude=True)
 
     model = await get_embedding_model(session, model_identifier)
     if not model.is_active:
@@ -212,7 +224,7 @@ async def search_similar_candidate_documents(
         )
 
     # 2. Validate query vector elements
-    _validate_vector_elements(query_vector, field_name="Query vector")
+    _validate_vector_elements(query_vector, field_name="Query vector", check_zero_magnitude=True)
 
     # 3. Retrieve model from registry & verify active
     model = await get_embedding_model(session, model_identifier)

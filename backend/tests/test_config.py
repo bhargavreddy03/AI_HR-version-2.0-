@@ -303,3 +303,114 @@ def test_production_settings_reject_mismatched_migration_user() -> None:
             DATABASE_SYNC_URL=f"postgresql://aihr_migration_user:{secure_mig_pass}@localhost:5432/ai_hr_db",
             COOKIE_SECURE=True,
         )
+
+
+def test_production_settings_reject_mismatched_migration_password() -> None:
+    """Verify that mismatched password in DATABASE_MIGRATION_URL is rejected in production."""
+    secure_pass = "a_very_secure_runtime_password_123456!"
+    secure_mig_pass = "a_very_secure_migration_password_654321!"
+    with pytest.raises(
+        ValueError,
+        match="DATABASE_MIGRATION_URL password does not match POSTGRES_MIGRATION_PASSWORD",
+    ):
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
+            MFA_ENCRYPTION_KEY="production_ultra_secure_mfa_encryption_key_32_bytes_long!",
+            BACKUP_CODE_PEPPER="production_ultra_secure_backup_pepper_32_bytes_long!",
+            POSTGRES_USER="aihr_app_user",
+            POSTGRES_PASSWORD=secure_pass,
+            POSTGRES_MIGRATION_USER="aihr_migration_user",
+            POSTGRES_MIGRATION_PASSWORD=secure_mig_pass,
+            DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            DATABASE_MIGRATION_URL="postgresql+asyncpg://aihr_migration_user:different_mig_password_999!@localhost:5432/ai_hr_db",
+            DATABASE_SYNC_URL=f"postgresql://aihr_migration_user:{secure_mig_pass}@localhost:5432/ai_hr_db",
+            COOKIE_SECURE=True,
+        )
+
+
+def test_production_settings_accept_url_encoded_special_characters() -> None:
+    """Verify that URL-encoded passwords with special characters (@, :, /, #) match plain passwords."""
+    from urllib.parse import quote_plus
+
+    raw_pass = "P@ssw0rd:Secret/Special#2026!"
+    encoded_pass = quote_plus(raw_pass)
+    settings = Settings(
+        ENVIRONMENT="production",
+        JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
+        MFA_ENCRYPTION_KEY="production_ultra_secure_mfa_encryption_key_32_bytes_long!",
+        BACKUP_CODE_PEPPER="production_ultra_secure_backup_pepper_32_bytes_long!",
+        POSTGRES_USER="aihr_app_user",
+        POSTGRES_PASSWORD=raw_pass,
+        DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{encoded_pass}@localhost:5432/ai_hr_db",
+        DATABASE_SYNC_URL=f"postgresql://aihr_app_user:{encoded_pass}@localhost:5432/ai_hr_db",
+        COOKIE_SECURE=True,
+    )
+    assert settings.POSTGRES_PASSWORD == raw_pass
+
+
+def test_production_settings_reject_inconsistent_database_host() -> None:
+    """Verify rejection when DATABASE_MIGRATION_URL host differs from DATABASE_URL host."""
+    secure_pass = "a_very_secure_runtime_password_123456!"
+    with pytest.raises(
+        ValueError,
+        match="DATABASE_MIGRATION_URL host does not match DATABASE_URL host",
+    ):
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
+            MFA_ENCRYPTION_KEY="production_ultra_secure_mfa_encryption_key_32_bytes_long!",
+            BACKUP_CODE_PEPPER="production_ultra_secure_backup_pepper_32_bytes_long!",
+            POSTGRES_USER="aihr_app_user",
+            POSTGRES_PASSWORD=secure_pass,
+            POSTGRES_MIGRATION_USER="aihr_migration_user",
+            POSTGRES_MIGRATION_PASSWORD=secure_pass,
+            DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{secure_pass}@primary-db.prod.internal:5432/ai_hr_db",
+            DATABASE_MIGRATION_URL=f"postgresql+asyncpg://aihr_migration_user:{secure_pass}@other-db.prod.internal:5432/ai_hr_db",
+            DATABASE_SYNC_URL=f"postgresql://aihr_app_user:{secure_pass}@primary-db.prod.internal:5432/ai_hr_db",
+            COOKIE_SECURE=True,
+        )
+
+
+def test_production_settings_reject_insecure_redis_password() -> None:
+    """Verify rejection when REDIS_PASSWORD is set to a development default in production."""
+    secure_pass = "a_very_secure_runtime_password_123456!"
+    with pytest.raises(
+        ValueError,
+        match="Insecure default REDIS_PASSWORD detected for production/staging",
+    ):
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
+            MFA_ENCRYPTION_KEY="production_ultra_secure_mfa_encryption_key_32_bytes_long!",
+            BACKUP_CODE_PEPPER="production_ultra_secure_backup_pepper_32_bytes_long!",
+            POSTGRES_USER="aihr_app_user",
+            POSTGRES_PASSWORD=secure_pass,
+            DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            DATABASE_SYNC_URL=f"postgresql://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            REDIS_PASSWORD="local_development_redis_secret_only",
+            REDIS_URL="redis://:local_development_redis_secret_only@localhost:6379/0",
+            COOKIE_SECURE=True,
+        )
+
+
+def test_production_settings_reject_mismatched_redis_password() -> None:
+    """Verify rejection when REDIS_URL password does not match REDIS_PASSWORD in production."""
+    secure_pass = "a_very_secure_runtime_password_123456!"
+    with pytest.raises(
+        ValueError,
+        match="REDIS_URL password does not match REDIS_PASSWORD",
+    ):
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
+            MFA_ENCRYPTION_KEY="production_ultra_secure_mfa_encryption_key_32_bytes_long!",
+            BACKUP_CODE_PEPPER="production_ultra_secure_backup_pepper_32_bytes_long!",
+            POSTGRES_USER="aihr_app_user",
+            POSTGRES_PASSWORD=secure_pass,
+            DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            DATABASE_SYNC_URL=f"postgresql://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            REDIS_PASSWORD="a_very_secure_production_redis_password_123!",
+            REDIS_URL="redis://:different_production_redis_password_456!@localhost:6379/0",
+            COOKIE_SECURE=True,
+        )

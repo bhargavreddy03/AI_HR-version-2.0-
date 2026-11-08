@@ -5,6 +5,8 @@ Revises: 001_auth_identity
 Create Date: 2026-11-08 10:45:00.000000
 """
 
+import os
+import re
 from collections.abc import Sequence
 
 import sqlalchemy as sa
@@ -12,6 +14,17 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy.dialects import postgresql
 
 from alembic import op
+
+
+def _get_app_role() -> str:
+    """Return the configured runtime application role identifier safely."""
+    role = os.getenv("POSTGRES_APP_USER") or os.getenv("POSTGRES_USER")
+    if not role or role == "postgres":
+        role = "aihr_app_user"
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", role):
+        raise ValueError(f"Invalid runtime role identifier: {role}")
+    return role
+
 
 # revision identifiers, used by Alembic.
 revision: str = "002_db_foundation_pgvector"
@@ -120,19 +133,19 @@ def upgrade() -> None:
 
     # Partial HNSW Indexes on candidate_document_embeddings
     op.execute("""
-        CREATE INDEX idx_cand_emb_1536 ON candidate_document_embeddings 
+        CREATE INDEX idx_cand_emb_1536 ON candidate_document_embeddings
             USING hnsw (embedding_1536 vector_cosine_ops)
             WITH (m = 16, ef_construction = 64)
             WHERE embedding_1536 IS NOT NULL;
     """)
     op.execute("""
-        CREATE INDEX idx_cand_emb_1024 ON candidate_document_embeddings 
+        CREATE INDEX idx_cand_emb_1024 ON candidate_document_embeddings
             USING hnsw (embedding_1024 vector_cosine_ops)
             WITH (m = 16, ef_construction = 64)
             WHERE embedding_1024 IS NOT NULL;
     """)
     op.execute("""
-        CREATE INDEX idx_cand_emb_768 ON candidate_document_embeddings 
+        CREATE INDEX idx_cand_emb_768 ON candidate_document_embeddings
             USING hnsw (embedding_768 vector_cosine_ops)
             WITH (m = 16, ef_construction = 64)
             WHERE embedding_768 IS NOT NULL;
@@ -141,15 +154,13 @@ def upgrade() -> None:
     # Enable and Force Row Level Security on candidate_document_embeddings
     op.execute("ALTER TABLE candidate_document_embeddings ENABLE ROW LEVEL SECURITY;")
     op.execute("ALTER TABLE candidate_document_embeddings FORCE ROW LEVEL SECURITY;")
-    op.execute("""
+    app_role = _get_app_role()
+    op.execute(f"""
         DO $$
         BEGIN
-            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aihr_app_user') THEN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{app_role}') THEN
                 EXECUTE 'CREATE POLICY cand_emb_app_user_perm ON candidate_document_embeddings
-                         AS PERMISSIVE FOR ALL TO aihr_app_user USING (true) WITH CHECK (true);';
-            ELSE
-                EXECUTE 'CREATE POLICY cand_emb_app_user_perm ON candidate_document_embeddings
-                         AS PERMISSIVE FOR ALL TO PUBLIC USING (true) WITH CHECK (true);';
+                         AS PERMISSIVE FOR ALL TO "{app_role}" USING (true) WITH CHECK (true);';
             END IF;
         END $$;
     """)
@@ -219,19 +230,19 @@ def upgrade() -> None:
 
     # Partial HNSW Indexes on job_embeddings
     op.execute("""
-        CREATE INDEX idx_job_emb_1536 ON job_embeddings 
+        CREATE INDEX idx_job_emb_1536 ON job_embeddings
             USING hnsw (embedding_1536 vector_cosine_ops)
             WITH (m = 16, ef_construction = 64)
             WHERE embedding_1536 IS NOT NULL;
     """)
     op.execute("""
-        CREATE INDEX idx_job_emb_1024 ON job_embeddings 
+        CREATE INDEX idx_job_emb_1024 ON job_embeddings
             USING hnsw (embedding_1024 vector_cosine_ops)
             WITH (m = 16, ef_construction = 64)
             WHERE embedding_1024 IS NOT NULL;
     """)
     op.execute("""
-        CREATE INDEX idx_job_emb_768 ON job_embeddings 
+        CREATE INDEX idx_job_emb_768 ON job_embeddings
             USING hnsw (embedding_768 vector_cosine_ops)
             WITH (m = 16, ef_construction = 64)
             WHERE embedding_768 IS NOT NULL;
@@ -240,15 +251,12 @@ def upgrade() -> None:
     # Enable and Force Row Level Security on job_embeddings
     op.execute("ALTER TABLE job_embeddings ENABLE ROW LEVEL SECURITY;")
     op.execute("ALTER TABLE job_embeddings FORCE ROW LEVEL SECURITY;")
-    op.execute("""
+    op.execute(f"""
         DO $$
         BEGIN
-            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aihr_app_user') THEN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{app_role}') THEN
                 EXECUTE 'CREATE POLICY job_emb_app_user_perm ON job_embeddings
-                         AS PERMISSIVE FOR ALL TO aihr_app_user USING (true) WITH CHECK (true);';
-            ELSE
-                EXECUTE 'CREATE POLICY job_emb_app_user_perm ON job_embeddings
-                         AS PERMISSIVE FOR ALL TO PUBLIC USING (true) WITH CHECK (true);';
+                         AS PERMISSIVE FOR ALL TO "{app_role}" USING (true) WITH CHECK (true);';
             END IF;
         END $$;
     """)
@@ -261,13 +269,13 @@ def upgrade() -> None:
     """)
 
     # 5. Grant least-privilege DML permissions to runtime application role
-    op.execute("""
+    op.execute(f"""
         DO $$
         BEGIN
-            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aihr_app_user') THEN
-                GRANT SELECT ON embedding_models TO aihr_app_user;
-                GRANT SELECT, INSERT, UPDATE, DELETE ON candidate_document_embeddings TO aihr_app_user;
-                GRANT SELECT, INSERT, UPDATE, DELETE ON job_embeddings TO aihr_app_user;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{app_role}') THEN
+                GRANT SELECT ON embedding_models TO "{app_role}";
+                GRANT SELECT, INSERT, UPDATE, DELETE ON candidate_document_embeddings TO "{app_role}";
+                GRANT SELECT, INSERT, UPDATE, DELETE ON job_embeddings TO "{app_role}";
             END IF;
         END $$;
     """)
@@ -302,9 +310,10 @@ def downgrade() -> None:
             ) THEN
                 BEGIN
                     DROP EXTENSION IF EXISTS vector;
-                EXCEPTION WHEN OTHERS THEN
-                    -- If any external object or dependency references vector, preserve it safely
-                    NULL;
+                EXCEPTION
+                    -- Catch only expected dependency-related failures; do not swallow unexpected errors
+                    WHEN dependent_objects_still_exist THEN
+                        RAISE NOTICE 'Preserving vector extension: other objects depend upon it.';
                 END;
             END IF;
         END $$;

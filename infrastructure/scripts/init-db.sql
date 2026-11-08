@@ -1,6 +1,6 @@
 -- ==============================================================================
 -- PostgreSQL Initial Extension & Role Setup Script
--- Executed on container creation by PostgreSQL entrypoint as superuser (postgres)
+-- Executed on container creation by PostgreSQL entrypoint as bootstrap superuser
 -- Consumes credentials securely from environment variables without hardcoded passwords.
 -- ==============================================================================
 
@@ -15,8 +15,14 @@ BEGIN
     END IF;
 END $$;
 
--- 2. Read configured migration and application credentials via psql \getenv
+-- 2. Read configured migration, application, and bootstrap credentials via psql \getenv
 -- Environment variables are read directly without appearing in process listings or logs.
+
+\getenv super_user POSTGRES_SUPERUSER
+\if :{?super_user}
+\else
+  \set super_user 'postgres'
+\endif
 
 \getenv mig_user POSTGRES_MIGRATION_USER
 \if :{?mig_user}
@@ -34,11 +40,7 @@ END $$;
 \getenv app_user POSTGRES_APP_USER
 \if :{?app_user}
 \else
-  \getenv app_user POSTGRES_USER
-  \if :{?app_user}
-  \else
-    \set app_user 'aihr_app_user'
-  \endif
+  \set app_user 'aihr_app_user'
 \endif
 
 \getenv app_password POSTGRES_APP_PASSWORD
@@ -52,9 +54,10 @@ END $$;
   \endif
 \endif
 
--- Ensure app_user is not inadvertently set to the bootstrap superuser name
-SELECT (CASE WHEN :'app_user' = 'postgres' OR :'app_user' = '' THEN 'aihr_app_user' ELSE :'app_user' END) AS effective_app_user \gset
+-- Compute effective names safely without hardcoded role dependencies
+SELECT (CASE WHEN :'super_user' = '' THEN 'postgres' ELSE :'super_user' END) AS effective_super_user \gset
 SELECT (CASE WHEN :'mig_user' = '' THEN 'aihr_migration_user' ELSE :'mig_user' END) AS effective_mig_user \gset
+SELECT (CASE WHEN :'app_user' = :'effective_super_user' OR :'app_user' = '' THEN 'aihr_app_user' ELSE :'app_user' END) AS effective_app_user \gset
 
 -- 3. Create or Reconcile Migration / Schema Owner Role
 -- Owns the schema and tables; executes DDL migrations.
@@ -94,14 +97,14 @@ ALTER DEFAULT PRIVILEGES FOR ROLE :"effective_mig_user" IN SCHEMA public
 ALTER DEFAULT PRIVILEGES FOR ROLE :"effective_mig_user" IN SCHEMA public
     GRANT EXECUTE ON ROUTINES TO :"effective_app_user";
 
--- Also configure default privileges if tables are created by postgres (bootstrap role)
-ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
+-- Also configure default privileges if tables are created by the configured bootstrap role
+ALTER DEFAULT PRIVILEGES FOR ROLE :"effective_super_user" IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO :"effective_app_user";
 
-ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
+ALTER DEFAULT PRIVILEGES FOR ROLE :"effective_super_user" IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO :"effective_app_user";
 
-ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
+ALTER DEFAULT PRIVILEGES FOR ROLE :"effective_super_user" IN SCHEMA public
     GRANT EXECUTE ON ROUTINES TO :"effective_app_user";
 
 -- Grant permissions on any pre-existing tables/sequences in public schema
