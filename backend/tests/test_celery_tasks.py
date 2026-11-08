@@ -616,3 +616,58 @@ def test_bound_celery_task_missing_request_id_fails_closed() -> None:
         sample_task(fake_task, idempotency_key="missing-req-id-key")
 
     assert "Celery request ID is required" in str(exc_info.value)
+
+
+def test_direct_invocation_ignores_caller_supplied_task_id() -> None:
+    """Verify direct function calls always generate random internal ID and never trust caller-supplied task_id."""
+    mock_redis = MagicMock()
+    # Redis has an existing PENDING record registered with task_id="celery-task-456"
+    pending_payload = json.dumps({"status": "PENDING", "task_id": "celery-task-456"})
+    mock_redis.eval.return_value = [0, None, pending_payload]
+
+    execution_count = 0
+
+    @idempotent_task(key_param="idempotency_key")
+    def sample_direct_fn(idempotency_key: str | None = None, task_id: str | None = None) -> str:
+        nonlocal execution_count
+        execution_count += 1
+        return "direct-hijack-attempt"
+
+    with patch("app.core.tasks.idempotency.get_sync_redis_client", return_value=mock_redis):
+        # Caller directly invokes and tries to supply the registered task_id="celery-task-456"
+        res = sample_direct_fn(idempotency_key="resume-123", task_id="celery-task-456")
+
+        # Must NOT execute
+        assert execution_count == 0
+        assert res["status"] == "duplicate_execution_suppressed"
+        assert res["original_task_id"] == "celery-task-456"
+
+        # Verify that mock_redis.eval was called with a generated "direct:..." ID, NOT "celery-task-456"
+        eval_args = mock_redis.eval.call_args[0]
+        # In LUA_ACQUIRE, ARGV[1] is task_id (index 3 in eval args: script, numkeys, key, task_id, ...)
+        passed_task_id = eval_args[3]
+        assert passed_task_id.startswith("direct:")
+        assert passed_task_id != "celery-task-456"
+
+
+def test_bound_celery_task_ignores_caller_task_id_when_request_id_missing() -> None:
+    """Verify bound Celery tasks only accept self.request.id and reject execution even if kwargs has task_id."""
+
+    class MissingIdTask:
+        def __init__(self) -> None:
+            self.request = MagicMock(id=None, headers={})
+            self.name = "missing_id_with_kwargs_task"
+
+    fake_task = MissingIdTask()
+
+    @idempotent_task(key_param="idempotency_key")
+    def sample_task(
+        self: Any, idempotency_key: str | None = None, task_id: str | None = None
+    ) -> str:
+        return "should-never-run"
+
+    # Even if caller passes task_id="celery-task-456" in kwargs, missing self.request.id must fail closed
+    with pytest.raises(PermanentTaskError) as exc_info:
+        sample_task(fake_task, idempotency_key="key-test", task_id="celery-task-456")
+
+    assert "Celery request ID is required" in str(exc_info.value)

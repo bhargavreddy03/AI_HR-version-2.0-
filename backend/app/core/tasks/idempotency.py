@@ -1003,13 +1003,15 @@ def idempotent_task(
             task_inst = args[0] if (args and hasattr(args[0], "request")) else None
             req = getattr(task_inst, "request", None) if task_inst else None
             if task_inst is not None:
-                task_id = getattr(req, "id", None) or kwargs.get("task_id")
+                task_id = getattr(req, "id", None)
                 if not task_id or not str(task_id).strip():
                     raise PermanentTaskError(
                         f"Celery request ID is required for idempotent task execution of {getattr(task_inst, 'name', fn.__name__)}."
                     )
+                task_id = str(task_id)
             else:
-                task_id = kwargs.get("task_id") or f"direct:{uuid.uuid4().hex}"
+                # Direct function calls: always generate a random internal ID, never trust caller-supplied task_id
+                task_id = f"direct:{uuid.uuid4().hex}"
             req_headers = getattr(req, "headers", None) or {}
 
             # Determine scoped key from Celery headers or runtime arguments
