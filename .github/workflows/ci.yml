@@ -62,7 +62,22 @@ jobs:
           cd backend
           mypy app/
 
-      - name: Initialize PostgreSQL Roles and Extensions
+      - name: Initialize PostgreSQL Roles and Extensions (Fresh Run)
+        env:
+          POSTGRES_SUPERUSER: postgres
+          POSTGRES_SUPERUSER_PASSWORD: test_super_password_only
+          PGPASSWORD: test_super_password_only
+          POSTGRES_MIGRATION_USER: aihr_migration_user
+          POSTGRES_MIGRATION_PASSWORD: local_development_migration_password_only
+          POSTGRES_USER: aihr_app_user
+          POSTGRES_PASSWORD: local_development_password_only
+          POSTGRES_DB: ai_hr_db_test
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+        run: |
+          bash infrastructure/scripts/init-db.sh
+
+      - name: Verify PostgreSQL Initialization Idempotency (Rerun on Running Server)
         env:
           POSTGRES_SUPERUSER: postgres
           POSTGRES_SUPERUSER_PASSWORD: test_super_password_only
@@ -225,8 +240,10 @@ jobs:
             exit 1
           fi
 
-          DEV_SUPER_PASS="dev_postgres_superuser_secret"
-          DEV_REDIS_PASS="local_development_redis_secret_only"
+          DEV_SUPER_PASS="$(grep -E '^POSTGRES_SUPERUSER_PASSWORD=' .env.dev | cut -d= -f2-)"
+          DEV_REDIS_PASS="$(grep -E '^REDIS_PASSWORD=' .env.dev | cut -d= -f2-)"
+          DEV_SUPER_PASS="${DEV_SUPER_PASS:-local_development_super_password_only}"
+          DEV_REDIS_PASS="${DEV_REDIS_PASS:-local_development_redis_secret_only}"
 
           echo "1. Verifying pgvector extension in ai_hr_db..."
           EXT_CHECK=$(docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml exec -T -e PGPASSWORD="$DEV_SUPER_PASS" postgres psql -U postgres -d ai_hr_db -tA -c "SELECT extname FROM pg_extension WHERE extname = 'vector';")
@@ -275,6 +292,10 @@ jobs:
           echo "$PG_PORTS" | grep -q "127.0.0.1:5432" || { echo "ERROR: ai_hr_postgres is not bound to 127.0.0.1:5432!"; exit 1; }
           echo "$REDIS_PORTS" | grep -q "127.0.0.1:6379" || { echo "ERROR: ai_hr_redis is not bound to 127.0.0.1:6379!"; exit 1; }
           echo "Host loopback port bindings verified."
+
+          echo "6. Verifying PostgreSQL script rerun idempotency inside running container..."
+          docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml exec -T -e POSTGRES_HOST=localhost -e PGPASSWORD="$DEV_SUPER_PASS" postgres bash /docker-entrypoint-initdb.d/01-init.sh
+          echo "PostgreSQL initialization script rerun inside container verified successfully."
 
           echo "SUCCESS: All container smoke tests and security verifications passed."
 

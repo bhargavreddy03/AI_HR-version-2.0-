@@ -61,16 +61,26 @@ SELECT (CASE WHEN :'app_user' = '' THEN 'aihr_app_user' ELSE :'app_user' END) AS
 
 -- Enforce strict role distinctness: bootstrap superuser, migration role, and runtime app role
 -- must all be distinct. Rejects role collision before altering roles, ownership, or privileges.
+-- Session parameters are used to safely bridge psql-interpolated variables into the PL/pgSQL block
+-- because psql does not expand :variables inside dollar-quoted ($$) blocks.
+SELECT set_config('app.init_super_user', :'effective_super_user', false);
+SELECT set_config('app.init_mig_user', :'effective_mig_user', false);
+SELECT set_config('app.init_app_user', :'effective_app_user', false);
+
 DO $$
+DECLARE
+    super_u text := current_setting('app.init_super_user');
+    mig_u text := current_setting('app.init_mig_user');
+    app_u text := current_setting('app.init_app_user');
 BEGIN
-    IF :'effective_super_user' = :'effective_mig_user' THEN
-        RAISE EXCEPTION 'Role collision: migration role (%) cannot match bootstrap superuser (%)', :'effective_mig_user', :'effective_super_user';
+    IF super_u = mig_u THEN
+        RAISE EXCEPTION 'Role collision: migration role (%) cannot match bootstrap superuser (%)', mig_u, super_u;
     END IF;
-    IF :'effective_super_user' = :'effective_app_user' THEN
-        RAISE EXCEPTION 'Role collision: application runtime role (%) cannot match bootstrap superuser (%)', :'effective_app_user', :'effective_super_user';
+    IF super_u = app_u THEN
+        RAISE EXCEPTION 'Role collision: application runtime role (%) cannot match bootstrap superuser (%)', app_u, super_u;
     END IF;
-    IF :'effective_mig_user' = :'effective_app_user' THEN
-        RAISE EXCEPTION 'Role collision: application runtime role (%) cannot match migration role (%)', :'effective_app_user', :'effective_mig_user';
+    IF mig_u = app_u THEN
+        RAISE EXCEPTION 'Role collision: application runtime role (%) cannot match migration role (%)', app_u, mig_u;
     END IF;
 END $$;
 

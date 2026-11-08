@@ -180,6 +180,7 @@ async def transactional_session(
     """
     factory = session_factory or get_session_factory(engine=engine, settings=settings)
     raw = factory()
+    session_ctx: Any
     if hasattr(raw, "__aenter__"):
         session_ctx = raw
     else:
