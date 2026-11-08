@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # ----------------------------------------------------------------------------
   # Primary Relational Store: PostgreSQL 16 + pgvector
