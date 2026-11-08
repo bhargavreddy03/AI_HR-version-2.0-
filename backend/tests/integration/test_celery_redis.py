@@ -764,10 +764,10 @@ async def test_live_celery_worker_recovers_and_executes_from_dispatch_unknown(
         # Step 3: Dispatch message to live Celery broker using the exact same task_id
         async_res = system_ping.apply_async(
             args=("real-worker-dispatch-unknown",),
-            kwargs={"idempotency_key": test_key, "tenant_id": str(TENANT_A)},
+            kwargs={"idempotency_key": test_key},
             queue="default",
             task_id=task_id,
-            headers={"idempotency_scoped_key": scoped_key},
+            headers={"idempotency_scoped_key": scoped_key, "tenant_id": str(TENANT_A)},
         )
         assert async_res.id == task_id
 
