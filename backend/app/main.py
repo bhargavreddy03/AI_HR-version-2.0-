@@ -25,6 +25,7 @@ from app.core.redis import (
     create_redis_client,
     dispose_app_redis,
 )
+from app.core.security.headers import SecurityHeadersMiddleware
 
 
 @asynccontextmanager
@@ -72,7 +73,10 @@ def create_application(settings: Settings | None = None) -> FastAPI:
     # 1. Register Request Correlation ID Middleware (outermost for accurate logging)
     app.add_middleware(CorrelationIdMiddleware, settings=app_settings)
 
-    # 2. Configure CORS Middleware with explicit environment origins
+    # 2. Register HTTP Security Headers Middleware (CSP, HSTS, frame protection, body size limits)
+    app.add_middleware(SecurityHeadersMiddleware, settings=app_settings)
+
+    # 3. Configure CORS Middleware with explicit environment origins
     if app_settings.BACKEND_CORS_ORIGINS:
         app.add_middleware(
             CORSMiddleware,

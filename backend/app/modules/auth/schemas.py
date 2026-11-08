@@ -7,6 +7,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+from app.core.security.password import validate_password_complexity
+
 
 class RegisterRequest(BaseModel):
     """User self-registration request."""
@@ -21,6 +23,12 @@ class RegisterRequest(BaseModel):
     @classmethod
     def normalize_email(cls, v: str) -> str:
         return v.strip().lower()
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        validate_password_complexity(v)
+        return v
 
     @field_validator("first_name", "last_name")
     @classmethod
@@ -118,6 +126,12 @@ class PasswordChangeRequest(BaseModel):
     current_password: str = Field(..., description="Existing plaintext password")
     new_password: str = Field(..., min_length=12, max_length=128, description="New strong password")
 
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, v: str) -> str:
+        validate_password_complexity(v)
+        return v
+
 
 class PasswordResetRequest(BaseModel):
     """Public password reset initiation."""
@@ -135,6 +149,12 @@ class PasswordResetConfirmRequest(BaseModel):
 
     token: str = Field(..., description="Cryptographically secure reset token")
     new_password: str = Field(..., min_length=12, max_length=128, description="New strong password")
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, v: str) -> str:
+        validate_password_complexity(v)
+        return v
 
 
 class SessionSummary(BaseModel):

@@ -23,6 +23,7 @@ from app.core.errors import (
 )
 from app.core.redis import RedisClient
 from app.core.security import hash_password, needs_rehash, verify_password
+from app.core.security.audit import log_security_event
 from app.modules.auth.crypto import (
     decrypt_mfa_secret,
     encrypt_mfa_secret,
@@ -984,3 +985,167 @@ async def change_password(
 
     # Monotonic Redis session purge
     await delete_all_user_sessions_monotonic(redis, user.id, user.token_version)
+
+
+async def request_password_reset(
+    db: AsyncSession,
+    redis: RedisClient,
+    email: str,
+    client_ip: str | None,
+    settings: Settings,
+) -> str | None:
+    """Initiate a secure password reset workflow with single-use time-limited tokens.
+
+    To prevent account enumeration, this function completes normally regardless of whether
+    the email address exists in the platform.
+
+    Returns the raw token string (primarily for development/testing and notification workers).
+    """
+    # 1. Brute-force rate limiting: 3 reset requests per 5 minutes per IP + email
+    ip_ident = client_ip or "unknown_ip"
+    within_limit = await check_rate_limit(
+        redis,
+        identifier=f"{ip_ident}:{email.lower()}",
+        action="password_reset_request",
+        max_attempts=3,
+        window_seconds=300,
+    )
+    if not within_limit:
+        log_security_event(
+            "PASSWORD_RESET_RATE_LIMITED",
+            "FAILURE",
+            client_ip=client_ip,
+            details={"email": email},
+        )
+        raise RateLimitException(
+            "Too many password reset requests. Please wait 5 minutes before trying again.",
+            error_code="RATE_LIMIT_EXCEEDED",
+        )
+
+    # 2. Look up user by lowercase email
+    stmt = select(User).where(func.lower(User.email) == email.lower())
+    user = (await db.execute(stmt)).scalar_one_or_none()
+
+    if not user or not user.is_active:
+        # Generic response prevents account enumeration
+        log_security_event(
+            "PASSWORD_RESET_REQUESTED",
+            "FAILURE",
+            client_ip=client_ip,
+            details={"email": email, "reason": "User not found or inactive"},
+        )
+        return None
+
+    # 3. Generate single-use cryptographically secure random token (48 bytes URL-safe)
+    raw_token = generate_secure_token(48)
+    token_hash = hash_token(raw_token)
+
+    import json
+
+    token_data = {
+        "user_id": str(user.id),
+        "email": user.email,
+        "token_version": user.token_version,
+    }
+    # 15-minute expiration window for password recovery tokens
+    await redis.set(f"password_reset:{token_hash}", json.dumps(token_data), ex=900)
+
+    log_security_event(
+        "PASSWORD_RESET_REQUESTED",
+        "SUCCESS",
+        actor_id=user.id,
+        client_ip=client_ip,
+        details={"email": user.email},
+    )
+
+    return raw_token
+
+
+async def confirm_password_reset(
+    db: AsyncSession,
+    redis: RedisClient,
+    token: str,
+    new_password: str,
+    client_ip: str | None,
+    settings: Settings,
+) -> bool:
+    """Complete password reset using a single-use token, advance token version, and invalidate all sessions."""
+    import json
+
+    token_hash = hash_token(token.strip())
+    token_key = f"password_reset:{token_hash}"
+
+    raw_data = await redis.get(token_key)
+    if not raw_data:
+        log_security_event(
+            "PASSWORD_RESET_CONFIRM_FAILED",
+            "FAILURE",
+            client_ip=client_ip,
+            details={"reason": "Invalid or expired reset token"},
+        )
+        raise AuthenticationException(
+            "Password reset token is invalid or has expired",
+            error_code="RESET_TOKEN_INVALID",
+        )
+
+    # Atomically delete the token so it cannot be reused
+    await redis.delete(token_key)
+
+    token_payload = json.loads(raw_data)
+    user_id = UUID(token_payload["user_id"])
+
+    stmt = select(User).where(User.id == user_id).with_for_update()
+    user = (await db.execute(stmt)).scalar_one_or_none()
+    if not user or not user.is_active:
+        log_security_event(
+            "PASSWORD_RESET_CONFIRM_FAILED",
+            "FAILURE",
+            actor_id=user_id,
+            client_ip=client_ip,
+            details={"reason": "User inactive or deleted"},
+        )
+        raise AuthenticationException(
+            "User account not found or inactive", error_code="ACCOUNT_INACTIVE"
+        )
+
+    # Update password with Argon2id
+    user.password_hash = hash_password(new_password, settings=settings)
+    user.token_version += 1
+    user.force_authoritative_check = True
+
+    # Revoke all existing sessions in PostgreSQL
+    session_stmt = (
+        select(UserSession)
+        .where(UserSession.user_id == user.id, UserSession.is_revoked.is_(False))
+        .with_for_update()
+    )
+    active_sessions = (await db.execute(session_stmt)).scalars().all()
+    for s in active_sessions:
+        s.is_revoked = True
+
+    # Record transactional outbox event
+    outbox_entry = AuthRevocationOutbox(
+        id=generate_uuid7(),
+        event_type="PASSWORD_RESET_COMPLETED",
+        entity_type="USER",
+        entity_id=user.id,
+        user_id=user.id,
+        organization_id=None,
+        new_version=user.token_version,
+        payload={"reason": "password_reset_confirmation"},
+    )
+    db.add(outbox_entry)
+    await db.commit()
+
+    # Monotonic Redis session purge
+    await delete_all_user_sessions_monotonic(redis, user.id, user.token_version)
+
+    log_security_event(
+        "PASSWORD_RESET_COMPLETED",
+        "SUCCESS",
+        actor_id=user.id,
+        client_ip=client_ip,
+        details={"email": user.email},
+    )
+
+    return True

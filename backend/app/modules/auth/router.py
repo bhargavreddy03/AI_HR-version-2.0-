@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Cookie, Depends, Request, Response, status
@@ -36,6 +37,8 @@ from app.modules.auth.schemas import (
     MfaEnrollResponse,
     MfaVerifyRequest,
     PasswordChangeRequest,
+    PasswordResetConfirmRequest,
+    PasswordResetRequest,
     RefreshResponse,
     RegisterRequest,
     SwitchOrganizationRequest,
@@ -44,12 +47,14 @@ from app.modules.auth.schemas import (
 from app.modules.auth.service import (
     authenticate_user,
     change_password,
+    confirm_password_reset,
     disable_mfa,
     enroll_mfa,
     logout_all_sessions,
     logout_session,
     refresh_session_tokens,
     register_user,
+    request_password_reset,
     switch_organization,
     verify_mfa_challenge,
     verify_mfa_enrollment,
@@ -451,3 +456,64 @@ async def password_change(
         settings=settings,
     )
     return {"message": "Password changed successfully"}
+
+
+@router.post(
+    "/password/reset-request",
+    status_code=status.HTTP_200_OK,
+    summary="Request a password reset link (enumeration-safe)",
+)
+async def password_reset_request(
+    req: PasswordResetRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    redis: RedisClient = Depends(get_app_redis),
+    settings: Settings = Depends(get_app_settings),
+) -> dict[str, Any]:
+    """Initiate password recovery.
+
+    Returns a generic message to prevent account enumeration regardless of whether
+    the email address exists. In non-production testing, optionally provides the token.
+    """
+    client_ip = request.client.host if request.client else None
+    token = await request_password_reset(
+        db=db,
+        redis=redis,
+        email=req.email,
+        client_ip=client_ip,
+        settings=settings,
+    )
+    resp: dict[str, Any] = {
+        "message": "If the provided email is registered, password reset instructions have been sent."
+    }
+    # In development/testing environments only, expose token to facilitate automated tests
+    if settings.ENVIRONMENT != "production" and token:
+        resp["reset_token"] = token
+    return resp
+
+
+@router.post(
+    "/password/reset-confirm",
+    status_code=status.HTTP_200_OK,
+    summary="Confirm password reset with single-use token",
+)
+async def password_reset_confirm(
+    req: PasswordResetConfirmRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    redis: RedisClient = Depends(get_app_redis),
+    settings: Settings = Depends(get_app_settings),
+) -> dict[str, str]:
+    """Complete password reset using a single-use token, advance token version, and invalidate all sessions."""
+    client_ip = request.client.host if request.client else None
+    await confirm_password_reset(
+        db=db,
+        redis=redis,
+        token=req.token,
+        new_password=req.new_password,
+        client_ip=client_ip,
+        settings=settings,
+    )
+    return {
+        "message": "Password has been reset successfully. Please log in with your new password."
+    }
