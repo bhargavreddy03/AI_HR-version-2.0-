@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
@@ -908,16 +909,56 @@ async def test_search_similar_candidate_documents_rejects_booleans_in_vector() -
         )
 
 
-def test_get_engine_disposes_previous_engine_on_url_change() -> None:
-    """Verify that get_engine asynchronously disposes the old engine's pool when the connection URL changes."""
+@pytest.mark.asyncio
+async def test_get_engine_disposes_previous_engine_on_url_change() -> None:
+    """Verify that get_engine asynchronously disposes old engine and does not affect another app instance."""
+    from app.core import database as db_mod
+    from app.core.database import create_session_factory
+    from app.main import create_application
+
+    # Reset any cached global engine from prior tests in the test session
+    db_mod._engine = None
+    db_mod._session_factory = None
+
+    # 1. Initialize first global engine
     s1 = Settings(DATABASE_URL="postgresql+asyncpg://user:pass@localhost:5432/db1")
     engine1 = get_engine(s1)
+    assert engine1.url.database == "db1"
 
-    with patch.object(AsyncEngine, "dispose") as mock_dispose:
+    # 2. Setup a separate application instance with its own isolated engine
+    app_settings = Settings(
+        APP_NAME="Isolated Tenant App",
+        DATABASE_URL="postgresql+asyncpg://tenant_user:pass@localhost:5432/tenant_db",
+    )
+    app = create_application(app_settings)
+    app_engine = create_db_engine(app_settings)
+    app.state.engine = app_engine
+    app.state.session_factory = create_session_factory(app_engine)
+
+    # 3. Patch dispose specifically when changing global configuration to replace engine1
+    mock_dispose = AsyncMock()
+    with patch.object(AsyncEngine, "dispose", mock_dispose):
         s2 = Settings(DATABASE_URL="postgresql+asyncpg://user:pass@localhost:5432/db2")
         engine2 = get_engine(s2)
-        assert engine1 is not engine2
-        mock_dispose.assert_called_once()
+
+        # Verify new working engine is created with updated configuration
+        assert engine2 is not engine1
+        assert engine2.url.database == "db2"
+        factory2 = get_session_factory(engine2)
+        assert factory2.kw.get("bind") == engine2
+
+        # Yield execution to event loop to allow asynchronous disposal task to execute
+        await asyncio.sleep(0.01)
+
+        # Verify that dispose() was actually awaited on the discarded engine
+        mock_dispose.assert_awaited_once()
+
+    # 4. Verify that replacing the global engine did NOT affect the isolated application instance
+    assert app.state.engine is app_engine
+    assert app.state.engine.url.database == "tenant_db"
+    assert app.state.session_factory.kw.get("bind") is app_engine
+    assert app.state.engine is not engine1
+    assert app.state.engine is not engine2
 
 
 def test_init_db_sh_rejects_role_collisions() -> None:

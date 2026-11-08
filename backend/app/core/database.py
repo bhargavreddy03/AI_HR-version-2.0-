@@ -82,6 +82,9 @@ def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSessi
     )
 
 
+_pending_engine_disposal_tasks: set[asyncio.Task[None]] = set()
+
+
 async def _async_dispose_engine(engine: AsyncEngine) -> None:
     """Asynchronously and safely close an AsyncEngine connection pool."""
     try:
@@ -90,20 +93,25 @@ async def _async_dispose_engine(engine: AsyncEngine) -> None:
         logger.warning("Error asynchronously disposing engine pool: %s", exc)
 
 
-def _schedule_engine_disposal(engine: AsyncEngine) -> None:
+def _schedule_engine_disposal(engine: AsyncEngine) -> asyncio.Task[None] | None:
     """Schedule asynchronous disposal of an engine without blocking active users or instances."""
     try:
         loop = asyncio.get_running_loop()
         if loop.is_running():
-            loop.create_task(_async_dispose_engine(engine))
+            task = loop.create_task(_async_dispose_engine(engine))
+            _pending_engine_disposal_tasks.add(task)
+            task.add_done_callback(_pending_engine_disposal_tasks.discard)
+            return task
         else:
             loop.run_until_complete(_async_dispose_engine(engine))
+            return None
     except RuntimeError:
         # No running event loop in the current thread (e.g. sync CLI or startup)
         try:
             asyncio.run(_async_dispose_engine(engine))
         except Exception as exc:
             logger.warning("Error disposing engine pool: %s", exc)
+        return None
 
 
 def get_engine(settings: Settings | None = None) -> AsyncEngine:
