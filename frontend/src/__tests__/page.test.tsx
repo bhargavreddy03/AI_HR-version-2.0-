@@ -6,13 +6,12 @@ describe("HomePage Component", () => {
   it("renders platform heading and architecture overview", () => {
     render(<HomePage />);
 
-    expect(
-      screen.getByRole("heading", { level: 1, name: /AI HR Intelligence Platform/i })
-    ).toBeInTheDocument();
+    const heading = screen.getByRole("heading", { level: 1, name: /AI HR Intelligence Platform/i });
+    expect(heading).toBeDefined();
 
-    expect(screen.getByText(/Frontend Core:/i)).toBeInTheDocument();
-    expect(screen.getByText(/Backend API:/i)).toBeInTheDocument();
-    expect(screen.getByText(/Task Processing:/i)).toBeInTheDocument();
-    expect(screen.getByText(/Database & Vector:/i)).toBeInTheDocument();
+    expect(screen.getByText(/Frontend Core:/i)).toBeDefined();
+    expect(screen.getByText(/Backend API:/i)).toBeDefined();
+    expect(screen.getByText(/Task Processing:/i)).toBeDefined();
+    expect(screen.getByText(/Database & Vector:/i)).toBeDefined();
   });
 });

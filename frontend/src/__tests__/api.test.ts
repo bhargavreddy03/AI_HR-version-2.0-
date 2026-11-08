@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getApiBaseUrl } from "@/lib/api";
 
 describe("getApiBaseUrl discovery", () => {
@@ -10,24 +10,21 @@ describe("getApiBaseUrl discovery", () => {
 
   afterEach(() => {
     process.env = originalEnv;
+    vi.unstubAllGlobals();
   });
 
   it("returns INTERNAL_API_URL or default in server environment (window undefined)", () => {
-    const originalWindow = global.window;
-    // @ts-expect-error simulating server environment
-    delete global.window;
+    vi.stubGlobal("window", undefined);
 
     delete process.env.INTERNAL_API_URL;
     expect(getApiBaseUrl()).toBe("http://backend:8000/api/v1");
 
     process.env.INTERNAL_API_URL = "http://custom-internal-host:8000/api/v1";
     expect(getApiBaseUrl()).toBe("http://custom-internal-host:8000/api/v1");
-
-    global.window = originalWindow;
   });
 
   it("returns NEXT_PUBLIC_API_URL or default in browser environment (window defined)", () => {
-    // In happy-dom window is defined
+    vi.stubGlobal("window", {});
     delete process.env.NEXT_PUBLIC_API_URL;
     expect(getApiBaseUrl()).toBe("http://localhost:8000/api/v1");
 
