@@ -13,7 +13,6 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import AuthorizationException
-from app.modules.organizations.models import OrganizationMembership, Role
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +112,8 @@ async def validate_sole_admin_protection(
     Raises:
         AuthorizationException: If target_user_id is the sole active admin and is being deactivated or demoted.
     """
+    from app.modules.organizations.models import OrganizationMembership, Role
+
     # Count active org_admin memberships for this tenant
     stmt = (
         select(func.count(OrganizationMembership.id))
