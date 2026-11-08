@@ -16,12 +16,12 @@ jobs:
         image: pgvector/pgvector:pg16
         env:
           POSTGRES_DB: ai_hr_db_test
-          POSTGRES_USER: aihr_app_user
-          POSTGRES_PASSWORD: test_password_only
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: test_super_password_only
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U postgres -d ai_hr_db_test"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -62,14 +62,23 @@ jobs:
           cd backend
           mypy app/
 
+      - name: Initialize PostgreSQL Roles and Extensions
+        env:
+          PGPASSWORD: test_super_password_only
+        run: |
+          psql -h localhost -U postgres -d ai_hr_db_test -f infrastructure/scripts/init-db.sql
+
       - name: Run Pytest Test Suite
         env:
           ENVIRONMENT: testing
           POSTGRES_DB: ai_hr_db_test
           POSTGRES_USER: aihr_app_user
-          POSTGRES_PASSWORD: test_password_only
-          DATABASE_URL: postgresql+asyncpg://aihr_app_user:test_password_only@localhost:5432/ai_hr_db_test
-          DATABASE_SYNC_URL: postgresql://aihr_app_user:test_password_only@localhost:5432/ai_hr_db_test
+          POSTGRES_PASSWORD: local_development_password_only
+          POSTGRES_MIGRATION_USER: aihr_migration_user
+          POSTGRES_MIGRATION_PASSWORD: local_development_migration_password_only
+          DATABASE_URL: postgresql+asyncpg://aihr_app_user:local_development_password_only@localhost:5432/ai_hr_db_test
+          DATABASE_MIGRATION_URL: postgresql+asyncpg://aihr_migration_user:local_development_migration_password_only@localhost:5432/ai_hr_db_test
+          DATABASE_SYNC_URL: postgresql://aihr_migration_user:local_development_migration_password_only@localhost:5432/ai_hr_db_test
         run: |
           cd backend
           pytest -v --cov=app --cov-report=term-missing

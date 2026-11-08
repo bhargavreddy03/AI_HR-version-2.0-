@@ -225,3 +225,26 @@ def test_production_settings_accept_consistent_secure_credentials() -> None:
     assert settings.ENVIRONMENT == "production"
     assert settings.COOKIE_SECURE is True
     assert settings.POSTGRES_PASSWORD == secure_pass
+
+
+def test_production_settings_migration_role_validation() -> None:
+    """Verify that when separate migration credentials are provided in production, they are strictly validated."""
+    secure_pass = "a_very_secure_runtime_password_123456!"
+    secure_mig_pass = "a_very_secure_migration_password_654321!"
+    settings = Settings(
+        ENVIRONMENT="production",
+        JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
+        MFA_ENCRYPTION_KEY="production_ultra_secure_mfa_encryption_key_32_bytes_long!",
+        BACKUP_CODE_PEPPER="production_ultra_secure_backup_pepper_32_bytes_long!",
+        POSTGRES_USER="aihr_app_user",
+        POSTGRES_PASSWORD=secure_pass,
+        POSTGRES_MIGRATION_USER="aihr_migration_user",
+        POSTGRES_MIGRATION_PASSWORD=secure_mig_pass,
+        DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+        DATABASE_MIGRATION_URL=f"postgresql+asyncpg://aihr_migration_user:{secure_mig_pass}@localhost:5432/ai_hr_db",
+        DATABASE_SYNC_URL=f"postgresql://aihr_migration_user:{secure_mig_pass}@localhost:5432/ai_hr_db",
+        COOKIE_SECURE=True,
+    )
+    assert settings.POSTGRES_USER == "aihr_app_user"
+    assert settings.POSTGRES_MIGRATION_USER == "aihr_migration_user"
+    assert settings.DATABASE_MIGRATION_URL is not None

@@ -10,15 +10,15 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-ai_hr_db}
-      POSTGRES_USER: ${POSTGRES_USER:-aihr_app_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_development_password_only}
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-local_development_super_password_only}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ../scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aihr_app_user} -d ${POSTGRES_DB:-ai_hr_db}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-postgres} -d ${POSTGRES_DB:-ai_hr_db}"]
       interval: 10s
       timeout: 5s
       retries: 5

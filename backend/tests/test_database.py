@@ -39,6 +39,7 @@ from app.modules.embeddings.service import (
     DeprecatedEmbeddingModelException,
     EmbeddingModelNotFoundException,
     InvalidEmbeddingDimensionException,
+    InvalidSearchParameterException,
     search_similar_candidate_documents,
     store_candidate_document_embedding,
     store_job_embedding,
@@ -397,14 +398,188 @@ async def test_store_job_embedding_validation() -> None:
         )
 
 
+def test_embedding_model_registry_exact_canonical_contents() -> None:
+    """Assert that the embedding model registry matches the canonical approved specifications."""
+    assert len(APPROVED_MODELS) == 4
+    expected = {
+        ("text-embedding-3-small", "openai", 1536, True),
+        ("amazon.titan-embed-text-v1", "aws_bedrock", 1536, True),
+        ("cohere.embed-english-v3", "aws_bedrock", 1024, True),
+        ("bge-base-en-v1.5", "huggingface", 768, True),
+    }
+    actual = {
+        (
+            m["model_identifier"],
+            m["provider"],
+            m["expected_dimensions"],
+            m["is_active"],
+        )
+        for m in APPROVED_MODELS
+    }
+    assert actual == expected
+
+
 @pytest.mark.asyncio
 async def test_search_similar_candidate_documents_rejects_unsupported_dimensions() -> None:
-    """Verify search_similar_candidate_documents validates query vector dimensions."""
+    """Verify search_similar_candidate_documents validates query vector dimensions against registered model."""
     mock_session = AsyncMock(spec=AsyncSession)
+    mock_model = EmbeddingModel(
+        model_identifier="text-embedding-3-small",
+        provider="openai",
+        expected_dimensions=1536,
+        is_active=True,
+    )
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = mock_model
+    mock_session.execute.return_value = mock_result
+
     with pytest.raises(InvalidEmbeddingDimensionException):
         await search_similar_candidate_documents(
             session=mock_session,
             tenant_id=utc_now(),
             query_vector=[0.1] * 500,  # invalid dimension
             model_identifier="text-embedding-3-small",
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_similar_candidate_documents_rejects_empty_query_vector() -> None:
+    """Verify search_similar_candidate_documents rejects empty query vectors."""
+    mock_session = AsyncMock(spec=AsyncSession)
+    with pytest.raises(InvalidSearchParameterException, match="cannot be empty"):
+        await search_similar_candidate_documents(
+            session=mock_session,
+            tenant_id=utc_now(),
+            query_vector=[],
+            model_identifier="text-embedding-3-small",
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_similar_candidate_documents_rejects_nan_and_inf_values() -> None:
+    """Verify search_similar_candidate_documents rejects NaN, +Inf, and -Inf values."""
+    mock_session = AsyncMock(spec=AsyncSession)
+
+    # NaN test
+    nan_vec = [0.1] * 1535 + [float("nan")]
+    with pytest.raises(InvalidSearchParameterException, match="invalid non-finite value"):
+        await search_similar_candidate_documents(
+            session=mock_session,
+            tenant_id=utc_now(),
+            query_vector=nan_vec,
+            model_identifier="text-embedding-3-small",
+        )
+
+    # Inf test
+    inf_vec = [0.1] * 1535 + [float("inf")]
+    with pytest.raises(InvalidSearchParameterException, match="invalid non-finite value"):
+        await search_similar_candidate_documents(
+            session=mock_session,
+            tenant_id=utc_now(),
+            query_vector=inf_vec,
+            model_identifier="text-embedding-3-small",
+        )
+
+    # -Inf test
+    ninf_vec = [float("-inf")] + [0.1] * 1535
+    with pytest.raises(InvalidSearchParameterException, match="invalid non-finite value"):
+        await search_similar_candidate_documents(
+            session=mock_session,
+            tenant_id=utc_now(),
+            query_vector=ninf_vec,
+            model_identifier="text-embedding-3-small",
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_similar_candidate_documents_rejects_invalid_limits() -> None:
+    """Verify search_similar_candidate_documents validates positive bounded integer limits."""
+    mock_session = AsyncMock(spec=AsyncSession)
+
+    # Limit = 0
+    with pytest.raises(
+        InvalidSearchParameterException, match="Search limit must be a positive integer"
+    ):
+        await search_similar_candidate_documents(
+            session=mock_session,
+            tenant_id=utc_now(),
+            query_vector=[0.1] * 1536,
+            model_identifier="text-embedding-3-small",
+            limit=0,
+        )
+
+    # Limit < 0
+    with pytest.raises(
+        InvalidSearchParameterException, match="Search limit must be a positive integer"
+    ):
+        await search_similar_candidate_documents(
+            session=mock_session,
+            tenant_id=utc_now(),
+            query_vector=[0.1] * 1536,
+            model_identifier="text-embedding-3-small",
+            limit=-5,
+        )
+
+    # Limit > 100
+    with pytest.raises(
+        InvalidSearchParameterException, match="Search limit must be a positive integer"
+    ):
+        await search_similar_candidate_documents(
+            session=mock_session,
+            tenant_id=utc_now(),
+            query_vector=[0.1] * 1536,
+            model_identifier="text-embedding-3-small",
+            limit=101,
+        )
+
+    # Boolean limit
+    with pytest.raises(
+        InvalidSearchParameterException, match="Search limit must be a positive integer"
+    ):
+        await search_similar_candidate_documents(
+            session=mock_session,
+            tenant_id=utc_now(),
+            query_vector=[0.1] * 1536,
+            model_identifier="text-embedding-3-small",
+            limit=True,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_similar_candidate_documents_rejects_unregistered_model() -> None:
+    """Verify search_similar_candidate_documents rejects unregistered models."""
+    mock_session = AsyncMock(spec=AsyncSession)
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = None
+    mock_session.execute.return_value = mock_result
+
+    with pytest.raises(EmbeddingModelNotFoundException):
+        await search_similar_candidate_documents(
+            session=mock_session,
+            tenant_id=utc_now(),
+            query_vector=[0.1] * 1536,
+            model_identifier="unknown-model-identifier",
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_similar_candidate_documents_rejects_inactive_model() -> None:
+    """Verify search_similar_candidate_documents rejects inactive models."""
+    mock_session = AsyncMock(spec=AsyncSession)
+    mock_model = EmbeddingModel(
+        model_identifier="deprecated-model",
+        provider="openai",
+        expected_dimensions=1536,
+        is_active=False,
+    )
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = mock_model
+    mock_session.execute.return_value = mock_result
+
+    with pytest.raises(DeprecatedEmbeddingModelException):
+        await search_similar_candidate_documents(
+            session=mock_session,
+            tenant_id=utc_now(),
+            query_vector=[0.1] * 1536,
+            model_identifier="deprecated-model",
         )

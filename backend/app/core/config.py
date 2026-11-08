@@ -53,14 +53,32 @@ class Settings(BaseSettings):
     POSTGRES_HOST: str = Field(default="localhost", description="PostgreSQL host")
     POSTGRES_PORT: int = Field(default=5432, description="PostgreSQL port")
     POSTGRES_DB: str = Field(default="ai_hr_db", description="Database name")
-    POSTGRES_USER: str = Field(default="aihr_app_user", description="Database application user")
+    POSTGRES_USER: str = Field(
+        default="aihr_app_user",
+        description="Database application runtime user (restricted, NOSUPERUSER, NOBYPASSRLS)",
+    )
     POSTGRES_PASSWORD: str = Field(
-        default="local_development_password_only", description="Database password"
+        default="local_development_password_only",
+        description="Database application runtime password",
+    )
+
+    # Privileged Migration / Table Owner Role
+    POSTGRES_MIGRATION_USER: str = Field(
+        default="aihr_migration_user",
+        description="Database migration role (table/schema owner)",
+    )
+    POSTGRES_MIGRATION_PASSWORD: str = Field(
+        default="",
+        description="Database migration password",
     )
 
     DATABASE_URL: str = Field(
         default="postgresql+asyncpg://aihr_app_user:local_development_password_only@localhost:5432/ai_hr_db",
-        description="Asynchronous database connection URI",
+        description="Asynchronous database runtime connection URI (restricted role)",
+    )
+    DATABASE_MIGRATION_URL: str = Field(
+        default="",
+        description="Asynchronous database migration URI (privileged schema owner)",
     )
     DATABASE_SYNC_URL: str = Field(
         default="postgresql://aihr_app_user:local_development_password_only@localhost:5432/ai_hr_db",
@@ -207,7 +225,7 @@ class Settings(BaseSettings):
                     "Database credential mismatch: DATABASE_URL username does not match POSTGRES_USER"
                 )
 
-            # 4. DATABASE_SYNC_URL Validation (Synchronous URI for Alembic)
+            # 4. DATABASE_SYNC_URL & Migration Credentials Validation
             try:
                 sync_url = make_url(self.DATABASE_SYNC_URL)
             except Exception as exc:
@@ -222,18 +240,51 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "Insecure default or development password detected in DATABASE_SYNC_URL for production/staging"
                 )
-            if sync_password != self.POSTGRES_PASSWORD:
+
+            # Validate sync_url against migration role if configured, otherwise runtime role
+            if self.POSTGRES_MIGRATION_USER and sync_url.username == self.POSTGRES_MIGRATION_USER:
+                if (
+                    self.POSTGRES_MIGRATION_PASSWORD
+                    and sync_password != self.POSTGRES_MIGRATION_PASSWORD
+                ):
+                    raise ValueError(
+                        "Database credential mismatch: DATABASE_SYNC_URL password does not match POSTGRES_MIGRATION_PASSWORD"
+                    )
+            elif sync_url.username == self.POSTGRES_USER:
+                if sync_password != self.POSTGRES_PASSWORD:
+                    raise ValueError(
+                        "Database credential mismatch: DATABASE_SYNC_URL password does not match POSTGRES_PASSWORD"
+                    )
+            elif self.POSTGRES_USER and sync_url.username != self.POSTGRES_USER:
                 raise ValueError(
-                    "Database credential mismatch: DATABASE_SYNC_URL password does not match POSTGRES_PASSWORD"
+                    f"Database credential mismatch: DATABASE_SYNC_URL username does not match POSTGRES_USER ({self.POSTGRES_USER})"
                 )
-            if sync_password != db_password:
-                raise ValueError(
-                    "Database credential mismatch: DATABASE_URL and DATABASE_SYNC_URL passwords do not match"
-                )
-            if self.POSTGRES_USER and sync_url.username != self.POSTGRES_USER:
-                raise ValueError(
-                    "Database credential mismatch: DATABASE_SYNC_URL username does not match POSTGRES_USER"
-                )
+
+            # Validate DATABASE_MIGRATION_URL if set
+            if self.DATABASE_MIGRATION_URL:
+                try:
+                    mig_url = make_url(self.DATABASE_MIGRATION_URL)
+                except Exception as exc:
+                    raise ValueError(
+                        f"Invalid DATABASE_MIGRATION_URL configuration: {exc}"
+                    ) from exc
+
+                mig_password = mig_url.password or ""
+                if (
+                    not mig_password
+                    or mig_password in INSECURE_PASSWORDS
+                    or "local_development" in mig_password
+                ):
+                    raise ValueError(
+                        "Insecure default or development password detected in DATABASE_MIGRATION_URL for production/staging"
+                    )
+                if (
+                    self.POSTGRES_MIGRATION_USER
+                    and mig_url.username != self.POSTGRES_MIGRATION_USER
+                ):
+                    raise ValueError(
+                        f"Database credential mismatch: DATABASE_MIGRATION_URL username does not match POSTGRES_MIGRATION_USER ({self.POSTGRES_MIGRATION_USER})"
+                    )
 
             # 5. Cookie Security
             if not self.COOKIE_SECURE:

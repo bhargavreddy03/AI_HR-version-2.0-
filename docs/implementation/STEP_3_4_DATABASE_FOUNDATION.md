@@ -74,7 +74,23 @@ Two primary patterns manage transaction boundaries:
 
 ## 4. Multi-Tenant Database Isolation & PostgreSQL RLS
 
-### 4.1 Two-Tier Row-Level Security (RLS) Policy Model
+### 4.1 PostgreSQL Role Partitioning & Privilege Separation
+In strict conformance with Architecture Document 04 Section 1:
+- **`postgres` (Bootstrap / Cloud DBA Superuser)**:
+  - Used exclusively during container creation (`init-db.sql`) to install extensions and bootstrap roles.
+  - Never used by the application runtime or CI tests.
+- **`aihr_migration_user` (Privileged Migration / Schema Owner Role)**:
+  - Created with `NOSUPERUSER`, `NOBYPASSRLS`, `CREATEDB`.
+  - Owns schema `public` and all tenant-scoped tables (`candidate_document_embeddings`, `job_embeddings`, `organization_memberships`, etc.).
+  - Used strictly by Alembic for DDL migrations (`DATABASE_MIGRATION_URL` / `DATABASE_SYNC_URL`).
+- **`aihr_app_user` (Restricted Application Runtime Role)**:
+  - Created with `NOSUPERUSER`, `NOBYPASSRLS`, `NOCREATEDB`, `NOCREATEROLE`.
+  - Does **NOT** own any tenant-scoped tables, ensuring table-owner RLS bypass is impossible.
+  - Granted restricted DML permissions (`SELECT`, `INSERT`, `UPDATE`, `DELETE`) via `ALTER DEFAULT PRIVILEGES`.
+  - Used by the FastAPI runtime and Celery background workers (`DATABASE_URL`).
+  - Fully subject to PostgreSQL Row-Level Security at all times.
+
+### 4.2 Two-Tier Row-Level Security (RLS) Policy Model
 Conforming to Architecture Document 04 Section 2, all tenant-scoped tables implement:
 1. `ALTER TABLE <table_name> ENABLE ROW LEVEL SECURITY;`
 2. `ALTER TABLE <table_name> FORCE ROW LEVEL SECURITY;`
@@ -191,7 +207,7 @@ The database test suite covers all categories specified in the requirements:
 18. `test_store_job_embedding_validation`: Validates vector dimensions for job embeddings.
 19. `test_search_similar_candidate_documents_rejects_unsupported_dimensions`: Rejects invalid query dimensions.
 
-### Integration Tests (`backend/tests/integration/test_postgres_lifecycle.py`) — 17 Tests
+### Integration Tests (`backend/tests/integration/test_postgres_lifecycle.py`) — 21 Tests
 1. `test_postgres_connection_and_session_lifecycle`: Live connectivity and query execution.
 2. `test_postgres_commit_and_rollback_behavior`: Transaction rollback discards uncommitted mutations.
 3. `test_postgres_transaction_local_tenant_context`: Parameterized `set_config` transaction scoping.
@@ -207,8 +223,12 @@ The database test suite covers all categories specified in the requirements:
 13. `test_postgres_pgvector_extension_and_model_registry`: Extension verification and model registry seeding.
 14. `test_postgres_vector_dimension_check_constraints_and_foreign_keys`: Check constraints and composite FK enforcement.
 15. `test_postgres_vector_insertion_and_cosine_similarity_search`: High-dimensional vector insert and cosine search.
-16. `test_postgres_vector_tenant_isolation_under_rls`: Cross-tenant vector isolation under PostgreSQL RLS (includes automatic non-superuser role delegation via `SET LOCAL ROLE aihr_test_rls_user` when executing under containerized PostgreSQL superuser roles, ensuring truthful RLS policy evaluation in both local and CI environments).
-17. `test_postgres_hnsw_indexes_exist_and_downgrade_upgrade_lifecycle`: HNSW index validation and reversible migrations.
+16. `test_postgres_runtime_role_and_privileges_verification`: Verifies runtime role has `NOSUPERUSER`, `NOBYPASSRLS`, and does not own tenant tables.
+17. `test_postgres_vector_tenant_isolation_under_rls`: Cross-tenant vector isolation under PostgreSQL RLS connecting directly via application runtime credentials without test role workarounds.
+18. `test_postgres_embedding_model_registry_exact_seeded_contents`: Verifies live database contains exact 4 canonical models from architecture specification.
+19. `test_postgres_vector_similarity_search_hardened_validation_integration`: Verifies live database rejection of invalid limits, empty/NaN vectors, missing/inactive models, and dimension mismatches.
+20. `test_postgres_hnsw_indexes_exist_and_downgrade_upgrade_lifecycle`: HNSW index validation and reversible migrations.
+21. `test_postgres_vector_downgrade_preserves_external_dependent_objects_and_extension`: Verifies safe non-cascading downgrade preserving extension and external vector objects.
 
 ---
 

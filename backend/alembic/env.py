@@ -38,7 +38,12 @@ target_metadata = Base.metadata
 # Inject active database URL from config or Pydantic Settings fallback
 if not config.get_main_option("sqlalchemy.url"):
     settings = get_settings()
-    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+    migration_url = (
+        getattr(settings, "DATABASE_MIGRATION_URL", None)
+        or getattr(settings, "DATABASE_SYNC_URL", None)
+        or settings.DATABASE_URL
+    )
+    config.set_main_option("sqlalchemy.url", migration_url)
 
 
 def run_migrations_offline() -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from uuid import UUID
 
 from sqlalchemy import select
@@ -51,6 +52,33 @@ class EmbeddingModelNotFoundException(AppException):
         )
 
 
+class InvalidSearchParameterException(AppException):
+    """Raised when search parameters (limit, vector values) are malformed or invalid."""
+
+    def __init__(self, message: str = "Invalid search parameters provided") -> None:
+        super().__init__(
+            message=message,
+            status_code=400,
+            code="INVALID_SEARCH_PARAMETER",
+        )
+
+
+def _validate_vector_elements(vector: list[float], field_name: str = "Vector") -> None:
+    """Validate that vector contains only finite numeric values (no NaN, Inf, or non-numeric types)."""
+    if not vector:
+        raise InvalidSearchParameterException(f"{field_name} cannot be empty")
+    for i, val in enumerate(vector):
+        if (
+            not isinstance(val, int | float)
+            or isinstance(val, bool)
+            or math.isnan(val)
+            or math.isinf(val)
+        ):
+            raise InvalidSearchParameterException(
+                f"{field_name} contains invalid non-finite value at index {i}: {val}"
+            )
+
+
 async def get_embedding_model(
     session: AsyncSession,
     model_identifier: str,
@@ -78,9 +106,12 @@ async def store_candidate_document_embedding(
 
     Validates that:
     1. The model is registered and active.
-    2. The vector length strictly matches expected_dimensions.
-    3. Populates exactly the matching typed vector column (1536, 1024, or 768).
+    2. The vector values are finite numeric floats.
+    3. The vector length strictly matches expected_dimensions.
+    4. Populates exactly the matching typed vector column (1536, 1024, or 768).
     """
+    _validate_vector_elements(embedding, field_name="Embedding vector")
+
     model = await get_embedding_model(session, model_identifier)
     if not model.is_active:
         raise DeprecatedEmbeddingModelException(
@@ -121,6 +152,8 @@ async def store_job_embedding(
     embedding: list[float],
 ) -> JobEmbedding:
     """Store a tenant-scoped job embedding with model dimension verification."""
+    _validate_vector_elements(embedding, field_name="Embedding vector")
+
     model = await get_embedding_model(session, model_identifier)
     if not model.is_active:
         raise DeprecatedEmbeddingModelException(
@@ -161,11 +194,39 @@ async def search_similar_candidate_documents(
 ) -> list[tuple[CandidateDocumentEmbedding, float]]:
     """Execute tenant-scoped cosine similarity search across candidate document vectors.
 
+    Validates:
+    1. limit is a sensible positive bounded integer (1 <= limit <= 100).
+    2. query_vector is non-empty and contains only finite numeric floats.
+    3. model is registered in embedding_models and is active.
+    4. query_vector length strictly matches the registered model's expected_dimensions.
+    5. Tenant isolation is preserved via tenant_id filter and PostgreSQL RLS.
+
     Uses pgvector's cosine distance operator (<=>).
     Returns list of (CandidateDocumentEmbedding, cosine_similarity) tuples sorted by highest similarity.
     Cosine similarity = 1 - cosine_distance.
     """
+    # 1. Validate limit parameter
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 100:
+        raise InvalidSearchParameterException(
+            f"Search limit must be a positive integer between 1 and 100, received: {limit}"
+        )
+
+    # 2. Validate query vector elements
+    _validate_vector_elements(query_vector, field_name="Query vector")
+
+    # 3. Retrieve model from registry & verify active
+    model = await get_embedding_model(session, model_identifier)
+    if not model.is_active:
+        raise DeprecatedEmbeddingModelException(
+            f"Embedding model '{model_identifier}' is deprecated or inactive"
+        )
+
+    # 4. Verify dimension match against registered model
     dimensions = len(query_vector)
+    if dimensions != model.expected_dimensions:
+        raise InvalidEmbeddingDimensionException(
+            f"Query vector dimension {dimensions} does not match model '{model_identifier}' expected {model.expected_dimensions}"
+        )
 
     if dimensions == 1536:
         vector_col = CandidateDocumentEmbedding.embedding_1536

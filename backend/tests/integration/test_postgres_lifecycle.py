@@ -53,8 +53,10 @@ from app.modules.embeddings.models import (
     EmbeddingModel,
 )
 from app.modules.embeddings.service import (
+    DeprecatedEmbeddingModelException,
     EmbeddingModelNotFoundException,
     InvalidEmbeddingDimensionException,
+    InvalidSearchParameterException,
     search_similar_candidate_documents,
     store_candidate_document_embedding,
     store_job_embedding,
@@ -122,12 +124,17 @@ def integration_settings() -> Settings:
 
 @pytest.fixture(scope="module", autouse=True)
 def ensure_database_schema(integration_settings: Settings) -> None:
-    """Ensure latest Alembic migrations are applied before running integration tests."""
+    """Ensure latest Alembic migrations are applied using migration credentials before running integration tests."""
     if not POSTGRES_AVAILABLE:
         return
     ini_path = Path(__file__).resolve().parent.parent.parent / "alembic.ini"
     alembic_cfg = Config(str(ini_path))
-    alembic_cfg.set_main_option("sqlalchemy.url", integration_settings.DATABASE_URL)
+    migration_url = (
+        getattr(integration_settings, "DATABASE_MIGRATION_URL", None)
+        or getattr(integration_settings, "DATABASE_SYNC_URL", None)
+        or integration_settings.DATABASE_URL
+    )
+    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
     command.upgrade(alembic_cfg, "head")
 
 
@@ -336,7 +343,12 @@ def test_alembic_upgrade_head_and_revision_state(
     """Verify that Alembic connects to live PostgreSQL without error swallowing, reporting revision state honestly."""
     ini_path = Path(__file__).resolve().parent.parent.parent / "alembic.ini"
     alembic_cfg = Config(str(ini_path))
-    alembic_cfg.set_main_option("sqlalchemy.url", integration_settings.DATABASE_URL)
+    migration_url = (
+        getattr(integration_settings, "DATABASE_MIGRATION_URL", None)
+        or getattr(integration_settings, "DATABASE_SYNC_URL", None)
+        or integration_settings.DATABASE_URL
+    )
+    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
 
     # Inspect script directory for available schema migration revisions
     script = ScriptDirectory.from_config(alembic_cfg)
@@ -1281,10 +1293,57 @@ async def test_postgres_vector_insertion_and_cosine_similarity_search(
 
 @skip_if_no_postgres
 @pytest.mark.asyncio
+async def test_postgres_runtime_role_and_privileges_verification(
+    integration_settings: Settings,
+) -> None:
+    """Verify that runtime connection role has NOSUPERUSER, NOBYPASSRLS, and does not own tenant tables."""
+    engine = create_db_engine(integration_settings)
+    session_factory = create_session_factory(engine)
+
+    try:
+        async with session_factory() as session:
+            # 1. Verify connected session role is the restricted application user
+            user_res = await session.execute(text("SELECT current_user;"))
+            current_role = user_res.scalar()
+            assert current_role == integration_settings.POSTGRES_USER
+
+            # 2. Verify role attributes: strictly NOSUPERUSER, NOBYPASSRLS
+            role_attr_res = await session.execute(
+                text(
+                    "SELECT rolsuper, rolbypassrls, rolcreatedb "
+                    "FROM pg_roles WHERE rolname = current_user;"
+                )
+            )
+            role_attrs = role_attr_res.one()
+            assert role_attrs[0] is False, "Runtime role must have NOSUPERUSER"
+            assert role_attrs[1] is False, "Runtime role must have NOBYPASSRLS"
+
+            # 3. Verify runtime role does NOT own tenant-scoped tables
+            owner_res = await session.execute(
+                text(
+                    "SELECT tablename, tableowner FROM pg_tables "
+                    "WHERE tablename IN ('candidate_document_embeddings', 'job_embeddings', 'organization_memberships');"
+                )
+            )
+            owners = owner_res.all()
+            assert len(owners) >= 3
+            for tbl, owner in owners:
+                assert (
+                    owner != current_role
+                ), f"Security violation: table {tbl} is owned by runtime role {current_role}"
+    finally:
+        await engine.dispose()
+
+
+@skip_if_no_postgres
+@pytest.mark.asyncio
 async def test_postgres_vector_tenant_isolation_under_rls(
     integration_settings: Settings,
 ) -> None:
-    """Verify that vector embedding queries and similarity searches are strictly isolated per tenant under RLS."""
+    """Verify that vector embedding queries and similarity searches are strictly isolated per tenant under RLS
+
+    using the real application runtime credentials WITHOUT SET ROLE test workarounds.
+    """
     engine = create_db_engine(integration_settings)
     session_factory = create_session_factory(engine)
 
@@ -1293,33 +1352,6 @@ async def test_postgres_vector_tenant_isolation_under_rls(
     doc_a_id = generate_uuid7()
 
     try:
-        # Check if the connection role is a superuser (superusers unconditionally bypass RLS in PostgreSQL)
-        is_super = False
-        async with session_factory() as session:
-            res = await session.execute(
-                text("SELECT rolsuper FROM pg_roles WHERE rolname = current_user;")
-            )
-            is_super = bool(res.scalar())
-            if is_super:
-                await session.execute(
-                    text("""
-                        DO $$
-                        BEGIN
-                            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aihr_test_rls_user') THEN
-                                CREATE ROLE aihr_test_rls_user NOSUPERUSER NOBYPASSRLS INHERIT;
-                            END IF;
-                            GRANT USAGE ON SCHEMA public TO aihr_test_rls_user;
-                            GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO aihr_test_rls_user;
-                            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO aihr_test_rls_user;
-                            GRANT ALL PRIVILEGES ON ALL ROUTINES IN SCHEMA public TO aihr_test_rls_user;
-                            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aihr_app_user') THEN
-                                GRANT aihr_app_user TO aihr_test_rls_user;
-                            END IF;
-                        END $$;
-                    """)
-                )
-                await session.commit()
-
         async with session_factory() as session:
             org_a = Organization(
                 id=tenant_a_id,
@@ -1336,10 +1368,8 @@ async def test_postgres_vector_tenant_isolation_under_rls(
 
         test_vec = [0.1] * 1536
 
-        # Tenant A inserts vector embedding
+        # Tenant A inserts vector embedding under Tenant A context
         async with session_factory() as session:
-            if is_super:
-                await session.execute(text("SET LOCAL ROLE aihr_test_rls_user;"))
             await set_tenant_context(session, tenant_a_id)
             await store_candidate_document_embedding(
                 session=session,
@@ -1353,8 +1383,6 @@ async def test_postgres_vector_tenant_isolation_under_rls(
 
         # Tenant B queries under its tenant context: must return 0 results
         async with session_factory() as session:
-            if is_super:
-                await session.execute(text("SET LOCAL ROLE aihr_test_rls_user;"))
             await set_tenant_context(session, tenant_b_id)
             # Direct query
             res = await session.execute(
@@ -1373,10 +1401,8 @@ async def test_postgres_vector_tenant_isolation_under_rls(
             )
             assert len(b_results) == 0
 
-        # Mismatched context (Tenant B context attempting to insert row with tenant_a_id) is rejected
+        # Mismatched context (Tenant B context attempting to insert row with tenant_a_id) is rejected by RLS
         async with session_factory() as session:
-            if is_super:
-                await session.execute(text("SET LOCAL ROLE aihr_test_rls_user;"))
             await set_tenant_context(session, tenant_b_id)
             with pytest.raises(DBAPIError):
                 cross_tenant_emb = CandidateDocumentEmbedding(
@@ -1395,13 +1421,178 @@ async def test_postgres_vector_tenant_isolation_under_rls(
 
 
 @skip_if_no_postgres
+@pytest.mark.asyncio
+async def test_postgres_embedding_model_registry_exact_seeded_contents(
+    integration_settings: Settings,
+) -> None:
+    """Verify that live PostgreSQL registry contains the exact 4 canonical approved models."""
+    engine = create_db_engine(integration_settings)
+    session_factory = create_session_factory(engine)
+
+    try:
+        async with session_factory() as session:
+            res = await session.execute(
+                select(
+                    EmbeddingModel.model_identifier,
+                    EmbeddingModel.provider,
+                    EmbeddingModel.expected_dimensions,
+                    EmbeddingModel.is_active,
+                ).order_by(EmbeddingModel.model_identifier)
+            )
+            rows = set(res.all())
+            expected = {
+                ("text-embedding-3-small", "openai", 1536, True),
+                ("amazon.titan-embed-text-v1", "aws_bedrock", 1536, True),
+                ("cohere.embed-english-v3", "aws_bedrock", 1024, True),
+                ("bge-base-en-v1.5", "huggingface", 768, True),
+            }
+            assert rows == expected
+    finally:
+        await engine.dispose()
+
+
+@skip_if_no_postgres
+@pytest.mark.asyncio
+async def test_postgres_vector_similarity_search_hardened_validation_integration(
+    integration_settings: Settings,
+) -> None:
+    """Verify live PostgreSQL integration for hardened similarity search validations."""
+    engine = create_db_engine(integration_settings)
+    session_factory = create_session_factory(engine)
+
+    tenant_id = generate_uuid7()
+    doc_id = generate_uuid7()
+    test_vec = [0.05] * 1536
+
+    try:
+        async with session_factory() as session:
+            org = Organization(
+                id=tenant_id,
+                name=f"Search Validation Org {tenant_id.hex[:6]}",
+                slug=f"search-val-{tenant_id.hex[:6]}",
+            )
+            session.add(org)
+            await session.commit()
+
+        # Seed candidate document embedding
+        async with session_factory() as session:
+            await set_tenant_context(session, tenant_id)
+            await store_candidate_document_embedding(
+                session=session,
+                tenant_id=tenant_id,
+                document_id=doc_id,
+                model_identifier="text-embedding-3-small",
+                model_version="1.0",
+                embedding=test_vec,
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            await set_tenant_context(session, tenant_id)
+
+            # 1. Reject invalid limits
+            with pytest.raises(InvalidSearchParameterException):
+                await search_similar_candidate_documents(
+                    session=session,
+                    tenant_id=tenant_id,
+                    query_vector=test_vec,
+                    model_identifier="text-embedding-3-small",
+                    limit=0,
+                )
+
+            with pytest.raises(InvalidSearchParameterException):
+                await search_similar_candidate_documents(
+                    session=session,
+                    tenant_id=tenant_id,
+                    query_vector=test_vec,
+                    model_identifier="text-embedding-3-small",
+                    limit=105,
+                )
+
+            # 2. Reject empty or NaN/Inf vectors
+            with pytest.raises(InvalidSearchParameterException):
+                await search_similar_candidate_documents(
+                    session=session,
+                    tenant_id=tenant_id,
+                    query_vector=[],
+                    model_identifier="text-embedding-3-small",
+                )
+
+            nan_vec = [0.05] * 1535 + [float("nan")]
+            with pytest.raises(InvalidSearchParameterException):
+                await search_similar_candidate_documents(
+                    session=session,
+                    tenant_id=tenant_id,
+                    query_vector=nan_vec,
+                    model_identifier="text-embedding-3-small",
+                )
+
+            # 3. Reject unregistered model
+            with pytest.raises(EmbeddingModelNotFoundException):
+                await search_similar_candidate_documents(
+                    session=session,
+                    tenant_id=tenant_id,
+                    query_vector=test_vec,
+                    model_identifier="unknown-model-identifier",
+                )
+
+            # 3b. Reject inactive model
+            await session.execute(
+                text(
+                    "UPDATE embedding_models SET is_active = FALSE WHERE model_identifier = 'bge-base-en-v1.5';"
+                )
+            )
+            with pytest.raises(DeprecatedEmbeddingModelException):
+                await search_similar_candidate_documents(
+                    session=session,
+                    tenant_id=tenant_id,
+                    query_vector=[0.05] * 768,
+                    model_identifier="bge-base-en-v1.5",
+                )
+            await session.execute(
+                text(
+                    "UPDATE embedding_models SET is_active = TRUE WHERE model_identifier = 'bge-base-en-v1.5';"
+                )
+            )
+
+            # 4. Reject dimension mismatch
+            with pytest.raises(InvalidEmbeddingDimensionException):
+                await search_similar_candidate_documents(
+                    session=session,
+                    tenant_id=tenant_id,
+                    query_vector=[0.05] * 768,  # mismatch with 1536
+                    model_identifier="text-embedding-3-small",
+                )
+
+            # 5. Valid search succeeds and returns results
+            results = await search_similar_candidate_documents(
+                session=session,
+                tenant_id=tenant_id,
+                query_vector=test_vec,
+                model_identifier="text-embedding-3-small",
+                limit=5,
+            )
+            assert len(results) == 1
+            matched_doc, similarity = results[0]
+            assert matched_doc.document_id == doc_id
+            assert similarity > 0.999
+    finally:
+        await engine.dispose()
+
+
+@skip_if_no_postgres
 def test_postgres_hnsw_indexes_exist_and_downgrade_upgrade_lifecycle(
     integration_settings: Settings,
 ) -> None:
     """Verify that HNSW partial indexes are created and test Alembic downgrade/re-upgrade determinism."""
     ini_path = Path(__file__).resolve().parent.parent.parent / "alembic.ini"
     alembic_cfg = Config(str(ini_path))
-    alembic_cfg.set_main_option("sqlalchemy.url", integration_settings.DATABASE_URL)
+    migration_url = (
+        getattr(integration_settings, "DATABASE_MIGRATION_URL", None)
+        or getattr(integration_settings, "DATABASE_SYNC_URL", None)
+        or integration_settings.DATABASE_URL
+    )
+    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
 
     # 1. Verify HNSW indexes exist in live schema
     script = ScriptDirectory.from_config(alembic_cfg)
@@ -1414,3 +1605,70 @@ def test_postgres_hnsw_indexes_exist_and_downgrade_upgrade_lifecycle(
     # 3. Re-upgrade back to head
     command.upgrade(alembic_cfg, "head")
     assert script.get_heads() == heads
+
+
+@skip_if_no_postgres
+def test_postgres_vector_downgrade_preserves_external_dependent_objects_and_extension(
+    integration_settings: Settings,
+) -> None:
+    """Verify that downgrade without CASCADE preserves external vector-dependent objects and the extension."""
+    ini_path = Path(__file__).resolve().parent.parent.parent / "alembic.ini"
+    alembic_cfg = Config(str(ini_path))
+    migration_url = (
+        getattr(integration_settings, "DATABASE_MIGRATION_URL", None)
+        or getattr(integration_settings, "DATABASE_SYNC_URL", None)
+        or integration_settings.DATABASE_URL
+    )
+    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
+
+    # Ensure head first
+    command.upgrade(alembic_cfg, "head")
+
+    # Connect with synchronous engine to create external object
+    from sqlalchemy import create_engine
+
+    sync_url = getattr(
+        integration_settings, "DATABASE_SYNC_URL", None
+    ) or integration_settings.DATABASE_URL.replace("+asyncpg", "")
+    sync_engine = create_engine(sync_url)
+
+    try:
+        with sync_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS external_vector_dependent_table ("
+                    "  id UUID PRIMARY KEY, "
+                    "  external_vec vector(64)"
+                    ");"
+                )
+            )
+
+        # Execute migration downgrade to 001
+        command.downgrade(alembic_cfg, "001_auth_identity")
+
+        # Verify:
+        # A. Migration 002 tables are cleanly dropped
+        with sync_engine.connect() as conn:
+            cand_check = conn.execute(
+                text("SELECT to_regclass('candidate_document_embeddings');")
+            ).scalar()
+            assert cand_check is None
+
+            # B. External table still exists intact
+            ext_check = conn.execute(
+                text("SELECT to_regclass('external_vector_dependent_table');")
+            ).scalar()
+            assert ext_check is not None
+
+            # C. vector extension is still installed and active
+            ext_installed = conn.execute(
+                text("SELECT 1 FROM pg_extension WHERE extname = 'vector';")
+            ).scalar()
+            assert ext_installed == 1
+
+        # Re-upgrade back to head
+        command.upgrade(alembic_cfg, "head")
+    finally:
+        with sync_engine.begin() as conn:
+            conn.execute(text("DROP TABLE IF EXISTS external_vector_dependent_table;"))
+        sync_engine.dispose()

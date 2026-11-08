@@ -260,6 +260,18 @@ def upgrade() -> None:
             WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
     """)
 
+    # 5. Grant least-privilege DML permissions to runtime application role
+    op.execute("""
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aihr_app_user') THEN
+                GRANT SELECT ON embedding_models TO aihr_app_user;
+                GRANT SELECT, INSERT, UPDATE, DELETE ON candidate_document_embeddings TO aihr_app_user;
+                GRANT SELECT, INSERT, UPDATE, DELETE ON job_embeddings TO aihr_app_user;
+            END IF;
+        END $$;
+    """)
+
 
 def downgrade() -> None:
     # 1. Drop job_embeddings policies, indexes, and table
@@ -275,5 +287,25 @@ def downgrade() -> None:
     # 3. Drop embedding_models table
     op.drop_table("embedding_models")
 
-    # 4. Safely drop vector extension if no other tables use it
-    op.execute("DROP EXTENSION IF EXISTS vector CASCADE;")
+    # 4. Safely preserve the shared vector extension.
+    # Database extensions are cluster/database-level infrastructure capabilities.
+    # Do NOT execute DROP EXTENSION ... CASCADE on shared database extensions.
+    # Check if any other user tables or types in the database depend on the vector type.
+    # Only drop without CASCADE if no remaining dependent objects exist.
+    op.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE data_type = 'USER-DEFINED' AND udt_name = 'vector'
+            ) THEN
+                BEGIN
+                    DROP EXTENSION IF EXISTS vector;
+                EXCEPTION WHEN OTHERS THEN
+                    -- If any external object or dependency references vector, preserve it safely
+                    NULL;
+                END;
+            END IF;
+        END $$;
+    """)

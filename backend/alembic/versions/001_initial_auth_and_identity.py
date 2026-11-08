@@ -570,6 +570,18 @@ def upgrade() -> None:
     )
     op.bulk_insert(perms_table, perms_data)
 
+    # 11. Grant runtime DML permissions to aihr_app_user
+    op.execute("""
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aihr_app_user') THEN
+                GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO aihr_app_user;
+                GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO aihr_app_user;
+                GRANT EXECUTE ON ALL ROUTINES IN SCHEMA public TO aihr_app_user;
+            END IF;
+        END $$;
+    """)
+
 
 def downgrade() -> None:
     # Drop tables in reverse order
