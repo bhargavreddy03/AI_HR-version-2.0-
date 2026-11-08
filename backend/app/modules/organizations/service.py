@@ -117,27 +117,27 @@ async def assign_membership_role(
 ) -> OrganizationMembership:
     """Assign or mutate an organization member's role with strict RBAC security guards.
 
-    Enforces:
-    1. Server-side authorization: Actor must be org_admin or platform_super_admin (resolved from DB).
-    2. Concurrency Serialization: Operations are serialized per tenant organization row lock.
-    3. Tenant isolation: The requested role must belong to tenant_id or be a platform system role.
-    4. Ceiling Rule: Actor cannot grant roles or permissions higher than their authority (resolved from DB).
-    5. Super-Admin Protection: Org admins cannot grant platform_super_admin.
-    6. Sole Admin Protection: The last active org admin cannot be demoted to a non-admin role.
+    Execution order:
+    1. Acquire the organization row lock using serialize_organization_mutation().
+    2. Resolve the actor's latest account status, active organization membership, role and permissions directly from DB.
+    3. Perform authorization checks using the freshly resolved information.
+    4. Execute the existing protected membership operation.
+    5. Commit within the same transaction.
     """
-    # 1. Resolve actor authority and permissions exclusively from trusted database records (Finding 3)
+    # 1. Acquire organization row lock first to prevent stale authorization data races
+    await serialize_organization_mutation(db, tenant_id)
+
+    # 2. Resolve actor authority and permissions exclusively from trusted database records under the lock
     resolved_role, is_super_admin, actor_permissions = await _resolve_trusted_actor_context(
         db, tenant_id=tenant_id, actor_user_id=actor_user_id
     )
 
+    # 3. Perform authorization checks using freshly resolved information
     if not is_super_admin and resolved_role != ROLE_ORG_ADMIN:
         raise AuthorizationException(
             "Forbidden: Only organization administrators or super-administrators can assign roles",
             error_code="MEMBERSHIP_MUTATION_FORBIDDEN",
         )
-
-    # 2. Serialize administrator mutations per organization within this transaction (Finding 2)
-    await serialize_organization_mutation(db, tenant_id)
 
     # 3. Fetch the target role definition with its permissions from trusted database records
     role_stmt = (
@@ -219,25 +219,29 @@ async def update_membership(
 ) -> OrganizationMembership:
     """Update organization membership details with mass-assignment defense and sole-admin protection.
 
-    Enforces:
-    1. Server-side authorization check resolved from database.
-    2. Concurrency Serialization: Operations are serialized per tenant organization row lock.
-    3. Mass assignment payload filtering: Strips immutable/structural fields.
-    4. Sole Admin Protection: Deactivating the last active org admin is strictly rejected.
+    Execution order:
+    1. Acquire the organization row lock using serialize_organization_mutation().
+    2. Resolve the actor's latest account status, active organization membership, role and permissions directly from DB.
+    3. Perform authorization checks using the freshly resolved information.
+    4. Execute the existing protected membership operation.
+    5. Commit within the same transaction.
     """
+    # 1. Acquire organization row lock first to prevent stale authorization data races
+    await serialize_organization_mutation(db, tenant_id)
+
+    # 2. Resolve actor authority directly from database under the lock
     resolved_role, is_super_admin, _ = await _resolve_trusted_actor_context(
         db, tenant_id=tenant_id, actor_user_id=actor_user_id
     )
+
+    # 3. Perform authorization checks using freshly resolved information
     if not is_super_admin and resolved_role != ROLE_ORG_ADMIN:
         raise AuthorizationException(
             "Forbidden: Only organization administrators can update memberships",
             error_code="MEMBERSHIP_MUTATION_FORBIDDEN",
         )
 
-    # Serialize mutations per organization within this transaction (Finding 2)
-    await serialize_organization_mutation(db, tenant_id)
-
-    # Strip protected structural fields
+    # 4. Strip protected structural fields
     sanitized_fields = filter_mass_assignment_payload(update_data, PROTECTED_MEMBERSHIP_FIELDS)
 
     mem_stmt = (
@@ -279,24 +283,29 @@ async def remove_membership(
 ) -> bool:
     """Remove a user membership from an organization with sole-admin protection.
 
-    Enforces:
-    1. Server-side authorization check resolved from database.
-    2. Concurrency Serialization: Operations are serialized per tenant organization row lock.
-    3. Sole Admin Protection: Removing the last active org admin is rejected.
+    Execution order:
+    1. Acquire the organization row lock using serialize_organization_mutation().
+    2. Resolve the actor's latest account status, active organization membership, role and permissions directly from DB.
+    3. Perform authorization checks using the freshly resolved information.
+    4. Execute the existing protected membership operation.
+    5. Commit within the same transaction.
     """
+    # 1. Acquire organization row lock first to prevent stale authorization data races
+    await serialize_organization_mutation(db, tenant_id)
+
+    # 2. Resolve actor authority directly from database under the lock
     resolved_role, is_super_admin, _ = await _resolve_trusted_actor_context(
         db, tenant_id=tenant_id, actor_user_id=actor_user_id
     )
+
+    # 3. Perform authorization checks using freshly resolved information
     if not is_super_admin and resolved_role != ROLE_ORG_ADMIN:
         raise AuthorizationException(
             "Forbidden: Only organization administrators can remove memberships",
             error_code="MEMBERSHIP_MUTATION_FORBIDDEN",
         )
 
-    # Serialize mutations per organization within this transaction (Finding 2)
-    await serialize_organization_mutation(db, tenant_id)
-
-    # Ensure this removal does not leave the tenant without an active admin within the same transaction
+    # 4. Ensure this removal does not leave the tenant without an active admin within the same transaction
     await validate_sole_admin_protection(
         db, tenant_id=tenant_id, target_user_id=target_user_id, serialize=False
     )

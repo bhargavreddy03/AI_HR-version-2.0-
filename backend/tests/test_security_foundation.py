@@ -847,8 +847,9 @@ async def test_rbac_organization_service_mutation_guards() -> None:
     )
 
     db.execute.side_effect = [
-        make_mock_result(actor_user),  # 1. _resolve_trusted_actor_context: User
-        make_mock_result(actor_membership),  # 2. _resolve_trusted_actor_context: OrgMembership
+        make_mock_result(tenant_id),  # 1. serialize_organization_mutation
+        make_mock_result(actor_user),  # 2. _resolve_trusted_actor_context: User
+        make_mock_result(actor_membership),  # 3. _resolve_trusted_actor_context: OrgMembership
     ]
 
     with pytest.raises(AuthorizationException, match="Only organization administrators"):
@@ -890,9 +891,9 @@ async def test_rbac_organization_service_mutation_guards() -> None:
     mock_super_admin_role.role_permissions = []
 
     db.execute.side_effect = [
-        make_mock_result(admin_user),  # 1. actor user
-        make_mock_result(admin_membership),  # 2. actor membership
-        make_mock_result(tenant_id),  # 3. serialize_organization_mutation
+        make_mock_result(tenant_id),  # 1. serialize_organization_mutation
+        make_mock_result(admin_user),  # 2. actor user
+        make_mock_result(admin_membership),  # 3. actor membership
         make_mock_result(mock_super_admin_role),  # 4. target role
     ]
 
@@ -928,9 +929,9 @@ async def test_rbac_organization_service_mutation_guards() -> None:
     target_role_excess.role_permissions = [rp_target_1, rp_target_2]
 
     db.execute.side_effect = [
-        make_mock_result(admin_user),  # 1. actor user
-        make_mock_result(admin_mem_with_perm),  # 2. actor membership
-        make_mock_result(tenant_id),  # 3. serialize_organization_mutation
+        make_mock_result(tenant_id),  # 1. serialize_organization_mutation
+        make_mock_result(admin_user),  # 2. actor user
+        make_mock_result(admin_mem_with_perm),  # 3. actor membership
         make_mock_result(target_role_excess),  # 4. target role
     ]
 
@@ -970,9 +971,9 @@ async def test_rbac_organization_service_mutation_guards() -> None:
     )
 
     db.execute.side_effect = [
-        make_mock_result(admin_user),  # 1. actor user
-        make_mock_result(admin_mem_for_demote),  # 2. actor membership
-        make_mock_result(tenant_id),  # 3. serialize_organization_mutation
+        make_mock_result(tenant_id),  # 1. serialize_organization_mutation
+        make_mock_result(admin_user),  # 2. actor user
+        make_mock_result(admin_mem_for_demote),  # 3. actor membership
         make_mock_result(target_role_recruiter),  # 4. target role
         make_mock_result(target_membership),  # 5. target membership
         make_mock_result(1),  # 6. count active admins (=1)
@@ -1000,9 +1001,9 @@ async def test_rbac_organization_service_mutation_guards() -> None:
     )
 
     db.execute.side_effect = [
-        make_mock_result(admin_user),  # 1. actor user
-        make_mock_result(admin_membership),  # 2. actor membership
-        make_mock_result(tenant_id),  # 3. serialize_organization_mutation
+        make_mock_result(tenant_id),  # 1. serialize_organization_mutation
+        make_mock_result(admin_user),  # 2. actor user
+        make_mock_result(admin_membership),  # 3. actor membership
         make_mock_result(mock_membership_to_update),  # 4. target membership
     ]
 
@@ -1027,9 +1028,9 @@ async def test_rbac_organization_service_mutation_guards() -> None:
 
     # 6. Sole admin removal rejected
     db.execute.side_effect = [
-        make_mock_result(admin_user),  # 1. actor user
-        make_mock_result(admin_membership),  # 2. actor membership
-        make_mock_result(tenant_id),  # 3. serialize_organization_mutation
+        make_mock_result(tenant_id),  # 1. serialize_organization_mutation
+        make_mock_result(admin_user),  # 2. actor user
+        make_mock_result(admin_membership),  # 3. actor membership
         make_mock_result(1),  # 4. count active admins (=1)
         make_mock_result(target_membership.id),  # 5. check target is admin (=True)
     ]

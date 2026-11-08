@@ -14,7 +14,7 @@ from pathlib import Path
 
 import asyncpg
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from starlette.requests import Request
@@ -69,7 +69,11 @@ from app.modules.organizations.models import (
     OrganizationMembership,
     Role,
 )
-from app.modules.organizations.service import remove_membership
+from app.modules.organizations.service import (
+    assign_membership_role,
+    remove_membership,
+    update_membership,
+)
 
 # Read test database URLs from environment or standard defaults
 INTEGRATION_DB_URL = os.getenv(
@@ -2140,6 +2144,259 @@ async def test_sole_admin_concurrency_serialization(
                     actor_user_id=super_admin_id,
                 )
         assert exc_sole.value.error_code == "SOLE_ADMIN_PROTECTION_VIOLATION"
+
+    finally:
+        await engine.dispose()
+
+
+@skip_if_no_postgres
+@pytest.mark.asyncio
+async def test_actor_revocation_while_waiting_for_organization_lock_rejected(
+    integration_settings: Settings,
+) -> None:
+    """Verify that an administrator whose privileges are revoked while waiting for the organization lock
+
+    cannot execute operations using stale permissions across assign_membership_role, update_membership,
+    and remove_membership.
+    """
+    engine = create_db_engine(integration_settings)
+    session_factory = create_session_factory(engine)
+
+    tenant_id = generate_uuid7()
+    admin_id = generate_uuid7()
+    super_admin_id = generate_uuid7()
+    target_user_id = generate_uuid7()
+
+    try:
+        # Step 1: Seed organization, system roles (org_admin, recruiter), and users
+        async with session_factory() as session:
+            await set_tenant_context(session, tenant_id)
+            org = Organization(
+                id=tenant_id,
+                name=f"Lock Order Test Org {tenant_id.hex[:6]}",
+                slug=f"lock-order-org-{tenant_id.hex[:6]}",
+                status="active",
+            )
+            session.add(org)
+
+            # Resolve system org_admin role
+            admin_role = (
+                (await session.execute(select(Role).where(Role.name == "org_admin")))
+                .scalars()
+                .first()
+            )
+            assert admin_role is not None
+
+            # Resolve system recruiter role
+            recruiter_role = (
+                (await session.execute(select(Role).where(Role.name == "recruiter")))
+                .scalars()
+                .first()
+            )
+            assert recruiter_role is not None
+
+            super_user = User(
+                id=super_admin_id,
+                email=f"super_lock_{super_admin_id.hex[:6]}@example.com",
+                password_hash=hash_password("SuperSecretPass123!"),
+                first_name="Super",
+                last_name="Admin",
+                is_active=True,
+                is_super_admin=True,
+            )
+            admin_user = User(
+                id=admin_id,
+                email=f"admin_lock_{admin_id.hex[:6]}@example.com",
+                password_hash=hash_password("SuperSecretPass123!"),
+                first_name="Admin",
+                last_name="Actor",
+                is_active=True,
+                is_super_admin=False,
+            )
+            target_user = User(
+                id=target_user_id,
+                email=f"target_lock_{target_user_id.hex[:6]}@example.com",
+                password_hash=hash_password("SuperSecretPass123!"),
+                first_name="Target",
+                last_name="Member",
+                is_active=True,
+                is_super_admin=False,
+            )
+            session.add_all([super_user, admin_user, target_user])
+            await session.flush()
+
+            # Admin membership
+            admin_mem = OrganizationMembership(
+                id=generate_uuid7(),
+                tenant_id=tenant_id,
+                user_id=admin_id,
+                role_id=admin_role.id,
+                is_active=True,
+            )
+            # Target membership initially recruiter
+            target_mem = OrganizationMembership(
+                id=generate_uuid7(),
+                tenant_id=tenant_id,
+                user_id=target_user_id,
+                role_id=recruiter_role.id,
+                is_active=True,
+            )
+            session.add_all([admin_mem, target_mem])
+            await session.commit()
+
+        # ----------------------------------------------------------------------
+        # Test 1: assign_membership_role blocked if actor demoted while waiting on lock
+        # ----------------------------------------------------------------------
+        async with session_factory() as session_1:
+            await set_tenant_context(session_1, tenant_id)
+            # Session 1 acquires organization row lock
+            await session_1.execute(
+                select(Organization.id).where(Organization.id == tenant_id).with_for_update()
+            )
+
+            # Session 2 attempts assign_membership_role (blocks on organization lock)
+            async def try_assign() -> OrganizationMembership:
+                async with session_factory() as session_2:
+                    await set_tenant_context(session_2, tenant_id)
+                    return await assign_membership_role(
+                        db=session_2,
+                        tenant_id=tenant_id,
+                        target_user_id=target_user_id,
+                        new_role_id=admin_role.id,
+                        actor_user_id=admin_id,
+                    )
+
+            assign_task = asyncio.create_task(try_assign())
+            await asyncio.sleep(0.05)  # Ensure Task 2 is waiting on PostgreSQL lock
+
+            # Session 1 demotes admin_id to recruiter while Task 2 is waiting
+            await session_1.execute(
+                update(OrganizationMembership)
+                .where(
+                    OrganizationMembership.tenant_id == tenant_id,
+                    OrganizationMembership.user_id == admin_id,
+                )
+                .values(role_id=recruiter_role.id)
+            )
+            await session_1.commit()  # Commits demotion & releases lock to Task 2
+
+            with pytest.raises(AuthorizationException) as exc_assign:
+                await assign_task
+            assert exc_assign.value.error_code == "MEMBERSHIP_MUTATION_FORBIDDEN"
+
+        # Re-promote admin_id to org_admin
+        async with session_factory() as session:
+            await set_tenant_context(session, tenant_id)
+            await session.execute(
+                update(OrganizationMembership)
+                .where(
+                    OrganizationMembership.tenant_id == tenant_id,
+                    OrganizationMembership.user_id == admin_id,
+                )
+                .values(role_id=admin_role.id, is_active=True)
+            )
+            await session.commit()
+
+        # ----------------------------------------------------------------------
+        # Test 2: update_membership blocked if actor deactivated while waiting on lock
+        # ----------------------------------------------------------------------
+        async with session_factory() as session_1:
+            await set_tenant_context(session_1, tenant_id)
+            await session_1.execute(
+                select(Organization.id).where(Organization.id == tenant_id).with_for_update()
+            )
+
+            async def try_update() -> OrganizationMembership:
+                async with session_factory() as session_2:
+                    await set_tenant_context(session_2, tenant_id)
+                    return await update_membership(
+                        db=session_2,
+                        tenant_id=tenant_id,
+                        target_user_id=target_user_id,
+                        update_data={"is_active": False},
+                        actor_user_id=admin_id,
+                    )
+
+            update_task = asyncio.create_task(try_update())
+            await asyncio.sleep(0.05)
+
+            # Session 1 deactivates admin_id while Task 2 is waiting
+            await session_1.execute(
+                update(OrganizationMembership)
+                .where(
+                    OrganizationMembership.tenant_id == tenant_id,
+                    OrganizationMembership.user_id == admin_id,
+                )
+                .values(is_active=False)
+            )
+            await session_1.commit()
+
+            with pytest.raises(AuthorizationException) as exc_update:
+                await update_task
+            assert exc_update.value.error_code == "MEMBERSHIP_MUTATION_FORBIDDEN"
+
+        # Re-activate and re-promote admin_id
+        async with session_factory() as session:
+            await set_tenant_context(session, tenant_id)
+            await session.execute(
+                update(OrganizationMembership)
+                .where(
+                    OrganizationMembership.tenant_id == tenant_id,
+                    OrganizationMembership.user_id == admin_id,
+                )
+                .values(role_id=admin_role.id, is_active=True)
+            )
+            await session.commit()
+
+        # ----------------------------------------------------------------------
+        # Test 3: remove_membership blocked if actor demoted while waiting on lock
+        # ----------------------------------------------------------------------
+        async with session_factory() as session_1:
+            await set_tenant_context(session_1, tenant_id)
+            await session_1.execute(
+                select(Organization.id).where(Organization.id == tenant_id).with_for_update()
+            )
+
+            async def try_remove() -> bool:
+                async with session_factory() as session_2:
+                    await set_tenant_context(session_2, tenant_id)
+                    return await remove_membership(
+                        db=session_2,
+                        tenant_id=tenant_id,
+                        target_user_id=target_user_id,
+                        actor_user_id=admin_id,
+                    )
+
+            remove_task = asyncio.create_task(try_remove())
+            await asyncio.sleep(0.05)
+
+            # Session 1 demotes admin_id while Task 2 is waiting
+            await session_1.execute(
+                update(OrganizationMembership)
+                .where(
+                    OrganizationMembership.tenant_id == tenant_id,
+                    OrganizationMembership.user_id == admin_id,
+                )
+                .values(role_id=recruiter_role.id)
+            )
+            await session_1.commit()
+
+            with pytest.raises(AuthorizationException) as exc_remove:
+                await remove_task
+            assert exc_remove.value.error_code == "MEMBERSHIP_MUTATION_FORBIDDEN"
+
+        # Verify target user still exists and was not removed
+        async with session_factory() as session:
+            await set_tenant_context(session, tenant_id)
+            target_check = (
+                await session.execute(
+                    select(OrganizationMembership.id).where(
+                        OrganizationMembership.tenant_id == tenant_id,
+                        OrganizationMembership.user_id == target_user_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            assert target_check is not None, "Target membership must not have been deleted"
 
     finally:
         await engine.dispose()

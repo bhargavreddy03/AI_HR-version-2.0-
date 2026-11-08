@@ -77,6 +77,11 @@ The platform defines five distinct roles with strictly partitioned operational c
 ### 3.2 Service-Layer RBAC Guardrails & Concurrency Serialization
 RBAC security guards and serialization primitives are integrated directly into the organization mutation operations in [`backend/app/modules/organizations/service.py`](file:///backend/app/modules/organizations/service.py):
 
+- **Lock-First Transactional Serialization & Authorization Race Condition Elimination**:
+  - In `assign_membership_role()`, `update_membership()`, and `remove_membership()`, the tenant organization row lock (`serialize_organization_mutation(db, tenant_id)`) is acquired as **Step 1** prior to resolving actor authority or checking permissions.
+  - This eliminates a high-severity authorization race condition where an actor's credentials, role, or active status were previously resolved before acquiring the organization lock. Under that previous order, an administrator demoted or deactivated while waiting on the lock would still execute mutations using stale cached authority.
+  - With lock-first ordering, transactions serialize before actor resolution. Under PostgreSQL's `READ COMMITTED` isolation level, the waiting transaction's subsequent read of the actor's user and membership record observes the newly committed revocation, immediately terminating execution with `403 MEMBERSHIP_MUTATION_FORBIDDEN`.
+  - A comprehensive PostgreSQL concurrency regression test (`test_actor_revocation_while_waiting_for_organization_lock_rejected` in `test_postgres_lifecycle.py`) exercises all three mutation functions under live row contention, proving that privilege revocations committed while an operation is queued behind the lock strictly prevent execution with stale permissions.
 - **Database-Resolved Authority & Ceiling Rule (`_resolve_trusted_actor_context`)**:
   - In `assign_membership_role()`, `update_membership()`, and `remove_membership()`, actor roles, super-admin status, and authorized permission sets are resolved directly from trusted database records (`User`, `OrganizationMembership`, `Role`, `RolePermission`).
   - Caller-supplied role or super-admin parameters are never accepted as proof of authority, neutralizing claim-spoofing attacks.
@@ -339,4 +344,4 @@ While Step 3.7 establishes an enterprise-grade security foundation, future miles
 ---
 
 ### Step 3.7 Verification Conclusion
-All seven security audit findings have been **fully resolved, verified, and certified**. All quality gates, concurrency unit tests, type checks, and linting suites have passed with zero errors. Development pauses here for independent security review prior to initiating Step 3.8.
+All security audit findings, post-audit hardening requirements, and the membership authorization concurrency race condition have been **fully resolved, verified, and certified**. All quality gates, concurrency integration tests, type checks, and linting suites have passed with zero errors. Development pauses here for independent security review prior to initiating Step 3.8.
