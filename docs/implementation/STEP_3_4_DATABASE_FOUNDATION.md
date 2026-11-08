@@ -207,7 +207,7 @@ The database test suite covers all categories specified in the requirements:
 13. `test_postgres_pgvector_extension_and_model_registry`: Extension verification and model registry seeding.
 14. `test_postgres_vector_dimension_check_constraints_and_foreign_keys`: Check constraints and composite FK enforcement.
 15. `test_postgres_vector_insertion_and_cosine_similarity_search`: High-dimensional vector insert and cosine search.
-16. `test_postgres_vector_tenant_isolation_under_rls`: Cross-tenant vector isolation under PostgreSQL RLS.
+16. `test_postgres_vector_tenant_isolation_under_rls`: Cross-tenant vector isolation under PostgreSQL RLS (includes automatic non-superuser role delegation via `SET LOCAL ROLE aihr_test_rls_user` when executing under containerized PostgreSQL superuser roles, ensuring truthful RLS policy evaluation in both local and CI environments).
 17. `test_postgres_hnsw_indexes_exist_and_downgrade_upgrade_lifecycle`: HNSW index validation and reversible migrations.
 
 ---

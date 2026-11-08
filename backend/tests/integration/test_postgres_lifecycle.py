@@ -1293,6 +1293,33 @@ async def test_postgres_vector_tenant_isolation_under_rls(
     doc_a_id = generate_uuid7()
 
     try:
+        # Check if the connection role is a superuser (superusers unconditionally bypass RLS in PostgreSQL)
+        is_super = False
+        async with session_factory() as session:
+            res = await session.execute(
+                text("SELECT rolsuper FROM pg_roles WHERE rolname = current_user;")
+            )
+            is_super = bool(res.scalar())
+            if is_super:
+                await session.execute(
+                    text("""
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aihr_test_rls_user') THEN
+                                CREATE ROLE aihr_test_rls_user NOSUPERUSER NOBYPASSRLS INHERIT;
+                            END IF;
+                            GRANT USAGE ON SCHEMA public TO aihr_test_rls_user;
+                            GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO aihr_test_rls_user;
+                            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO aihr_test_rls_user;
+                            GRANT ALL PRIVILEGES ON ALL ROUTINES IN SCHEMA public TO aihr_test_rls_user;
+                            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aihr_app_user') THEN
+                                GRANT aihr_app_user TO aihr_test_rls_user;
+                            END IF;
+                        END $$;
+                    """)
+                )
+                await session.commit()
+
         async with session_factory() as session:
             org_a = Organization(
                 id=tenant_a_id,
@@ -1311,6 +1338,8 @@ async def test_postgres_vector_tenant_isolation_under_rls(
 
         # Tenant A inserts vector embedding
         async with session_factory() as session:
+            if is_super:
+                await session.execute(text("SET LOCAL ROLE aihr_test_rls_user;"))
             await set_tenant_context(session, tenant_a_id)
             await store_candidate_document_embedding(
                 session=session,
@@ -1324,6 +1353,8 @@ async def test_postgres_vector_tenant_isolation_under_rls(
 
         # Tenant B queries under its tenant context: must return 0 results
         async with session_factory() as session:
+            if is_super:
+                await session.execute(text("SET LOCAL ROLE aihr_test_rls_user;"))
             await set_tenant_context(session, tenant_b_id)
             # Direct query
             res = await session.execute(
@@ -1344,6 +1375,8 @@ async def test_postgres_vector_tenant_isolation_under_rls(
 
         # Mismatched context (Tenant B context attempting to insert row with tenant_a_id) is rejected
         async with session_factory() as session:
+            if is_super:
+                await session.execute(text("SET LOCAL ROLE aihr_test_rls_user;"))
             await set_tenant_context(session, tenant_b_id)
             with pytest.raises(DBAPIError):
                 cross_tenant_emb = CandidateDocumentEmbedding(
