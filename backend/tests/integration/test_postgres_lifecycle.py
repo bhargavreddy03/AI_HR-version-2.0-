@@ -114,9 +114,17 @@ def integration_settings() -> Settings:
     return Settings(
         ENVIRONMENT="testing",
         DEBUG=True,
-        POSTGRES_PASSWORD="test_password_only",
+        POSTGRES_USER=os.getenv("POSTGRES_USER", "aihr_app_user"),
+        POSTGRES_PASSWORD=os.getenv("POSTGRES_PASSWORD", "test_password_only"),
+        POSTGRES_MIGRATION_USER=os.getenv("POSTGRES_MIGRATION_USER", "aihr_migration_user"),
+        POSTGRES_MIGRATION_PASSWORD=os.getenv(
+            "POSTGRES_MIGRATION_PASSWORD", "test_migration_password_only"
+        ),
         DATABASE_URL=INTEGRATION_DB_URL,
-        DATABASE_SYNC_URL=INTEGRATION_DB_URL.replace("+asyncpg", ""),
+        DATABASE_SYNC_URL=os.getenv(
+            "DATABASE_SYNC_URL", INTEGRATION_DB_URL.replace("+asyncpg", "")
+        ),
+        DATABASE_MIGRATION_URL=os.getenv("DATABASE_MIGRATION_URL", ""),
         MFA_ENCRYPTION_KEY="integration_test_mfa_encryption_key_at_least_32_bytes_long",
         BACKUP_CODE_PEPPER="integration_test_backup_code_pepper_32_bytes_long",
     )
@@ -131,9 +139,10 @@ def ensure_database_schema(integration_settings: Settings) -> None:
     alembic_cfg = Config(str(ini_path))
     migration_url = (
         getattr(integration_settings, "DATABASE_MIGRATION_URL", None)
+        or os.getenv("DATABASE_MIGRATION_URL")
         or getattr(integration_settings, "DATABASE_SYNC_URL", None)
         or integration_settings.DATABASE_URL
-    )
+    ).replace("+asyncpg", "")
     alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
     command.upgrade(alembic_cfg, "head")
 
@@ -1238,6 +1247,7 @@ async def test_postgres_vector_insertion_and_cosine_similarity_search(
         vec_orthogonal[1] = 1.0  # Orthogonal along axis 1
 
         async with session_factory() as session:
+            await set_tenant_context(session, tenant_id)
             await store_candidate_document_embedding(
                 session=session,
                 tenant_id=tenant_id,
@@ -1270,6 +1280,7 @@ async def test_postgres_vector_insertion_and_cosine_similarity_search(
 
         # Perform cosine similarity search
         async with session_factory() as session:
+            await set_tenant_context(session, tenant_id)
             results = await search_similar_candidate_documents(
                 session=session,
                 tenant_id=tenant_id,
@@ -1616,21 +1627,19 @@ def test_postgres_vector_downgrade_preserves_external_dependent_objects_and_exte
     alembic_cfg = Config(str(ini_path))
     migration_url = (
         getattr(integration_settings, "DATABASE_MIGRATION_URL", None)
+        or os.getenv("DATABASE_MIGRATION_URL")
         or getattr(integration_settings, "DATABASE_SYNC_URL", None)
         or integration_settings.DATABASE_URL
-    )
+    ).replace("+asyncpg", "")
     alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
 
     # Ensure head first
     command.upgrade(alembic_cfg, "head")
 
-    # Connect with synchronous engine to create external object
+    # Connect with synchronous engine using migration credentials (schema owner with CREATE privileges)
     from sqlalchemy import create_engine
 
-    sync_url = getattr(
-        integration_settings, "DATABASE_SYNC_URL", None
-    ) or integration_settings.DATABASE_URL.replace("+asyncpg", "")
-    sync_engine = create_engine(sync_url)
+    sync_engine = create_engine(migration_url)
 
     try:
         with sync_engine.begin() as conn:

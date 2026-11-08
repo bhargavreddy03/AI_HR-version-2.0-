@@ -10,6 +10,14 @@ import pytest
 from app.core.config import Settings
 
 
+@pytest.fixture(autouse=True)
+def isolate_migration_env_in_config_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure migration credentials from CI runner environment do not leak into general config unit tests."""
+    monkeypatch.delenv("DATABASE_MIGRATION_URL", raising=False)
+    monkeypatch.delenv("POSTGRES_MIGRATION_USER", raising=False)
+    monkeypatch.delenv("POSTGRES_MIGRATION_PASSWORD", raising=False)
+
+
 def test_settings_default_development() -> None:
     """Verify default development configuration settings when environment is development."""
     with patch.dict(os.environ, {"ENVIRONMENT": "development", "DEBUG": "false"}):
@@ -248,3 +256,50 @@ def test_production_settings_migration_role_validation() -> None:
     assert settings.POSTGRES_USER == "aihr_app_user"
     assert settings.POSTGRES_MIGRATION_USER == "aihr_migration_user"
     assert settings.DATABASE_MIGRATION_URL is not None
+
+
+def test_production_settings_reject_insecure_migration_password() -> None:
+    """Verify that insecure password in DATABASE_MIGRATION_URL is rejected in production."""
+    secure_pass = "a_very_secure_runtime_password_123456!"
+    with pytest.raises(
+        ValueError,
+        match="Insecure default or development password detected in DATABASE_MIGRATION_URL",
+    ):
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
+            MFA_ENCRYPTION_KEY="production_ultra_secure_mfa_encryption_key_32_bytes_long!",
+            BACKUP_CODE_PEPPER="production_ultra_secure_backup_pepper_32_bytes_long!",
+            POSTGRES_USER="aihr_app_user",
+            POSTGRES_PASSWORD=secure_pass,
+            POSTGRES_MIGRATION_USER="aihr_migration_user",
+            POSTGRES_MIGRATION_PASSWORD="local_development_migration_password_only",
+            DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            DATABASE_MIGRATION_URL="postgresql+asyncpg://aihr_migration_user:local_development_migration_password_only@localhost:5432/ai_hr_db",
+            DATABASE_SYNC_URL=f"postgresql://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            COOKIE_SECURE=True,
+        )
+
+
+def test_production_settings_reject_mismatched_migration_user() -> None:
+    """Verify that mismatched username in DATABASE_MIGRATION_URL is rejected in production."""
+    secure_pass = "a_very_secure_runtime_password_123456!"
+    secure_mig_pass = "a_very_secure_migration_password_654321!"
+    with pytest.raises(
+        ValueError,
+        match="DATABASE_MIGRATION_URL username does not match POSTGRES_MIGRATION_USER",
+    ):
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY="production_ultra_secure_jwt_signing_key_32_bytes_long!",
+            MFA_ENCRYPTION_KEY="production_ultra_secure_mfa_encryption_key_32_bytes_long!",
+            BACKUP_CODE_PEPPER="production_ultra_secure_backup_pepper_32_bytes_long!",
+            POSTGRES_USER="aihr_app_user",
+            POSTGRES_PASSWORD=secure_pass,
+            POSTGRES_MIGRATION_USER="aihr_migration_user",
+            POSTGRES_MIGRATION_PASSWORD=secure_mig_pass,
+            DATABASE_URL=f"postgresql+asyncpg://aihr_app_user:{secure_pass}@localhost:5432/ai_hr_db",
+            DATABASE_MIGRATION_URL=f"postgresql+asyncpg://wrong_mig_user:{secure_mig_pass}@localhost:5432/ai_hr_db",
+            DATABASE_SYNC_URL=f"postgresql://aihr_migration_user:{secure_mig_pass}@localhost:5432/ai_hr_db",
+            COOKIE_SECURE=True,
+        )
