@@ -13,13 +13,14 @@ Step 3.4 establishes the enterprise relational database and neural vector storag
 
 ## 2. Relational Database & ORM Architecture
 
-### 2.1 Package Organization (`backend/app/db/`)
+### 2.1 Package Organization (`backend/app/db/` and `backend/app/core/`)
 The database foundation is structured into dedicated, decoupled components:
 - `backend/app/db/base.py`: Central declarative `Base` (`AsyncAttrs`, `DeclarativeBase`), naming conventions (`POSTGRES_NAMING_CONVENTION`), common mixins (`TimestampMixin`, `TenantScopedMixin`), and model registration.
-- `backend/app/db/session.py`: Asynchronous engine creation (`create_db_engine`), session factory (`create_session_factory`), singleton getters (`get_engine`, `get_session_factory`), FastAPI dependency (`get_db`), transaction context manager (`transactional_session`), and health probe (`check_database_health`).
+- `backend/app/core/database.py`: Core implementation containing asynchronous engine creation (`create_db_engine`), session factory (`create_session_factory`), singleton getters (`get_engine`, `get_session_factory`), FastAPI dependency (`get_db`), transaction context manager (`transactional_session`), asynchronous connection pool cleanup and disposal (`dispose_app_database`), and health probe (`check_database_health`).
+- `backend/app/db/session.py`: Backward-compatible re-export module re-exporting engine creation, session lifecycle, and transaction management utilities from `backend/app/core/database.py`.
 - `backend/app/db/events.py`: Connection pool event listeners (`register_pool_cleanup_listener`) providing defense-in-depth parameter resets on checkin and invalidation on failure.
 - `backend/app/db/__init__.py`: Clean public API for the database layer.
-- `backend/app/core/base.py` & `backend/app/core/database.py`: Fully backward-compatible re-exports preserving existing Step 3.1–3.3 module contracts and test patch targets.
+- `backend/app/core/base.py`: Backward-compatible re-export preserving existing Step 3.1–3.3 declarative base contracts and test patch targets from `backend/app/db/base.py`.
 
 ### 2.2 Primary Key Convention: Application-Generated UUIDv7
 - RFC 9562-compliant, time-ordered 128-bit UUIDv7 identifiers are generated at the application layer via `generate_uuid7()` (`app.db.base`).
