@@ -206,6 +206,9 @@ jobs:
           set -euo pipefail
           trap 'docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml down -v --remove-orphans' EXIT
 
+          echo "Ensuring executable permissions on container entrypoint scripts..."
+          chmod +x backend/entrypoint.sh infrastructure/scripts/init-db.sh
+
           echo "Starting complete 5-service dev stack (postgres, redis, backend, celery_worker, frontend)..."
           docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml up -d --build
 
