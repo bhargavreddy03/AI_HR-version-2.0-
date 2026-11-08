@@ -204,7 +204,15 @@ jobs:
       - name: Smoke Test Docker Compose Stack Startup, Port Isolation, and Security
         run: |
           set -euo pipefail
-          trap 'docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml down -v --remove-orphans' EXIT
+          dump_logs_on_exit() {
+            local exit_code=$?
+            if [ $exit_code -ne 0 ]; then
+              echo "=== SMOKE TEST FAILED (exit code $exit_code) - DUMPING CONTAINER LOGS ==="
+              docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml logs --tail=100 || true
+            fi
+            docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml down -v --remove-orphans || true
+          }
+          trap dump_logs_on_exit EXIT
 
           echo "Ensuring executable permissions on container entrypoint scripts..."
           chmod +x backend/entrypoint.sh infrastructure/scripts/init-db.sh
