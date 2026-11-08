@@ -23,7 +23,7 @@ APP_ENV="${ENVIRONMENT:-${APP_ENV:-production}}"
 # In development mode, provide convenient local defaults if not already set.
 # Outside development (e.g. production, staging, testing), explicit credentials are strictly required.
 if [ "${APP_ENV}" = "development" ] || [ "${APP_ENV}" = "dev" ] || [ "${APP_ENV}" = "local" ]; then
-    export POSTGRES_SUPERUSER="${POSTGRES_SUPERUSER:-${POSTGRES_USER:-postgres}}"
+    export POSTGRES_SUPERUSER="${POSTGRES_SUPERUSER:-postgres}"
     export POSTGRES_SUPERUSER_PASSWORD="${POSTGRES_SUPERUSER_PASSWORD:-${PGPASSWORD:-local_development_super_password_only}}"
     export PGPASSWORD="${POSTGRES_SUPERUSER_PASSWORD}"
     export POSTGRES_MIGRATION_USER="${POSTGRES_MIGRATION_USER:-aihr_migration_user}"
@@ -51,7 +51,7 @@ else
         exit 1
     fi
 
-    export POSTGRES_SUPERUSER="${POSTGRES_SUPERUSER:-${POSTGRES_USER:-postgres}}"
+    export POSTGRES_SUPERUSER="${POSTGRES_SUPERUSER:-postgres}"
     export POSTGRES_SUPERUSER_PASSWORD="${EFFECTIVE_SUPER_PASSWORD}"
     export PGPASSWORD="${EFFECTIVE_SUPER_PASSWORD}"
     export POSTGRES_MIGRATION_USER="${POSTGRES_MIGRATION_USER:-aihr_migration_user}"

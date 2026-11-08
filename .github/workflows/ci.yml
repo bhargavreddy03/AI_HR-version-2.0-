@@ -64,6 +64,8 @@ jobs:
 
       - name: Initialize PostgreSQL Roles and Extensions
         env:
+          POSTGRES_SUPERUSER: postgres
+          POSTGRES_SUPERUSER_PASSWORD: test_super_password_only
           PGPASSWORD: test_super_password_only
           POSTGRES_MIGRATION_USER: aihr_migration_user
           POSTGRES_MIGRATION_PASSWORD: local_development_migration_password_only
