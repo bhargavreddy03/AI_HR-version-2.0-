@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,7 +13,7 @@ from app.core.tasks.base import (
     PermanentTaskError,
     TransientTaskError,
 )
-from app.core.tasks.idempotency import IdempotencyManager, idempotent_task
+from app.core.tasks.idempotency import IdempotencyManager, LockHeartbeat, idempotent_task
 from app.core.tasks.system import (
     sample_permanent_failure,
     sample_transient_retry,
@@ -364,3 +365,175 @@ def test_delayed_worker_execution_acquires_long_waiting_pending_task() -> None:
         result_ttl=86400,
     )
     assert completed is True
+
+
+def test_idempotent_task_fails_closed_when_acquisition_fails() -> None:
+    """FINDING 1: Verify underlying task function NEVER executes if lock acquisition fails."""
+    mock_redis = MagicMock()
+    # Simulate acquire returning failure with an unhandled/corrupted state
+    mock_redis.eval.return_value = [0, None, json.dumps({"status": "CORRUPTED_OR_UNKNOWN"})]
+
+    call_count = 0
+
+    @idempotent_task(key_param="idempotency_key")
+    def sensitive_task(val: int, idempotency_key: str | None = None) -> int:
+        nonlocal call_count
+        call_count += 1
+        return val * 10
+
+    with patch("app.core.tasks.idempotency.get_sync_redis_client", return_value=mock_redis):
+        with pytest.raises(PermanentTaskError) as exc_info:
+            sensitive_task(5, idempotency_key="fail-closed-key")
+
+        assert "Unprotected task execution prevented" in str(exc_info.value)
+        # Crucial check: Underlying task was NEVER called!
+        assert call_count == 0
+
+
+def test_idempotent_task_fails_closed_on_failed_state() -> None:
+    """FINDING 1: Verify that a task previously in FAILED state never re-executes automatically."""
+    mock_redis = MagicMock()
+    failed_payload = json.dumps(
+        {
+            "status": "FAILED",
+            "task_id": "failed-task-123",
+            "error": "Database constraint violation",
+        }
+    )
+    mock_redis.eval.return_value = [0, None, failed_payload]
+
+    execution_count = 0
+
+    @idempotent_task(key_param="idempotency_key")
+    def sample_fn(idempotency_key: str | None = None) -> str:
+        nonlocal execution_count
+        execution_count += 1
+        return "should-never-run"
+
+    with patch("app.core.tasks.idempotency.get_sync_redis_client", return_value=mock_redis):
+        res = sample_fn(idempotency_key="key-failed-task")
+        assert res["status"] == "task_previously_failed"
+        assert res["original_task_id"] == "failed-task-123"
+        assert res["error"] == "Database constraint violation"
+        assert execution_count == 0
+
+
+def test_idempotent_task_safe_recovery_transition_from_dispatch_unknown() -> None:
+    """FINDING 1: Verify DISPATCH_UNKNOWN with matching task_id safely recovers and executes."""
+    mock_redis = MagicMock()
+    unknown_payload = json.dumps(
+        {
+            "status": "DISPATCH_UNKNOWN",
+            "task_id": "matching-worker-task-1",
+        }
+    )
+    # 1. Acquire transitions DISPATCH_UNKNOWN to PROCESSING for matching task_id
+    mock_redis.eval.side_effect = [
+        [1, "recovered-token-1", unknown_payload],  # acquire
+        1,  # complete
+    ]
+
+    execution_count = 0
+
+    @idempotent_task(key_param="idempotency_key")
+    def sample_fn(idempotency_key: str | None = None) -> str:
+        nonlocal execution_count
+        execution_count += 1
+        return "recovered-success"
+
+    # Simulate Celery task instance with matching request.id
+    class FakeTask:
+        def __init__(self) -> None:
+            self.request = MagicMock(id="matching-worker-task-1", headers={})
+            self.name = "fake_task"
+
+    fake_task = FakeTask()
+
+    @idempotent_task(key_param="idempotency_key")
+    def sample_bound_fn(self: Any, idempotency_key: str | None = None) -> str:
+        nonlocal execution_count
+        execution_count += 1
+        return "recovered-success"
+
+    with patch("app.core.tasks.idempotency.get_sync_redis_client", return_value=mock_redis):
+        res = sample_bound_fn(fake_task, idempotency_key="recovery-key")
+        assert res == "recovered-success"
+        assert execution_count == 1
+
+
+def test_heartbeat_distinguishes_transient_network_error_from_confirmed_loss() -> None:
+    """FINDING 4: Verify heartbeat retries transient network errors without falsely marking ownership lost."""
+    import redis
+
+    mock_redis = MagicMock()
+    # 1st call throws connection error, 2nd succeeds with renewed
+    mock_redis.eval.side_effect = [
+        redis.ConnectionError("Temporary Redis connection timeout"),
+        [1, "RENEWED"],
+    ]
+
+    manager = IdempotencyManager(sync_client=mock_redis)
+    heartbeat = LockHeartbeat(
+        manager=manager,
+        key="test-key",
+        lock_token="valid-token",
+        interval=0.05,
+        extend_ttl=360,
+        max_consecutive_network_failures=3,
+    )
+    heartbeat.start()
+    import time
+
+    time.sleep(0.15)
+    heartbeat.stop()
+
+    # Heartbeat must NOT have marked ownership lost because connection recovered
+    assert heartbeat.is_ownership_lost() is False
+
+
+def test_heartbeat_confirms_ownership_lost_on_expired_or_mismatched_token() -> None:
+    """FINDING 4: Verify heartbeat immediately marks ownership lost when Redis confirms token mismatch."""
+    mock_redis = MagicMock()
+    # Redis confirms TOKEN_MISMATCH (another worker stole lock)
+    mock_redis.eval.return_value = [0, "TOKEN_MISMATCH"]
+
+    manager = IdempotencyManager(sync_client=mock_redis)
+    heartbeat = LockHeartbeat(
+        manager=manager,
+        key="test-key",
+        lock_token="stale-token",
+        interval=0.05,
+        extend_ttl=360,
+    )
+    heartbeat.start()
+    import time
+
+    time.sleep(0.12)
+    heartbeat.stop()
+
+    assert heartbeat.is_ownership_lost() is True
+    assert heartbeat.loss_reason == "TOKEN_MISMATCH"
+
+
+def test_idempotent_task_aborts_if_lock_ownership_lost_during_execution() -> None:
+    """FINDING 4: Verify task raises PermanentTaskError if heartbeat detected lock loss during execution."""
+    mock_redis = MagicMock()
+    # 1. Acquire succeeds
+    # 2. Heartbeat renewal returns TOKEN_MISMATCH
+    mock_redis.eval.side_effect = [
+        [1, "worker-token-lost", "{}"],  # acquire
+        [0, "TOKEN_MISMATCH"],  # heartbeat renewal
+    ]
+
+    @idempotent_task(key_param="idempotency_key", lock_ttl=60, heartbeat_interval=0.03)
+    def long_task(idempotency_key: str | None = None) -> str:
+        import time
+
+        time.sleep(0.12)  # Allow heartbeat to fire and detect TOKEN_MISMATCH
+        return "finished-computation"
+
+    with patch("app.core.tasks.idempotency.get_sync_redis_client", return_value=mock_redis):
+        with pytest.raises(PermanentTaskError) as exc_info:
+            long_task(idempotency_key="ownership-loss-key")
+
+        assert "lock ownership lost during execution" in str(exc_info.value)

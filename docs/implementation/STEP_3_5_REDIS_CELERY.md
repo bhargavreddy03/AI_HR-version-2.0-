@@ -121,25 +121,44 @@ Idempotency keys are tracked in Redis under strictly scoped keys `idempotency:ta
    - If key already exists: enforces tenant ownership verification before returning existing payload, and suppresses duplicate dispatch.
 3. **Worker Acquisition (`LUA_ACQUIRE`)**:
    - Generates a unique `lock_token` (UUID).
-   - When worker begins execution, transitions state from `PENDING` to `PROCESSING`, assigns the `lock_token`, and sets the active worker execution lease (`bounded_lock_ttl >= 360s`).
+   - When worker begins execution, transitions state from `PENDING` (or recoverable `DISPATCH_UNKNOWN` matching `task_id`) to `PROCESSING`, assigns the `lock_token`, and sets the active worker execution lease (`bounded_lock_ttl >= 360s`).
    - If key is already `PROCESSING` by another worker or `COMPLETED`: rejects acquisition, returning the existing record and suppressing duplicate execution.
-4. **Bounded Leases & Lock Renewal (`LUA_RENEW_LOCK` & `LockHeartbeat`)**:
+4. **Fail-Closed Execution Model (`@idempotent_task`)**:
+   - Underlying task execution (`fn`) is **strictly permitted if and only if** Redis confirms successful lock acquisition and returns a valid `lock_token`.
+   - If lock acquisition fails:
+     - `COMPLETED`: Returns cached result immediately.
+     - `PROCESSING` or `PENDING`: Suppresses duplicate execution safely.
+     - `FAILED`: Rejects automatic execution without running.
+     - `DISPATCH_UNKNOWN`: Permits execution only if the worker's `task_id` matches the original registered `task_id`.
+     - Unknown states, missing records, or Redis connectivity errors: **Fail closed immediately**, raising `PermanentTaskError` and preventing unprotected execution.
+5. **Bounded Leases & Resilient Lock Heartbeat (`LUA_RENEW_LOCK` & `LockHeartbeat`)**:
    - Active worker lock lease is automatically bounded to exceed the maximum Celery task execution time (`max(lock_ttl, settings.CELERY_TASK_TIME_LIMIT + 60)`).
-   - While the task is actively executing, a background daemon `LockHeartbeat` periodically calls `renew()` using `LUA_RENEW_LOCK`, extending the key's lease TTL.
-   - Renewal strictly requires and validates that caller's `lock_token` matches the stored lock token in Redis.
-5. **Safe Broker Dispatch Failure & Reconciliation (`DISPATCH_UNKNOWN`)**:
+   - While the task is actively executing, a background daemon `LockHeartbeat` periodically calls `renew_with_reason()` using `LUA_RENEW_LOCK`, extending the key's lease TTL.
+   - **Transient Network Errors vs Confirmed Loss**:
+     - `LockHeartbeat` distinguishes transient Redis connectivity failures (`ConnectionError`, `TimeoutError`) from confirmed lock ownership loss (`KEY_EXPIRED`, `TOKEN_MISMATCH`, `NO_ACTIVE_LOCK`).
+     - Transient network drops are retried within a bounded window (up to `max_consecutive_network_failures=3`).
+     - Explicit Redis rejections (`TOKEN_MISMATCH`, `KEY_EXPIRED`) immediately mark ownership lost.
+     - If lock ownership was confirmed lost during execution or if `complete()` returns failure, the task aborts and raises `PermanentTaskError` rather than claiming false success.
+6. **Safe Broker Dispatch Failure & Atomic Reconciliation (`DISPATCH_UNKNOWN`)**:
    - If Celery broker dispatch raises an exception (e.g., broker timeout or connection drop where broker may have already accepted the message), the idempotency record is **not** deleted.
-   - The state is atomically updated to `DISPATCH_UNKNOWN` via `LUA_RECORD_DISPATCH_UNKNOWN` with the dispatch error details.
+   - The state is conditionally updated to `DISPATCH_UNKNOWN` via `LUA_RECORD_DISPATCH_UNKNOWN`:
+     - Verifies `expected_task_id`.
+     - **Never overwrites** active or terminal states (`PROCESSING`, `COMPLETED`, `FAILED`).
+     - **Never overwrites** if an active worker `lock_token` has already been assigned.
+     - Preserves completed task results even if the worker finished before the API publisher timed out.
    - When the client retries with the same `Idempotency-Key`, `TaskService` inspects the Celery result backend and broker:
      - If the task was already received and is executing/finished (`STARTED`, `SUCCESS`, `FAILURE`, `RETRY`), it reconciles to that status and returns `duplicate=True` without redispatching.
-     - If the task was not yet picked up (`PENDING`), it safely re-dispatches using the **exact same** `task_id` and reconciles status to `PENDING` via `LUA_RECONCILE_DISPATCH` with `DEFAULT_SUBMISSION_TTL`. Duplicate execution is strictly impossible because both messages share the same Celery ID and same Redis lock.
-6. **Completion Protection (`LUA_COMPLETE`)**:
-   - Atomically sets status to `COMPLETED` and stores the serialized result with retention TTL (`result_ttl = 86400s`, 24 hours) **only if** the record's `lock_token` matches the current worker.
-   - Prevents stale or expired workers from overwriting new lock holders.
-7. **Transient Failure (`LUA_RELEASE`)**:
-   - Releases the active worker lock lease and restores the record to `PENDING` with `DEFAULT_SUBMISSION_TTL` **only if** the `lock_token` matches the current worker, allowing the scheduled retry to safely re-acquire while blocking concurrent duplicate submissions during retry backoff.
-8. **Permanent Failure (`LUA_FAIL`)**:
-   - Marks the task as `FAILED` with retention TTL **only if** the `lock_token` matches the current worker.
+     - If the task was not yet picked up, it re-dispatches using the **exact same** `task_id` and reconciles status via `LUA_RECONCILE_DISPATCH` with `expected_task_id` verification.
+7. **Completion Protection (`LUA_COMPLETE`)**:
+   - Atomically sets status to `COMPLETED` and stores the serialized result with retention TTL (`result_ttl = 86400s`, 24 hours) **strictly if** the record's `lock_token` matches the current worker.
+   - Stale or expired workers can never overwrite new lock holders.
+8. **Transient Failure (`LUA_RELEASE`)**:
+   - Releases the active worker lock lease and restores the record to `PENDING` with `DEFAULT_SUBMISSION_TTL` **strictly if** the `lock_token` matches the current worker, allowing the scheduled retry to safely re-acquire while blocking concurrent duplicate submissions during retry backoff.
+9. **Permanent Failure (`LUA_FAIL`)**:
+   - Marks the task as `FAILED` with retention TTL **strictly if** the `lock_token` matches the current worker.
+10. **External Side Effects & Distributed Transactions**:
+   - The distributed lock and idempotency state machine guarantees single-worker execution boundaries within the Celery and Redis infrastructure.
+   - External side effects (such as third-party HTTP webhooks, external payment APIs, or transactional emails) must additionally supply business-level idempotency tokens or utilize transactional outbox mechanisms to guarantee end-to-end exactly-once business semantics across external boundaries.
 
 ---
 

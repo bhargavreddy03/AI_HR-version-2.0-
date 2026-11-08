@@ -406,3 +406,89 @@ async def test_task_service_crafted_prefix_key_cannot_collide_across_tenants() -
     # It must be scoped under tenant_attacker, preventing any collision with tenant_victim
     assert f"{IDEMPOTENCY_PREFIX}{tenant_attacker}" in actual_redis_key
     assert actual_redis_key.startswith(f"{IDEMPOTENCY_PREFIX}{tenant_attacker}")
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_skips_redispatch_if_worker_already_acquired() -> None:
+    """FINDING 2: Verify API reconciliation racing with worker acquisition never overwrites PROCESSING."""
+    mock_celery = MagicMock()
+    mock_task = MagicMock()
+    mock_task.name = "racing_task"
+
+    mock_redis = AsyncMock()
+    existing_unknown = json.dumps(
+        {
+            "status": "DISPATCH_UNKNOWN",
+            "task_id": "racing-task-id",
+            "tenant_id": None,
+        }
+    )
+    processing_payload = json.dumps(
+        {
+            "status": "PROCESSING",
+            "task_id": "racing-task-id",
+            "lock_token": "active-worker-token",
+        }
+    )
+    # 1. register returns existing DISPATCH_UNKNOWN
+    # 2. reconcile_dispatch_async returns rejection because worker acquired concurrently
+    mock_redis.eval.side_effect = [
+        [0, existing_unknown],  # register
+        [0, "IMMUTABLE_STATE_PROCESSING", processing_payload],  # reconcile
+    ]
+
+    service = TaskService(app_celery=mock_celery)
+
+    with patch("app.services.task_service.AsyncResult") as mock_ar_cls:
+        mock_ar = MagicMock()
+        mock_ar.state = "PENDING"
+        mock_ar_cls.return_value = mock_ar
+
+        res = await service.submit_task(
+            task=mock_task,
+            idempotency_key="racing-key",
+            redis_client=mock_redis,
+        )
+
+        assert res.duplicate is True
+        assert res.task_id == "racing-task-id"
+        assert res.status == "PROCESSING"
+        # Must NOT re-dispatch when worker has already acquired
+        mock_task.apply_async.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_record_dispatch_unknown_preserves_completed_task() -> None:
+    """FINDING 3: Verify publish error never overwrites a task already completed by a fast worker."""
+    mock_celery = MagicMock()
+    mock_task = MagicMock()
+    mock_task.name = "fast_worker_task"
+    mock_task.apply_async.side_effect = RuntimeError("Socket read timeout from broker")
+
+    mock_redis = AsyncMock()
+    completed_payload = json.dumps(
+        {
+            "status": "COMPLETED",
+            "task_id": "fast-task-id",
+            "result": {"computed": 100},
+        }
+    )
+    # 1. Registration succeeds
+    # 2. record_dispatch_unknown returns rejection because worker already COMPLETED the task
+    mock_redis.eval.side_effect = [
+        [1, "{}"],  # register
+        [0, "IMMUTABLE_STATE_COMPLETED", completed_payload],  # record_dispatch_unknown
+    ]
+
+    service = TaskService(app_celery=mock_celery)
+
+    res = await service.submit_task(
+        task=mock_task,
+        idempotency_key="fast-worker-key",
+        redis_client=mock_redis,
+    )
+
+    # Must recognise that task completed successfully and preserve result
+    assert res.duplicate is True
+    assert res.status == "COMPLETED"
+    assert res.task_id is not None

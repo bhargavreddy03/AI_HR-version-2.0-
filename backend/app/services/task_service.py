@@ -18,6 +18,7 @@ from redis.asyncio import Redis as AsyncRedis
 from app.core.celery_app import celery_app
 from app.core.errors import AuthorizationException, ServiceUnavailableException
 from app.core.tasks.idempotency import (
+    DEFAULT_DISPATCH_UNKNOWN_TTL,
     DEFAULT_SUBMISSION_TTL,
     IdempotencyManager,
     format_scoped_key,
@@ -151,11 +152,45 @@ class TaskService:
                         await IdempotencyManager.reconcile_dispatch_async(
                             client=redis_client,
                             key=scoped_key,
+                            expected_task_id=existing_task_id,
                             new_status=current_state,
+                            ttl=DEFAULT_SUBMISSION_TTL,
                         )
                         return TaskSubmissionResult(
                             task_id=existing_task_id,
                             status=current_state,
+                            queue=target_queue,
+                            duplicate=True,
+                        )
+
+                    # FINDING 2: Atomically reconcile to PENDING before re-dispatching.
+                    # Verify task ID and ensure worker has not already acquired (PROCESSING/COMPLETED).
+                    (
+                        reconciled,
+                        reason,
+                        current_payload,
+                    ) = await IdempotencyManager.reconcile_dispatch_async(
+                        client=redis_client,
+                        key=scoped_key,
+                        expected_task_id=existing_task_id,
+                        new_status="PENDING",
+                        ttl=DEFAULT_SUBMISSION_TTL,
+                    )
+                    if not reconciled:
+                        curr_status = (
+                            current_payload.get("status", "PROCESSING")
+                            if current_payload
+                            else "PROCESSING"
+                        )
+                        logger.info(
+                            "Reconciliation to PENDING skipped for key=%s: worker active/completed (%s, %s)",
+                            scoped_key,
+                            curr_status,
+                            reason,
+                        )
+                        return TaskSubmissionResult(
+                            task_id=existing_task_id,
+                            status=curr_status,
                             queue=target_queue,
                             duplicate=True,
                         )
@@ -175,12 +210,6 @@ class TaskService:
                             return str(res.id)
 
                         await asyncio.to_thread(_redispatch)
-                        await IdempotencyManager.reconcile_dispatch_async(
-                            client=redis_client,
-                            key=scoped_key,
-                            new_status="PENDING",
-                            ttl=DEFAULT_SUBMISSION_TTL,
-                        )
                         return TaskSubmissionResult(
                             task_id=existing_task_id,
                             status="PENDING",
@@ -259,16 +288,38 @@ class TaskService:
         try:
             task_id = await asyncio.to_thread(_dispatch)
         except Exception as dispatch_exc:
-            # Handle uncertain dispatch outcomes safely. Do not immediately delete registration records.
-            # Record recoverable DISPATCH_UNKNOWN state so retries reconcile without duplicate tasks.
+            # FINDING 3: Conditionally record DISPATCH_UNKNOWN.
+            # Never overwrite PROCESSING, COMPLETED, or FAILED. Preserve results and lock tokens intact.
             if redis_client is not None and scoped_key:
                 try:
-                    await IdempotencyManager.record_dispatch_unknown_async(
+                    (
+                        recorded,
+                        reason,
+                        current_payload,
+                    ) = await IdempotencyManager.record_dispatch_unknown_async(
                         client=redis_client,
                         key=scoped_key,
+                        expected_task_id=assigned_task_id,
                         error_msg=str(dispatch_exc),
-                        ttl=600,
+                        ttl=DEFAULT_DISPATCH_UNKNOWN_TTL,
                     )
+                    if not recorded and current_payload:
+                        curr_status = str(current_payload.get("status", "UNKNOWN"))
+                        logger.info(
+                            "Dispatch threw error %s, but task %s is already %s (reason: %s)",
+                            dispatch_exc,
+                            assigned_task_id,
+                            curr_status,
+                            reason,
+                        )
+                        # If worker already started or completed the task, return duplicate response
+                        if curr_status in ("COMPLETED", "PROCESSING"):
+                            return TaskSubmissionResult(
+                                task_id=assigned_task_id,
+                                status=curr_status,
+                                queue=target_queue,
+                                duplicate=True,
+                            )
                 except Exception as rec_exc:
                     logger.warning("Failed to record DISPATCH_UNKNOWN state in Redis: %s", rec_exc)
             elif redis_client is not None and not idempotency_key:

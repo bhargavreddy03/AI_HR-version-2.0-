@@ -18,7 +18,7 @@ from redis.asyncio import Redis as AsyncRedis
 from app.core.config import Settings, get_settings
 from app.core.errors import ServiceUnavailableException
 from app.core.redis import get_sync_redis_client
-from app.core.tasks.base import TransientTaskError
+from app.core.tasks.base import PermanentTaskError, TransientTaskError
 
 logger = logging.getLogger("app.tasks.idempotency")
 
@@ -86,7 +86,7 @@ end
 return {0, val}
 """
 
-# Atomic worker acquisition: transitions from empty OR from PENDING (with matching task_id) to PROCESSING
+# Atomic worker acquisition: transitions from empty OR from PENDING/DISPATCH_UNKNOWN (with matching task_id) to PROCESSING
 LUA_ACQUIRE = """
 local key = KEYS[1]
 local task_id = ARGV[1]
@@ -115,7 +115,7 @@ if not val then
 end
 
 local data = cjson.decode(val)
-if data.status == "PENDING" and (data.task_id == task_id or task_id == "standalone") then
+if (data.status == "PENDING" or data.status == "DISPATCH_UNKNOWN") and (data.task_id == task_id or task_id == "standalone") then
     data.status = "PROCESSING"
     data.lock_token = lock_token
     data.started_at = now_str
@@ -143,66 +143,96 @@ local lock_token = ARGV[1]
 local extend_ttl = tonumber(ARGV[2])
 
 if not lock_token or lock_token == "" then
-    return 0
+    return {0, "MISSING_CALLER_TOKEN"}
 end
 
 local val = redis.call('GET', key)
 if not val then
-    return 0
+    return {0, "KEY_EXPIRED"}
 end
 
 local data = cjson.decode(val)
 if not data.lock_token or data.lock_token == cjson.null or data.lock_token == "" then
-    return 0
+    return {0, "NO_ACTIVE_LOCK"}
 end
 
 if data.lock_token ~= lock_token then
-    return 0
+    return {0, "TOKEN_MISMATCH"}
 end
 
 redis.call('EXPIRE', key, extend_ttl)
-return 1
+return {1, "RENEWED"}
 """
 
-# Atomic state transition to DISPATCH_UNKNOWN when broker dispatch encounters an uncertain error
+# Atomic conditional state transition to DISPATCH_UNKNOWN when broker dispatch encounters an uncertain error
 LUA_RECORD_DISPATCH_UNKNOWN = """
 local key = KEYS[1]
-local error_msg = ARGV[1]
-local ttl = tonumber(ARGV[2])
-local now_str = ARGV[3]
+local expected_task_id = ARGV[1]
+local error_msg = ARGV[2]
+local ttl = tonumber(ARGV[3])
+local now_str = ARGV[4]
 
 local val = redis.call('GET', key)
 if not val then
-    return 0
+    return {0, "KEY_NOT_FOUND", cjson.null}
 end
 
 local data = cjson.decode(val)
+if expected_task_id and expected_task_id ~= "" and data.task_id ~= expected_task_id then
+    return {0, "TASK_ID_MISMATCH", val}
+end
+
+-- Strictly protect active and terminal states: NEVER overwrite PROCESSING, COMPLETED, or FAILED
+if data.status == "PROCESSING" or data.status == "COMPLETED" or data.status == "FAILED" then
+    return {0, "IMMUTABLE_STATE_" .. data.status, val}
+end
+
+-- Strictly protect if an active worker lock token has already been assigned
+if data.lock_token and data.lock_token ~= cjson.null and data.lock_token ~= "" then
+    return {0, "ACTIVE_LOCK_PRESENT", val}
+end
+
 data.status = "DISPATCH_UNKNOWN"
 data.dispatch_error = error_msg
 data.updated_at = now_str
 local new_payload = cjson.encode(data)
 redis.call('SET', key, new_payload, 'EX', ttl)
-return 1
+return {1, "RECORDED", new_payload}
 """
 
-# Atomic state reconciliation: updates DISPATCH_UNKNOWN back to PENDING or active state
+# Atomic conditional state reconciliation: updates DISPATCH_UNKNOWN back to PENDING or active state
 LUA_RECONCILE_DISPATCH = """
 local key = KEYS[1]
-local new_status = ARGV[1]
-local ttl = tonumber(ARGV[2])
-local now_str = ARGV[3]
+local expected_task_id = ARGV[1]
+local new_status = ARGV[2]
+local ttl = tonumber(ARGV[3])
+local now_str = ARGV[4]
 
 local val = redis.call('GET', key)
 if not val then
-    return 0
+    return {0, "KEY_NOT_FOUND", cjson.null}
 end
 
 local data = cjson.decode(val)
+if expected_task_id and expected_task_id ~= "" and data.task_id ~= expected_task_id then
+    return {0, "TASK_ID_MISMATCH", val}
+end
+
+-- Strictly protect active and terminal states: never overwrite with PENDING, never wipe lock_token
+if data.status == "PROCESSING" or data.status == "COMPLETED" or data.status == "FAILED" then
+    return {0, "IMMUTABLE_STATE_" .. data.status, val}
+end
+
+-- If key has an active worker lock token, never overwrite it
+if data.lock_token and data.lock_token ~= cjson.null and data.lock_token ~= "" then
+    return {0, "ACTIVE_LOCK_PRESENT", val}
+end
+
 data.status = new_status
 data.reconciled_at = now_str
 local new_payload = cjson.encode(data)
 redis.call('SET', key, new_payload, 'EX', ttl)
-return 1
+return {1, "RECONCILED", new_payload}
 """
 
 # Atomic task completion: stores result and COMPLETED status strictly if caller owns lock_token
@@ -454,6 +484,35 @@ class IdempotencyManager:
                 error_code="IDEMPOTENCY_UNAVAILABLE",
             ) from exc
 
+    def renew_with_reason(
+        self,
+        key: str,
+        lock_token: str | None,
+        extend_ttl: int = 360,
+    ) -> tuple[bool, str]:
+        """Atomically extend lock lifetime for the active owner holding lock_token.
+
+        Returns (success, reason).
+        """
+        if not lock_token or not lock_token.strip():
+            logger.warning("Rejected renew() attempt without valid lock_token for key %s", key)
+            return False, "MISSING_CALLER_TOKEN"
+
+        redis_key = self._format_key(key)
+        res = self.sync_client.eval(
+            LUA_RENEW_LOCK,
+            1,
+            redis_key,
+            lock_token,
+            str(extend_ttl),
+        )
+        if isinstance(res, list | tuple):
+            success = bool(res[0])
+            reason = str(res[1]) if len(res) > 1 else ("RENEWED" if success else "REJECTED")
+            return success, reason
+        success = bool(res)
+        return success, "RENEWED" if success else "REJECTED"
+
     def renew(
         self,
         key: str,
@@ -461,20 +520,9 @@ class IdempotencyManager:
         extend_ttl: int = 360,
     ) -> bool:
         """Atomically extend lock lifetime for the active owner holding lock_token."""
-        if not lock_token or not lock_token.strip():
-            logger.warning("Rejected renew() attempt without valid lock_token for key %s", key)
-            return False
-
-        redis_key = self._format_key(key)
         try:
-            res = self.sync_client.eval(
-                LUA_RENEW_LOCK,
-                1,
-                redis_key,
-                lock_token,
-                str(extend_ttl),
-            )
-            return bool(res)
+            success, _ = self.renew_with_reason(key, lock_token, extend_ttl)
+            return success
         except Exception as exc:
             logger.error("Redis failure during lock renewal for key %s: %s", key, exc)
             return False
@@ -514,6 +562,8 @@ class IdempotencyManager:
                 str(result_ttl),
                 now_str,
             )
+            if isinstance(res, list | tuple):
+                return bool(res[0])
             return bool(res)
         except Exception as exc:
             logger.error("Redis failure during idempotency complete: %s", exc)
@@ -549,6 +599,8 @@ class IdempotencyManager:
                 str(ttl),
                 now_str,
             )
+            if isinstance(res, list | tuple):
+                return bool(res[0])
             return bool(res)
         except Exception as exc:
             logger.error("Redis failure during idempotency fail: %s", exc)
@@ -705,10 +757,10 @@ class IdempotencyManager:
         key: str,
         lock_token: str | None,
         extend_ttl: int = 360,
-    ) -> bool:
+    ) -> tuple[bool, str]:
         """Asynchronously extend lock lifetime for the active owner holding lock_token."""
         if not lock_token or not lock_token.strip():
-            return False
+            return False, "MISSING_CALLER_TOKEN"
         redis_key = f"{IDEMPOTENCY_PREFIX}{key}" if not key.startswith(IDEMPOTENCY_PREFIX) else key
         try:
             res = await client.eval(
@@ -718,20 +770,26 @@ class IdempotencyManager:
                 lock_token,
                 str(extend_ttl),
             )
-            return bool(res)
+            if isinstance(res, list | tuple):
+                success = bool(res[0])
+                reason = str(res[1]) if len(res) > 1 else ("RENEWED" if success else "REJECTED")
+                return success, reason
+            success = bool(res)
+            return success, "RENEWED" if success else "REJECTED"
         except Exception as exc:
             logger.error("Redis failure during async lock renewal: %s", exc)
-            return False
+            return False, "REDIS_ERROR"
 
     @classmethod
     async def record_dispatch_unknown_async(
         cls,
         client: AsyncRedis[Any],
         key: str,
+        expected_task_id: str,
         error_msg: str,
-        ttl: int = 600,
-    ) -> bool:
-        """Record recoverable uncertain dispatch state when Celery dispatch encounters an exception."""
+        ttl: int = DEFAULT_DISPATCH_UNKNOWN_TTL,
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        """Conditionally record DISPATCH_UNKNOWN state without overwriting active/terminal states."""
         redis_key = f"{IDEMPOTENCY_PREFIX}{key}" if not key.startswith(IDEMPOTENCY_PREFIX) else key
         now_str = datetime.now(UTC).isoformat()
         try:
@@ -739,24 +797,33 @@ class IdempotencyManager:
                 LUA_RECORD_DISPATCH_UNKNOWN,
                 1,
                 redis_key,
+                expected_task_id,
                 error_msg,
                 str(ttl),
                 now_str,
             )
-            return bool(res)
+            if isinstance(res, list | tuple):
+                success = bool(res[0])
+                reason = str(res[1]) if len(res) > 1 else ("RECORDED" if success else "REJECTED")
+                raw_payload = res[2] if len(res) > 2 else None
+                payload = json.loads(str(raw_payload)) if raw_payload else None
+                return success, reason, payload
+            success = bool(res)
+            return success, "RECORDED" if success else "REJECTED", None
         except Exception as exc:
             logger.error("Redis failure recording DISPATCH_UNKNOWN: %s", exc)
-            return False
+            return False, "REDIS_ERROR", None
 
     @classmethod
     async def reconcile_dispatch_async(
         cls,
         client: AsyncRedis[Any],
         key: str,
+        expected_task_id: str,
         new_status: str = "PENDING",
         ttl: int = DEFAULT_SUBMISSION_TTL,
-    ) -> bool:
-        """Atomically reconcile DISPATCH_UNKNOWN state back to PENDING or active state."""
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        """Atomically reconcile DISPATCH_UNKNOWN state conditional on task ID and current status."""
         redis_key = f"{IDEMPOTENCY_PREFIX}{key}" if not key.startswith(IDEMPOTENCY_PREFIX) else key
         now_str = datetime.now(UTC).isoformat()
         try:
@@ -764,14 +831,25 @@ class IdempotencyManager:
                 LUA_RECONCILE_DISPATCH,
                 1,
                 redis_key,
+                expected_task_id,
                 new_status,
                 str(ttl),
                 now_str,
             )
-            return bool(res)
+            if isinstance(res, list | tuple):
+                success = bool(res[0])
+                reason = str(res[1]) if len(res) > 1 else ("RECONCILED" if success else "REJECTED")
+                raw_payload = res[2] if len(res) > 2 else None
+                payload = json.loads(str(raw_payload)) if raw_payload else None
+                return success, reason, payload
+            success = bool(res)
+            return success, "RECONCILED" if success else "REJECTED", None
         except Exception as exc:
             logger.error("Redis failure reconciling dispatch: %s", exc)
-            return False
+            raise ServiceUnavailableException(
+                "Idempotency service unavailable during reconciliation.",
+                error_code="IDEMPOTENCY_UNAVAILABLE",
+            ) from exc
 
     @classmethod
     async def get_async(
@@ -798,7 +876,13 @@ class IdempotencyManager:
 
 
 class LockHeartbeat:
-    """Background heartbeat thread to periodically renew lock TTL while task is running."""
+    """Background heartbeat thread to periodically renew lock lease while task executes.
+
+    - Distinguishes temporary Redis network errors from confirmed lock ownership loss.
+    - Retries transient network failures within a bounded window.
+    - Confirms ownership loss when Redis returns KEY_EXPIRED, TOKEN_MISMATCH, or NO_ACTIVE_LOCK.
+    - Prevents tasks from claiming success when lock ownership has been lost.
+    """
 
     def __init__(
         self,
@@ -807,26 +891,66 @@ class LockHeartbeat:
         lock_token: str,
         interval: float,
         extend_ttl: int,
+        max_consecutive_network_failures: int = 3,
     ) -> None:
         self.manager = manager
         self.key = key
         self.lock_token = lock_token
         self.interval = interval
         self.extend_ttl = extend_ttl
+        self.max_consecutive_network_failures = max_consecutive_network_failures
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._ownership_lost = False
+        self._loss_reason: str | None = None
+        self._lock = threading.Lock()
+
+    def is_ownership_lost(self) -> bool:
+        with self._lock:
+            return self._ownership_lost
+
+    @property
+    def loss_reason(self) -> str | None:
+        with self._lock:
+            return self._loss_reason
+
+    def _mark_ownership_lost(self, reason: str) -> None:
+        with self._lock:
+            self._ownership_lost = True
+            self._loss_reason = reason
+        logger.error(
+            "CRITICAL: Lock ownership confirmed lost for key %s (reason: %s). Task execution cannot be trusted.",
+            self.key,
+            reason,
+        )
 
     def start(self) -> None:
         def _run() -> None:
+            consecutive_network_failures = 0
             while not self._stop_event.wait(self.interval):
                 try:
-                    renewed = self.manager.renew(self.key, self.lock_token, self.extend_ttl)
-                    if not renewed:
-                        logger.warning("Lock renewal failed or lost ownership for key %s", self.key)
-                        break
-                except Exception as exc:
-                    logger.warning("Exception during lock heartbeat renewal: %s", exc)
+                    renewed, reason = self.manager.renew_with_reason(
+                        self.key, self.lock_token, self.extend_ttl
+                    )
+                    if renewed:
+                        consecutive_network_failures = 0
+                        continue
+
+                    # Confirmed lock loss from Redis (e.g. KEY_EXPIRED, TOKEN_MISMATCH)
+                    self._mark_ownership_lost(reason or "CONFIRMED_LOCK_LOSS")
                     break
+                except Exception as exc:
+                    consecutive_network_failures += 1
+                    logger.warning(
+                        "Transient network failure in lock heartbeat for key %s (failure %d/%d): %s",
+                        self.key,
+                        consecutive_network_failures,
+                        self.max_consecutive_network_failures,
+                        exc,
+                    )
+                    if consecutive_network_failures >= self.max_consecutive_network_failures:
+                        self._mark_ownership_lost(f"EXCEEDED_MAX_NETWORK_FAILURES: {exc}")
+                        break
 
         self._thread = threading.Thread(target=_run, daemon=True, name="lock-heartbeat")
         self._thread.start()
@@ -841,13 +965,16 @@ def idempotent_task(
     key_param: str = "idempotency_key",
     lock_ttl: int = 360,
     result_ttl: int = 86400,
+    heartbeat_interval: float | None = None,
 ) -> Callable[[F], F]:
-    """Decorator ensuring Celery task execution is idempotent under at-least-once delivery.
+    """Decorator ensuring Celery task execution is strictly idempotent under at-least-once delivery.
 
-    - Scopes idempotency keys across tenants, users, and task types.
-    - Uses properly bounded leases exceeding maximum execution time (CELERY_TASK_TIME_LIMIT).
-    - Periodically renews worker lock while task executes.
-    - Strictly checks ownership tokens during renewal, completion, failure, and release.
+    - Fail-closed: Never executes the underlying task without an acquired lock token.
+    - Returns cached results for COMPLETED tasks.
+    - Suppresses duplicate execution for PROCESSING or PENDING tasks.
+    - Fails closed for FAILED tasks or unknown/unacquirable states.
+    - Periodic heartbeat renews worker execution lease with transient network retry.
+    - Confirmed ownership loss aborts completion and raises PermanentTaskError.
     """
 
     def decorator(fn: F) -> F:
@@ -883,9 +1010,13 @@ def idempotent_task(
             manager = IdempotencyManager()
             settings = manager.settings
 
-            # Ensure lease is safely bounded to exceed hard task time limit
+            # Ensure worker execution lease is safely bounded to exceed hard task time limit
             bounded_lock_ttl = max(lock_ttl, settings.CELERY_TASK_TIME_LIMIT + 60)
-            heartbeat_interval = min(bounded_lock_ttl / 4.0, 30.0)
+            effective_heartbeat_interval = (
+                heartbeat_interval
+                if heartbeat_interval is not None
+                else min(bounded_lock_ttl / 4.0, 30.0)
+            )
 
             acquired, lock_token, existing = manager.acquire(
                 key=scoped_key,
@@ -893,47 +1024,76 @@ def idempotent_task(
                 lock_ttl=bounded_lock_ttl,
             )
 
-            if not acquired and existing:
-                if existing.get("status") == "COMPLETED":
-                    logger.info(
-                        "Idempotent task returning cached result: key=%s, task_id=%s",
-                        scoped_key,
-                        task_id,
-                    )
-                    return existing.get("result")
-                if existing.get("status") in ("PROCESSING", "PENDING"):
-                    logger.warning(
-                        "Duplicate task execution suppressed (already running): key=%s, owner_task_id=%s",
-                        scoped_key,
-                        existing.get("task_id"),
-                    )
-                    return {
-                        "status": "duplicate_execution_suppressed",
-                        "idempotency_key": idempotency_key,
-                        "original_task_id": existing.get("task_id"),
-                    }
+            # FINDING 1: FAIL-CLOSED LOCK ENFORCEMENT
+            # Under no circumstances may fn() execute if lock acquisition failed or lock_token is missing.
+            if not acquired or not lock_token:
+                if existing:
+                    status = existing.get("status")
+                    if status == "COMPLETED":
+                        logger.info(
+                            "Idempotent task returning cached result: key=%s, task_id=%s",
+                            scoped_key,
+                            task_id,
+                        )
+                        return existing.get("result")
+                    if status in ("PROCESSING", "PENDING"):
+                        logger.warning(
+                            "Duplicate task execution suppressed (already running/pending): key=%s, owner_task_id=%s",
+                            scoped_key,
+                            existing.get("task_id"),
+                        )
+                        return {
+                            "status": "duplicate_execution_suppressed",
+                            "idempotency_key": idempotency_key,
+                            "original_task_id": existing.get("task_id"),
+                        }
+                    if status == "FAILED":
+                        logger.warning(
+                            "Execution rejected: task previously failed permanently: key=%s, task_id=%s",
+                            scoped_key,
+                            existing.get("task_id"),
+                        )
+                        return {
+                            "status": "task_previously_failed",
+                            "idempotency_key": idempotency_key,
+                            "original_task_id": existing.get("task_id"),
+                            "error": existing.get("error"),
+                        }
+                # Unknown state, unacquirable state, or missing record: FAIL CLOSED
+                raise PermanentTaskError(
+                    f"Unprotected task execution prevented: idempotency lock acquisition failed for key {scoped_key}"
+                )
 
             # Start active lock heartbeat while task executes
-            heartbeat = None
-            if lock_token:
-                heartbeat = LockHeartbeat(
-                    manager=manager,
-                    key=scoped_key,
-                    lock_token=lock_token,
-                    interval=heartbeat_interval,
-                    extend_ttl=bounded_lock_ttl,
-                )
-                heartbeat.start()
+            heartbeat = LockHeartbeat(
+                manager=manager,
+                key=scoped_key,
+                lock_token=lock_token,
+                interval=effective_heartbeat_interval,
+                extend_ttl=bounded_lock_ttl,
+            )
+            heartbeat.start()
 
             try:
                 result = fn(*args, **kwargs)
-                manager.complete(
+
+                # FINDING 4: Verify lock ownership was not lost during execution before reporting completion
+                if heartbeat.is_ownership_lost():
+                    raise PermanentTaskError(
+                        f"Task execution aborted for key {scoped_key}: lock ownership lost during execution ({heartbeat.loss_reason})."
+                    )
+
+                completed = manager.complete(
                     key=scoped_key,
                     result=result,
                     task_id=task_id,
                     lock_token=lock_token,
                     result_ttl=result_ttl,
                 )
+                if not completed:
+                    raise PermanentTaskError(
+                        f"Task completion rejected for key {scoped_key}: lock ownership token mismatch or expired lease."
+                    )
                 return result
             except TransientTaskError:
                 # Release worker lock lease and restore PENDING status with retention TTL so retry can acquire
@@ -944,16 +1104,16 @@ def idempotent_task(
                 )
                 raise
             except Exception as exc:
-                manager.fail(
-                    key=scoped_key,
-                    error=str(exc),
-                    task_id=task_id,
-                    lock_token=lock_token,
-                )
+                if not heartbeat.is_ownership_lost():
+                    manager.fail(
+                        key=scoped_key,
+                        error=str(exc),
+                        task_id=task_id,
+                        lock_token=lock_token,
+                    )
                 raise
             finally:
-                if heartbeat is not None:
-                    heartbeat.stop()
+                heartbeat.stop()
 
         return wrapper  # type: ignore[return-value]
 

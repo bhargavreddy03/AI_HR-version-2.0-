@@ -378,3 +378,224 @@ async def test_dispatch_failure_records_recoverable_dispatch_unknown() -> None:
     # Ensure idempotency key was NOT deleted
     for delete_call in mock_redis.delete.call_args_list:
         assert "key-dispatch-unknown" not in str(delete_call)
+
+
+@pytest.mark.integration
+@skip_if_no_redis
+@pytest.mark.asyncio
+async def test_live_redis_dispatch_unknown_preserves_completed_and_active_states() -> None:
+    """FINDING 3: Verify live Redis Lua script rejects DISPATCH_UNKNOWN when task already COMPLETED or PROCESSING."""
+    settings = Settings()
+    sync_redis = get_sync_redis_client(settings)
+    async_redis = create_redis_client(settings)
+    manager = IdempotencyManager(sync_client=sync_redis, settings=settings)
+
+    test_key = "live-preserve-test-" + uuid.uuid4().hex
+    task_id = "task-" + uuid.uuid4().hex
+
+    try:
+        # 1. Register PENDING submission
+        reg_ok, _ = await IdempotencyManager.register_submission_async(
+            client=async_redis,
+            key=test_key,
+            task_id=task_id,
+            tenant_id=TENANT_A,
+        )
+        assert reg_ok is True
+
+        # 2. Worker acquires lock (state becomes PROCESSING)
+        acquired, lock_token, _ = manager.acquire(test_key, task_id=task_id, lock_ttl=60)
+        assert acquired is True
+        assert lock_token is not None
+
+        # Verify: DISPATCH_UNKNOWN is rejected while PROCESSING with active lock token
+        rec_ok, rec_reason, _ = await IdempotencyManager.record_dispatch_unknown_async(
+            client=async_redis,
+            key=test_key,
+            expected_task_id=task_id,
+            error_msg="Simulated broker timeout",
+        )
+        assert rec_ok is False
+        assert rec_reason in ("IMMUTABLE_STATE_PROCESSING", "ACTIVE_LOCK_PRESENT")
+
+        # 3. Worker completes task with result
+        completed = manager.complete(
+            key=test_key,
+            result={"status": "completed_payload", "value": 42},
+            task_id=task_id,
+            lock_token=lock_token,
+        )
+        assert completed is True
+
+        # Verify: DISPATCH_UNKNOWN is rejected after COMPLETED, preserving result
+        rec_ok2, rec_reason2, rec_data2 = await IdempotencyManager.record_dispatch_unknown_async(
+            client=async_redis,
+            key=test_key,
+            expected_task_id=task_id,
+            error_msg="Late publisher timeout",
+        )
+        assert rec_ok2 is False
+        assert rec_reason2 == "IMMUTABLE_STATE_COMPLETED"
+        assert rec_data2 is not None
+        assert rec_data2["status"] == "COMPLETED"
+        assert rec_data2["result"]["value"] == 42
+
+        # Verify data in Redis is still COMPLETED
+        final_data = await IdempotencyManager.get_async(async_redis, test_key)
+        assert final_data is not None
+        assert final_data["status"] == "COMPLETED"
+        assert final_data["result"]["value"] == 42
+    finally:
+        manager.force_delete(test_key)
+        await async_redis.aclose()
+
+
+@pytest.mark.integration
+@skip_if_no_redis
+@pytest.mark.asyncio
+async def test_live_redis_full_state_transition_matrix() -> None:
+    """Verify complete state transition matrix under live Redis Lua atomic scripts.
+
+    Transitions tested:
+    1. PENDING -> PROCESSING -> COMPLETED (standard success)
+    2. PENDING -> PROCESSING -> FAILED (permanent failure, fails closed)
+    3. PENDING -> PROCESSING -> (Transient error release) -> PENDING -> re-acquire -> COMPLETED
+    4. PENDING -> DISPATCH_UNKNOWN -> (worker acquires) -> PROCESSING -> COMPLETED
+    5. PENDING -> DISPATCH_UNKNOWN -> (API reconciles) -> PENDING -> PROCESSING
+    6. Concurrent duplicate suppression while PROCESSING.
+    7. Stale ownership token rejection on renewal, completion, and failure.
+    """
+    settings = Settings()
+    sync_redis = get_sync_redis_client(settings)
+    async_redis = create_redis_client(settings)
+    manager = IdempotencyManager(sync_client=sync_redis, settings=settings)
+
+    # 1. PENDING -> PROCESSING -> COMPLETED
+    k1 = "matrix-test-1-" + uuid.uuid4().hex
+    t1 = "task-matrix-1"
+    try:
+        await IdempotencyManager.register_submission_async(async_redis, k1, t1)
+        acq, tok, _ = manager.acquire(k1, task_id=t1, lock_ttl=60)
+        assert acq is True and tok is not None
+        assert manager.complete(k1, {"result": 1}, task_id=t1, lock_token=tok) is True
+        d1 = await IdempotencyManager.get_async(async_redis, k1)
+        assert d1 is not None and d1["status"] == "COMPLETED"
+    finally:
+        manager.force_delete(k1)
+
+    # 2. PENDING -> PROCESSING -> FAILED
+    k2 = "matrix-test-2-" + uuid.uuid4().hex
+    t2 = "task-matrix-2"
+    try:
+        await IdempotencyManager.register_submission_async(async_redis, k2, t2)
+        acq, tok, _ = manager.acquire(k2, task_id=t2, lock_ttl=60)
+        assert acq is True and tok is not None
+        assert manager.fail(k2, "Permanent parse error", task_id=t2, lock_token=tok) is True
+        d2 = await IdempotencyManager.get_async(async_redis, k2)
+        assert d2 is not None and d2["status"] == "FAILED"
+        # FAILED state must fail closed on subsequent acquire attempts
+        acq_fail, tok_fail, existing_fail = manager.acquire(k2, task_id=t2, lock_ttl=60)
+        assert acq_fail is False
+        assert tok_fail is None
+        assert existing_fail is not None and existing_fail["status"] == "FAILED"
+    finally:
+        manager.force_delete(k2)
+
+    # 3. PENDING -> PROCESSING -> release (transient) -> PENDING -> acquire -> COMPLETED
+    k3 = "matrix-test-3-" + uuid.uuid4().hex
+    t3 = "task-matrix-3"
+    try:
+        await IdempotencyManager.register_submission_async(async_redis, k3, t3)
+        acq, tok, _ = manager.acquire(k3, task_id=t3, lock_ttl=60)
+        assert acq is True and tok is not None
+        # Simulate transient error: release lock back to PENDING
+        assert manager.release(k3, lock_token=tok, pending_ttl=360) is True
+        d3_rel = await IdempotencyManager.get_async(async_redis, k3)
+        assert d3_rel is not None and d3_rel["status"] == "PENDING"
+        # Retry worker acquires lock again with new token
+        acq_retry, tok_retry, _ = manager.acquire(k3, task_id=t3, lock_ttl=60)
+        assert acq_retry is True and tok_retry is not None
+        assert manager.complete(k3, {"retry": "success"}, task_id=t3, lock_token=tok_retry) is True
+        d3_done = await IdempotencyManager.get_async(async_redis, k3)
+        assert d3_done is not None and d3_done["status"] == "COMPLETED"
+    finally:
+        manager.force_delete(k3)
+
+    # 4. PENDING -> DISPATCH_UNKNOWN -> worker acquires -> PROCESSING -> COMPLETED
+    k4 = "matrix-test-4-" + uuid.uuid4().hex
+    t4 = "task-matrix-4"
+    try:
+        await IdempotencyManager.register_submission_async(async_redis, k4, t4)
+        rec_ok, _, _ = await IdempotencyManager.record_dispatch_unknown_async(
+            async_redis, k4, expected_task_id=t4, error_msg="Network blip during publish"
+        )
+        assert rec_ok is True
+        # Matching task acquires from DISPATCH_UNKNOWN
+        acq4, tok4, _ = manager.acquire(k4, task_id=t4, lock_ttl=60)
+        assert acq4 is True and tok4 is not None
+        assert manager.complete(k4, {"recovered": True}, task_id=t4, lock_token=tok4) is True
+        d4 = await IdempotencyManager.get_async(async_redis, k4)
+        assert d4 is not None and d4["status"] == "COMPLETED"
+    finally:
+        manager.force_delete(k4)
+
+    # 5. PENDING -> DISPATCH_UNKNOWN -> API reconciles -> PENDING -> PROCESSING
+    k5 = "matrix-test-5-" + uuid.uuid4().hex
+    t5 = "task-matrix-5"
+    try:
+        await IdempotencyManager.register_submission_async(async_redis, k5, t5)
+        await IdempotencyManager.record_dispatch_unknown_async(
+            async_redis, k5, expected_task_id=t5, error_msg="Ambiguous publish"
+        )
+        # API reconciliation resets to PENDING
+        rec5_ok, _, _ = await IdempotencyManager.reconcile_dispatch_async(
+            async_redis, k5, expected_task_id=t5, new_status="PENDING", ttl=360
+        )
+        assert rec5_ok is True
+        d5_rec = await IdempotencyManager.get_async(async_redis, k5)
+        assert d5_rec is not None and d5_rec["status"] == "PENDING"
+        # Worker now acquires from reconciled PENDING
+        acq5, tok5, _ = manager.acquire(k5, task_id=t5, lock_ttl=60)
+        assert acq5 is True and tok5 is not None
+    finally:
+        manager.force_delete(k5)
+
+    # 6. Concurrent duplicate suppression while PROCESSING
+    k6 = "matrix-test-6-" + uuid.uuid4().hex
+    t6 = "task-matrix-6"
+    try:
+        await IdempotencyManager.register_submission_async(async_redis, k6, t6)
+        acq6_1, tok6_1, _ = manager.acquire(k6, task_id=t6, lock_ttl=60)
+        assert acq6_1 is True and tok6_1 is not None
+        # Concurrent worker delivery attempt with same or different task_id fails
+        acq6_2, tok6_2, data6_2 = manager.acquire(k6, task_id="task-matrix-6-dup", lock_ttl=60)
+        assert acq6_2 is False
+        assert tok6_2 is None
+        assert data6_2 is not None and data6_2["status"] == "PROCESSING"
+    finally:
+        manager.force_delete(k6)
+
+    # 7. Stale token rejection on renew, complete, and fail
+    k7 = "matrix-test-7-" + uuid.uuid4().hex
+    t7 = "task-matrix-7"
+    try:
+        await IdempotencyManager.register_submission_async(async_redis, k7, t7)
+        acq7, legitimate_tok, _ = manager.acquire(k7, task_id=t7, lock_ttl=60)
+        assert acq7 is True and legitimate_tok is not None
+
+        # Renewal with stale token rejected
+        renew_ok, renew_reason = manager.renew_with_reason(k7, "stale-tok-123", extend_ttl=60)
+        assert renew_ok is False
+        assert renew_reason == "TOKEN_MISMATCH"
+
+        # Complete with stale token rejected
+        assert manager.complete(k7, {"ok": False}, task_id=t7, lock_token="stale-tok-123") is False
+
+        # Fail with stale token rejected
+        assert manager.fail(k7, "Err", task_id=t7, lock_token="stale-tok-123") is False
+
+        # Legitimate complete succeeds
+        assert manager.complete(k7, {"ok": True}, task_id=t7, lock_token=legitimate_tok) is True
+    finally:
+        manager.force_delete(k7)
+        await async_redis.aclose()
