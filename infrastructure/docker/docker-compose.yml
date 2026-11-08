@@ -8,6 +8,8 @@ services:
     image: pgvector/pgvector:pg16
     container_name: ai_hr_postgres
     restart: unless-stopped
+    env_file:
+      - ../../.env
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-production}
       POSTGRES_DB: ${POSTGRES_DB:-ai_hr_db}
