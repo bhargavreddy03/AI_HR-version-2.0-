@@ -135,6 +135,7 @@ def test_docker_compose_celery_worker_configuration() -> None:
     assert "ports" not in cw_prod, "celery_worker must not publish ports"
     assert cw_prod["depends_on"]["postgres"]["condition"] == "service_healthy"
     assert cw_prod["depends_on"]["redis"]["condition"] == "service_healthy"
+    assert cw_prod["depends_on"]["backend"]["condition"] == "service_healthy"
     assert cw_prod["stop_signal"] == "SIGTERM"
     assert "celery_health" in "".join(cw_prod["healthcheck"]["test"])
 

@@ -54,9 +54,14 @@ flowchart TD
 |---|---|---|---|---|---|---|---|
 | **`postgres`** | `pgvector/pgvector:pg16` | Debian 12 (bookworm) | `postgres` (system) | *None* (Private) | `127.0.0.1:5432:5432` | `pg_isready -U postgres -d ai_hr_db` | `SIGTERM` / 30s |
 | **`redis`** | `redis:7-alpine` | Alpine Linux 3.19 | `redis` (system) | *None* (Private) | `127.0.0.1:6379:6379` | `redis-cli -a "$REDIS_PASSWORD" ping` | `SIGTERM` / 15s |
-| **`backend`** | `./backend/Dockerfile` | `python:3.11-slim` | `appuser` (UID 10001) | `8000:8000` | `8000:8000` (`--reload`) | `curl -f http://localhost:8000/api/v1/health` | `SIGTERM` / 15s |
-| **`celery_worker`** | `./backend/Dockerfile` | `python:3.11-slim` | `appuser` (UID 10001) | *None* (Worker) | *None* (Mounted Source) | `python -m app.core.celery_health --workers` | `SIGTERM` / 30s |
-| **`frontend`** | `./frontend/Dockerfile` | `node:20-alpine` | `nextjs` (UID 1001) | `3000:3000` | `3000:3000` (`target: dev`) | `wget --spider http://127.0.0.1:3000/api/health` | `SIGTERM` / 15s |
+| **`backend`** | `./backend/Dockerfile` | `python:3.11-slim` | `appuser` (UID 10001) | *None* (Private) | `127.0.0.1:8000:8000` (`--reload`) | `curl -f http://localhost:8000/api/v1/health` | `SIGTERM` / 15s |
+| **`celery_worker`** | `./backend/Dockerfile` | `python:3.11-slim` | `appuser` (UID 10001) | *None* (Worker) | *None* (Worker) | `python -m app.core.celery_health --workers --queues` | `SIGTERM` / 30s |
+| **`frontend`** | `./frontend/Dockerfile` | `node:20-alpine` | `nextjs` (UID 1001) | *None* (Private) | `127.0.0.1:3000:3000` (`target: dev`) | `wget --spider http://127.0.0.1:3000/api/health` | `SIGTERM` / 15s |
+
+### 3.1 Startup Dependencies & Migration Gating
+- `backend` depends on `postgres: condition: service_healthy` and `redis: condition: service_healthy`.
+- `celery_worker` depends on `postgres: condition: service_healthy`, `redis: condition: service_healthy`, AND `backend: condition: service_healthy`. This ensures that Alembic database migrations executed during backend startup finish successfully before Celery workers start consuming tasks from queues.
+- `frontend` depends on `backend: condition: service_healthy`.
 
 ---
 
@@ -90,7 +95,7 @@ flowchart TD
 - **Browser-to-Container**: Host browser executes outside Docker:
   - Frontend Portal: `http://localhost:3000`
   - Backend API: `NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1`
-- **Port Isolation**: In `docker-compose.dev.yml`, PostgreSQL and Redis port bindings are strictly pinned to `127.0.0.1` (e.g. `127.0.0.1:5432:5432`), preventing exposure to local LAN or public networks.
+- **Port Isolation**: In `docker-compose.dev.yml`, all published development ports (`postgres`, `redis`, `backend`, `frontend`) are strictly pinned to `127.0.0.1` (`127.0.0.1:5432`, `127.0.0.1:6379`, `127.0.0.1:8000`, `127.0.0.1:3000`). Base `docker-compose.yml` publishes zero ports to the host by default. The final merged Compose configuration never binds any port to `0.0.0.0`.
 
 ### 5.2 Environment Templates
 - `.env.example`: Production/staging template. All passwords, JWT secrets, and encryption keys are empty placeholders; `docker-compose.yml` fails immediately (`:?`) if required secrets are omitted.

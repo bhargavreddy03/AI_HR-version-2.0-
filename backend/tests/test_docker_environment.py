@@ -3,10 +3,11 @@
 Validates:
 1. Docker Compose base (production) and development override specifications.
 2. 5-service orchestration: postgres, redis, backend, celery_worker, frontend.
-3. Private internal network, volume persistence, and localhost port isolation.
-4. Multi-stage Dockerfiles, non-root users, health checks, and .dockerignore rules.
-5. Celery health probe and queue inspection.
-6. Environment variable definitions and secret separation.
+3. Private internal network, volume persistence, and 127.0.0.1 host port isolation.
+4. Celery worker dependency on backend service health (startup migration gating).
+5. Celery worker health check testing --workers and --queues.
+6. Multi-stage Dockerfiles, non-root users, health checks, and .dockerignore rules.
+7. Environment variable definitions and secret separation.
 """
 
 from __future__ import annotations
@@ -86,13 +87,14 @@ def test_docker_compose_persistent_volumes() -> None:
 
 
 def test_docker_compose_no_unnecessary_port_exposure_in_production() -> None:
-    """Verify database, Redis, and Celery worker never publish host ports in base/production compose."""
+    """Verify no services publish host ports in base/production compose."""
     compose = _load_yaml(PROD_COMPOSE_PATH)
     services = compose["services"]
 
-    assert "ports" not in services["postgres"], "postgres must not publish host ports in production"
-    assert "ports" not in services["redis"], "redis must not publish host ports in production"
-    assert "ports" not in services["celery_worker"], "celery_worker must not publish host ports"
+    for name, svc in services.items():
+        assert (
+            "ports" not in svc
+        ), f"Service '{name}' must not publish host ports in base/production compose"
 
 
 def test_docker_compose_healthchecks_all_services() -> None:
@@ -117,14 +119,29 @@ def test_docker_compose_startup_dependencies_and_ordering() -> None:
     assert b_deps["postgres"]["condition"] == "service_healthy"
     assert b_deps["redis"]["condition"] == "service_healthy"
 
-    # Celery worker depends on healthy postgres and redis
+    # Celery worker depends on healthy postgres, redis, AND backend (migration completion gating)
     cw_deps = services["celery_worker"]["depends_on"]
     assert cw_deps["postgres"]["condition"] == "service_healthy"
     assert cw_deps["redis"]["condition"] == "service_healthy"
+    assert cw_deps["backend"]["condition"] == "service_healthy"
 
     # Frontend depends on healthy backend
     f_deps = services["frontend"]["depends_on"]
     assert f_deps["backend"]["condition"] == "service_healthy"
+
+
+def test_docker_compose_celery_worker_healthcheck_workers_and_queues() -> None:
+    """Verify celery_worker healthcheck tests broker, worker responsiveness, and all queues."""
+    compose = _load_yaml(PROD_COMPOSE_PATH)
+    cw_svc = compose["services"]["celery_worker"]
+    cmd_str = (
+        " ".join(cw_svc["healthcheck"]["test"])
+        if isinstance(cw_svc["healthcheck"]["test"], list)
+        else str(cw_svc["healthcheck"]["test"])
+    )
+
+    assert "--workers" in cmd_str
+    assert "--queues" in cmd_str
 
 
 def test_docker_compose_graceful_shutdown() -> None:
@@ -142,21 +159,43 @@ def test_docker_compose_graceful_shutdown() -> None:
 
 
 def test_dev_compose_loopback_only_port_publishing() -> None:
-    """Verify dev compose publishes postgres and redis exclusively to 127.0.0.1 (never 0.0.0.0)."""
+    """Verify dev compose publishes postgres, redis, backend, and frontend exclusively to 127.0.0.1 (never 0.0.0.0)."""
     dev_compose = _load_yaml(DEV_COMPOSE_PATH)
     services = dev_compose.get("services", {})
 
-    pg_ports = services["postgres"]["ports"]
-    for p in pg_ports:
-        assert p.startswith(
-            "127.0.0.1:"
-        ), f"PostgreSQL port '{p}' must be bound exclusively to 127.0.0.1"
+    for name in ("postgres", "redis", "backend", "frontend"):
+        svc_ports = services[name].get("ports", [])
+        assert svc_ports, f"Dev service '{name}' must specify ports"
+        for p in svc_ports:
+            assert p.startswith(
+                "127.0.0.1:"
+            ), f"Service '{name}' port '{p}' must be bound exclusively to 127.0.0.1"
 
-    redis_ports = services["redis"]["ports"]
-    for p in redis_ports:
-        assert p.startswith(
+    # Celery worker must never publish host ports even in dev
+    assert "ports" not in services.get("celery_worker", {})
+
+
+def test_merged_compose_configuration_no_0000_ports() -> None:
+    """Verify that merged development Compose configuration publishes ports exclusively on 127.0.0.1 without 0.0.0.0."""
+    prod_compose = _load_yaml(PROD_COMPOSE_PATH)
+    dev_compose = _load_yaml(DEV_COMPOSE_PATH)
+
+    # In prod_compose, no ports are defined
+    # In dev_compose, ports are defined for postgres, redis, backend, and frontend
+    all_published_ports: list[str] = []
+    for svc_name in ("postgres", "redis", "backend", "celery_worker", "frontend"):
+        p_prod = prod_compose["services"][svc_name].get("ports", [])
+        p_dev = dev_compose["services"][svc_name].get("ports", [])
+        all_published_ports.extend(p_prod)
+        all_published_ports.extend(p_dev)
+
+    for port_str in all_published_ports:
+        assert not port_str.startswith(
+            "0.0.0.0:"
+        ), f"Insecure wildcard host port binding found: {port_str}"
+        assert port_str.startswith(
             "127.0.0.1:"
-        ), f"Redis port '{p}' must be bound exclusively to 127.0.0.1"
+        ), f"Port binding is not restricted to 127.0.0.1: {port_str}"
 
 
 def test_dev_compose_source_mounting_and_reload() -> None:

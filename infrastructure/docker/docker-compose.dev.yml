@@ -30,9 +30,11 @@ services:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
 
   # ----------------------------------------------------------------------------
-  # Development Backend Override (Source mounting, auto-reload, auto-migrations)
+  # Development Backend Override (Published to 127.0.0.1 host loopback only)
   # ----------------------------------------------------------------------------
   backend:
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
     volumes:
       - ../../backend:/app
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
@@ -53,13 +55,15 @@ services:
       - CELERY_HEALTH_CHECK_WORKERS=true
 
   # ----------------------------------------------------------------------------
-  # Development Frontend Override (Target dev stage, hot reload, isolated node_modules)
+  # Development Frontend Override (Published to 127.0.0.1 host loopback only)
   # ----------------------------------------------------------------------------
   frontend:
     build:
       context: ../../frontend
       dockerfile: Dockerfile
       target: dev
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
     volumes:
       - ../../frontend:/app
       - /app/node_modules

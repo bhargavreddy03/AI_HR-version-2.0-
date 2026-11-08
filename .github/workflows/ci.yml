@@ -206,8 +206,8 @@ jobs:
           set -euo pipefail
           trap 'docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml down -v --remove-orphans' EXIT
 
-          echo "Starting dev stack (postgres and redis)..."
-          docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml up -d postgres redis
+          echo "Starting complete 5-service dev stack (postgres, redis, backend, celery_worker, frontend)..."
+          docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml up -d --build
 
           echo "Waiting for PostgreSQL container to become healthy..."
           PG_READY=false
@@ -220,12 +220,7 @@ jobs:
             fi
             sleep 1
           done
-
-          if [ "$PG_READY" != "true" ]; then
-            echo "ERROR: PostgreSQL container failed to become healthy within 45s timeout!"
-            docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml logs postgres
-            exit 1
-          fi
+          [ "$PG_READY" = "true" ] || { echo "ERROR: PostgreSQL container failed to become healthy within 45s timeout!"; docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml logs postgres; exit 1; }
 
           echo "Waiting for Redis container to become healthy..."
           REDIS_READY=false
@@ -238,12 +233,46 @@ jobs:
             fi
             sleep 1
           done
+          [ "$REDIS_READY" = "true" ] || { echo "ERROR: Redis container failed to become healthy within 30s timeout!"; docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml logs redis; exit 1; }
 
-          if [ "$REDIS_READY" != "true" ]; then
-            echo "ERROR: Redis container failed to become healthy within 30s timeout!"
-            docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml logs redis
-            exit 1
-          fi
+          echo "Waiting for FastAPI backend container to become healthy..."
+          BACKEND_READY=false
+          for i in $(seq 1 45); do
+            B_STATUS=$(docker inspect --format='{{json .State.Health.Status}}' ai_hr_backend 2>/dev/null || echo '""')
+            if [ "$B_STATUS" = '"healthy"' ]; then
+              echo "FastAPI backend container is healthy."
+              BACKEND_READY=true
+              break
+            fi
+            sleep 1
+          done
+          [ "$BACKEND_READY" = "true" ] || { echo "ERROR: FastAPI backend container failed to become healthy within 45s timeout!"; docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml logs backend; exit 1; }
+
+          echo "Waiting for Celery worker container to become healthy..."
+          CW_READY=false
+          for i in $(seq 1 45); do
+            CW_STATUS=$(docker inspect --format='{{json .State.Health.Status}}' ai_hr_celery_worker 2>/dev/null || echo '""')
+            if [ "$CW_STATUS" = '"healthy"' ]; then
+              echo "Celery worker container is healthy."
+              CW_READY=true
+              break
+            fi
+            sleep 1
+          done
+          [ "$CW_READY" = "true" ] || { echo "ERROR: Celery worker container failed to become healthy within 45s timeout!"; docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml logs celery_worker; exit 1; }
+
+          echo "Waiting for Next.js frontend container to become healthy..."
+          FRONTEND_READY=false
+          for i in $(seq 1 60); do
+            F_STATUS=$(docker inspect --format='{{json .State.Health.Status}}' ai_hr_frontend 2>/dev/null || echo '""')
+            if [ "$F_STATUS" = '"healthy"' ]; then
+              echo "Next.js frontend container is healthy."
+              FRONTEND_READY=true
+              break
+            fi
+            sleep 1
+          done
+          [ "$FRONTEND_READY" = "true" ] || { echo "ERROR: Next.js frontend container failed to become healthy within 60s timeout!"; docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml logs frontend; exit 1; }
 
           DEV_SUPER_PASS="$(grep -E '^POSTGRES_SUPERUSER_PASSWORD=' .env.dev | cut -d= -f2-)"
           DEV_REDIS_PASS="$(grep -E '^REDIS_PASSWORD=' .env.dev | cut -d= -f2-)"
@@ -284,25 +313,49 @@ jobs:
           echo "Redis authentication enforcement verified."
 
           echo "5. Verifying development stack host port bindings are bound to 127.0.0.1 loopback only..."
-          PG_PORTS=$(docker inspect ai_hr_postgres --format='{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostIp}}:{{.HostPort}} {{end}}{{end}}')
-          REDIS_PORTS=$(docker inspect ai_hr_redis --format='{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostIp}}:{{.HostPort}} {{end}}{{end}}')
-          echo "ai_hr_postgres host ports: $PG_PORTS"
-          echo "ai_hr_redis host ports: $REDIS_PORTS"
-
-          if echo "$PG_PORTS $REDIS_PORTS" | grep -q "0.0.0.0"; then
+          ALL_PORTS=$(docker inspect ai_hr_postgres ai_hr_redis ai_hr_backend ai_hr_frontend --format='{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostIp}}:{{.HostPort}} {{end}}{{end}}')
+          echo "Published host ports: $ALL_PORTS"
+          if echo "$ALL_PORTS" | grep -q "0.0.0.0"; then
             echo "ERROR: Insecure wildcard host port binding (0.0.0.0) detected!"
             exit 1
           fi
+          echo "$ALL_PORTS" | grep -q "127.0.0.1:5432" || { echo "ERROR: postgres is not bound to 127.0.0.1:5432!"; exit 1; }
+          echo "$ALL_PORTS" | grep -q "127.0.0.1:6379" || { echo "ERROR: redis is not bound to 127.0.0.1:6379!"; exit 1; }
+          echo "$ALL_PORTS" | grep -q "127.0.0.1:8000" || { echo "ERROR: backend is not bound to 127.0.0.1:8000!"; exit 1; }
+          echo "$ALL_PORTS" | grep -q "127.0.0.1:3000" || { echo "ERROR: frontend is not bound to 127.0.0.1:3000!"; exit 1; }
+          CW_PORTS=$(docker inspect ai_hr_celery_worker --format='{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostIp}}:{{.HostPort}} {{end}}{{end}}')
+          if [ -n "$CW_PORTS" ]; then
+            echo "ERROR: celery_worker must not publish any host ports!"
+            exit 1
+          fi
+          echo "Host loopback port bindings verified for all services."
 
-          echo "$PG_PORTS" | grep -q "127.0.0.1:5432" || { echo "ERROR: ai_hr_postgres is not bound to 127.0.0.1:5432!"; exit 1; }
-          echo "$REDIS_PORTS" | grep -q "127.0.0.1:6379" || { echo "ERROR: ai_hr_redis is not bound to 127.0.0.1:6379!"; exit 1; }
-          echo "Host loopback port bindings verified."
+          echo "6. Verifying FastAPI readiness probe (PostgreSQL + Redis)..."
+          READY_RESP=$(curl -fsS http://127.0.0.1:8000/api/v1/health/ready)
+          echo "FastAPI readiness response: $READY_RESP"
+          echo "$READY_RESP" | grep -q '"status":"ready"' || { echo "ERROR: FastAPI readiness probe not ready!"; exit 1; }
+          echo "$READY_RESP" | grep -q '"database":"connected"' || { echo "ERROR: Database not connected!"; exit 1; }
+          echo "$READY_RESP" | grep -q '"redis":"connected"' || { echo "ERROR: Redis not connected!"; exit 1; }
 
-          echo "6. Verifying PostgreSQL script rerun idempotency inside running container..."
+          echo "7. Verifying Next.js frontend health probe and container-to-backend communication..."
+          F_HEALTH=$(curl -fsS http://127.0.0.1:3000/api/health)
+          echo "Frontend health response: $F_HEALTH"
+          echo "$F_HEALTH" | grep -q '"status":"healthy"' || { echo "ERROR: Frontend health probe failed!"; exit 1; }
+          F_BACKEND=$(curl -fsS http://127.0.0.1:3000/api/backend-health)
+          echo "Frontend backend proxy response: $F_BACKEND"
+          echo "$F_BACKEND" | grep -q '"status":"connected"' || { echo "ERROR: Frontend cannot reach backend over container network!"; exit 1; }
+
+          echo "8. Verifying Celery worker queue consumption and live task execution..."
+          docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml exec -T celery_worker python -m app.core.celery_health --workers --queues
+          TASK_RESULT=$(docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml exec -T backend python -c "from app.core.tasks.system import system_ping; res = system_ping.delay('docker-smoke-test'); val = res.get(timeout=10); assert val['status'] == 'pong'; print('CELERY_SMOKE_SUCCESS')")
+          echo "$TASK_RESULT" | grep -q "CELERY_SMOKE_SUCCESS" || { echo "ERROR: Celery live task execution failed!"; exit 1; }
+          echo "Celery worker queue health and live task execution verified."
+
+          echo "9. Verifying PostgreSQL script rerun idempotency inside running container..."
           docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml exec -T -e POSTGRES_HOST=localhost -e PGPASSWORD="$DEV_SUPER_PASS" postgres bash /docker-entrypoint-initdb.d/01-init.sh
           echo "PostgreSQL initialization script rerun inside container verified successfully."
 
-          echo "SUCCESS: All container smoke tests and security verifications passed."
+          echo "SUCCESS: All 5 container services started, verified healthy, and passed all integration and security checks."
 
       - name: Teardown Docker Compose Development Stack
         if: always()

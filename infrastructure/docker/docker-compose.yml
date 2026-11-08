@@ -62,6 +62,7 @@ services:
 
   # ----------------------------------------------------------------------------
   # Modular Monolith API: FastAPI Backend
+  # (Ports NOT published in base/production; accessible only via private network)
   # ----------------------------------------------------------------------------
   backend:
     build:
@@ -80,8 +81,6 @@ services:
         condition: service_healthy
     env_file:
       - ${ENV_FILE:-../../.env}
-    ports:
-      - "${BACKEND_PORT:-8000}:8000"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
       interval: 15s
@@ -91,7 +90,8 @@ services:
 
   # ----------------------------------------------------------------------------
   # Asynchronous Background Worker: Celery Worker Fleet
-  # (Ports NOT published; communicates strictly via internal Docker network)
+  # (Ports NOT published; communicates strictly via internal Docker network.
+  # Depends on backend: condition: service_healthy to ensure migrations finish first.)
   # ----------------------------------------------------------------------------
   celery_worker:
     build:
@@ -108,6 +108,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      backend:
+        condition: service_healthy
     env_file:
       - ${ENV_FILE:-../../.env}
     command: >-
@@ -116,14 +118,15 @@ services:
       -Q default,document_processing,resume_parsing,embedding_generation,candidate_matching,notifications,reporting
       --concurrency=${CELERY_WORKER_CONCURRENCY:-2}
     healthcheck:
-      test: ["CMD-SHELL", "python -m app.core.celery_health --workers || exit 1"]
+      test: ["CMD-SHELL", "python -m app.core.celery_health --workers --queues || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 3
-      start_period: 15s
+      start_period: 20s
 
   # ----------------------------------------------------------------------------
   # Web Portal: Next.js 14 Frontend
+  # (Ports NOT published in base/production; accessible only via private network)
   # ----------------------------------------------------------------------------
   frontend:
     build:
@@ -140,8 +143,6 @@ services:
         condition: service_healthy
     env_file:
       - ${ENV_FILE:-../../.env}
-    ports:
-      - "${FRONTEND_PORT:-3000}:3000"
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/api/health || exit 1"]
       interval: 15s
