@@ -721,3 +721,75 @@ def test_init_db_sh_local_development_initialization() -> None:
         "Starting database role initialization and credential reconciliation (env: development)"
         in proc.stdout
     )
+
+
+def test_env_example_contains_no_development_credentials_and_no_development_environment() -> None:
+    """Verify .env.example contains no usable development passwords and does not default to development."""
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    env_example = repo_root / ".env.example"
+    assert env_example.exists(), ".env.example must exist at repository root"
+
+    content = env_example.read_text(encoding="utf-8")
+
+    # Must NOT contain hardcoded development passwords
+    assert "local_development_" not in content
+    assert "ENVIRONMENT=development" not in content
+
+    # ENVIRONMENT must be empty (requiring explicit configuration)
+    lines = {
+        line.split("=", 1)[0].strip(): line.split("=", 1)[1].strip()
+        for line in content.splitlines()
+        if "=" in line and not line.strip().startswith("#")
+    }
+    assert lines.get("ENVIRONMENT") == "", "ENVIRONMENT must be empty in production template"
+    assert (
+        lines.get("POSTGRES_PASSWORD") == ""
+    ), "POSTGRES_PASSWORD must be empty in production template"
+    assert (
+        lines.get("POSTGRES_MIGRATION_PASSWORD") == ""
+    ), "POSTGRES_MIGRATION_PASSWORD must be empty in production template"
+    assert (
+        lines.get("POSTGRES_SUPERUSER_PASSWORD") == ""
+    ), "POSTGRES_SUPERUSER_PASSWORD must be empty in production template"
+    assert lines.get("DATABASE_URL") == "", "DATABASE_URL must be empty in production template"
+    assert lines.get("JWT_SECRET_KEY") == "", "JWT_SECRET_KEY must be empty in production template"
+
+
+def test_env_dev_example_contains_development_configuration() -> None:
+    """Verify .env.dev.example explicitly defines development configuration and local credentials."""
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    dev_example = repo_root / ".env.dev.example"
+    assert dev_example.exists(), ".env.dev.example must exist at repository root"
+
+    content = dev_example.read_text(encoding="utf-8")
+
+    # Must contain development settings and compose guidance
+    assert "ENVIRONMENT=development" in content
+    assert "docker-compose.dev.yml" in content
+    assert "POSTGRES_PASSWORD=local_development_password_only" in content
+    assert "POSTGRES_MIGRATION_PASSWORD=local_development_migration_password_only" in content
+    assert "POSTGRES_SUPERUSER_PASSWORD=local_development_super_password_only" in content
+
+
+def test_docker_compose_enforces_mandatory_secrets_and_rejects_missing_values() -> None:
+    """Verify docker-compose.yml enforces required secrets via ${VAR:?error} syntax without silent fallbacks."""
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    compose_path = repo_root / "infrastructure" / "docker" / "docker-compose.yml"
+    assert compose_path.exists(), "docker-compose.yml must exist"
+
+    content = compose_path.read_text(encoding="utf-8")
+
+    # Must enforce mandatory environment and secret substitution
+    assert "${ENVIRONMENT:?" in content, "ENVIRONMENT must require explicit setting"
+    assert (
+        "${POSTGRES_SUPERUSER_PASSWORD:?" in content
+    ), "POSTGRES_SUPERUSER_PASSWORD must be required"
+    assert (
+        "${POSTGRES_MIGRATION_PASSWORD:?" in content
+    ), "POSTGRES_MIGRATION_PASSWORD must be required"
+    assert (
+        "${POSTGRES_PASSWORD:?" in content
+    ), "POSTGRES_APP_PASSWORD must require POSTGRES_PASSWORD"
+
+    # Must not contain fallback development passwords
+    assert "local_development_" not in content

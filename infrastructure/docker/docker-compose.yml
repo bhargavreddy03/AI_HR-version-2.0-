@@ -9,9 +9,9 @@ services:
     container_name: ai_hr_postgres
     restart: unless-stopped
     env_file:
-      - ../../.env
+      - ${ENV_FILE:-../../.env}
     environment:
-      ENVIRONMENT: ${ENVIRONMENT:-production}
+      ENVIRONMENT: ${ENVIRONMENT:?ENVIRONMENT must be explicitly set}
       POSTGRES_DB: ${POSTGRES_DB:-ai_hr_db}
       POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?POSTGRES_SUPERUSER_PASSWORD must be set}
@@ -66,7 +66,7 @@ services:
       redis:
         condition: service_healthy
     env_file:
-      - ../../.env
+      - ${ENV_FILE:-../../.env}
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     healthcheck:

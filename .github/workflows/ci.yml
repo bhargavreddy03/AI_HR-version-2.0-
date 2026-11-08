@@ -139,10 +139,42 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Validate Docker Compose Configuration
+      - name: Validate Docker Compose Configuration Rejects Missing Secrets
         run: |
           cp .env.example .env
+          if docker compose --env-file .env -f infrastructure/docker/docker-compose.yml config > /dev/null 2>&1; then
+            echo "ERROR: docker compose config should have failed on .env.example due to missing required secrets!"
+            exit 1
+          else
+            echo "SUCCESS: docker compose config correctly rejected missing required secrets."
+          fi
+
+      - name: Validate Docker Compose Development Configuration
+        run: |
+          cp .env.dev.example .env.dev
+          docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml config --quiet
+          echo "SUCCESS: Development compose config validated successfully."
+
+      - name: Validate Docker Compose Production Configuration With Secrets
+        run: |
+          cat << 'EOF' > .env
+          ENVIRONMENT=production
+          POSTGRES_DB=ai_hr_db
+          POSTGRES_USER=aihr_app_user
+          POSTGRES_PASSWORD=mock_production_password_min_32_chars_123
+          POSTGRES_MIGRATION_USER=aihr_migration_user
+          POSTGRES_MIGRATION_PASSWORD=mock_production_migration_password_32_chars
+          POSTGRES_SUPERUSER=postgres
+          POSTGRES_SUPERUSER_PASSWORD=mock_production_superuser_password_32_chars
+          DATABASE_URL=postgresql+asyncpg://aihr_app_user:mock_production_password_min_32_chars_123@postgres:5432/ai_hr_db
+          DATABASE_MIGRATION_URL=postgresql+asyncpg://aihr_migration_user:mock_production_migration_password_32_chars@postgres:5432/ai_hr_db
+          DATABASE_SYNC_URL=postgresql://aihr_migration_user:mock_production_migration_password_32_chars@postgres:5432/ai_hr_db
+          JWT_SECRET_KEY=mock_production_jwt_secret_key_minimum_32_chars
+          MFA_ENCRYPTION_KEY=mock_production_mfa_encryption_key_minimum_32
+          BACKUP_CODE_PEPPER=mock_production_backup_code_pepper_minimum_32
+          EOF
           docker compose --env-file .env -f infrastructure/docker/docker-compose.yml config --quiet
+          echo "SUCCESS: Production compose config validated successfully with explicit secrets."
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

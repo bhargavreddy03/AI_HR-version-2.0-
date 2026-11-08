@@ -119,7 +119,7 @@ Conforming to Architecture Document 04 Section 2, all tenant-scoped tables imple
          WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
      ```
 
-### 4.2 Transaction-Local Tenant Context & Pool Defense
+### 4.3 Transaction-Local Tenant Context & Pool Defense
 - **Transaction-Local Setting**: The authenticated tenant context is set using `SELECT set_config('app.current_tenant_id', :tenant_id, true)` (`is_local = true`). PostgreSQL automatically reverts the setting at transaction `COMMIT` or `ROLLBACK`.
 - **Pool Checkin Cleanup Listener**: As defense-in-depth against accidental session-level pollution (`is_local = false`), SQLAlchemy's connection checkin listener resets `app.current_tenant_id` to empty string and commits the reset. If cleanup fails, the connection record is invalidated (`connection_record.invalidate(exc)`) to prevent reuse.
 - **Fail-Safe Missing Context**: If `app.current_tenant_id` is unset or empty, `current_setting('app.current_tenant_id', true)` returns `NULL`, causing the equality comparison to evaluate to `UNKNOWN` (falsy in SQL). All `SELECT` queries return 0 rows, and mutations are rejected.
@@ -193,7 +193,7 @@ Conforming to Architecture Document 05 Section 2.B & 2.C:
 
 The database test suite covers all categories specified in the requirements:
 
-### Unit Tests (`backend/tests/test_database.py`) — 19 Tests
+### Unit Tests (`backend/tests/test_database.py`) — 32 Tests
 1. `test_metadata_naming_conventions`: Confirms canonical PostgreSQL naming conventions.
 2. `test_base_mixins_columns`: Verifies `TimestampMixin` and `TenantScopedMixin`.
 3. `test_timezone_aware_timestamp_handling`: Verifies timezone-aware UTC datetime generation.
@@ -212,7 +212,20 @@ The database test suite covers all categories specified in the requirements:
 16. `test_store_embedding_rejects_unregistered_model`: Rejects unregistered model identifiers.
 17. `test_store_embedding_rejects_inactive_model`: Rejects deactivated/deprecated models.
 18. `test_store_job_embedding_validation`: Validates vector dimensions for job embeddings.
-19. `test_search_similar_candidate_documents_rejects_unsupported_dimensions`: Rejects invalid query dimensions.
+19. `test_embedding_model_registry_exact_canonical_contents`: Validates exact 4 canonical models in model registry.
+20. `test_search_similar_candidate_documents_rejects_unsupported_dimensions`: Rejects invalid query dimensions.
+21. `test_search_similar_candidate_documents_rejects_empty_query_vector`: Rejects zero-length query vectors.
+22. `test_search_similar_candidate_documents_rejects_nan_and_inf_values`: Rejects non-finite floating point vector components.
+23. `test_search_similar_candidate_documents_rejects_invalid_limits`: Rejects limits <= 0 or > 100.
+24. `test_search_similar_candidate_documents_rejects_unregistered_model`: Rejects query model not in registry.
+25. `test_search_similar_candidate_documents_rejects_inactive_model`: Rejects inactive model queries.
+26. `test_init_db_sql_no_hardcoded_credentials_and_nocreatedb`: Verifies SQL script uses `\getenv` and enforces `NOCREATEDB`.
+27. `test_init_db_sh_entrypoint_security`: Verifies shell script wraps execution safely and quotes identifiers.
+28. `test_init_db_sh_missing_secrets_failure_outside_development`: Verifies `init-db.sh` fails immediately without silent fallbacks when required secrets are missing outside development.
+29. `test_init_db_sh_local_development_initialization`: Verifies `init-db.sh` sets convenient local development defaults when `ENVIRONMENT=development`.
+30. `test_env_example_contains_no_development_credentials_and_no_development_environment`: Verifies `.env.example` contains zero development passwords and requires explicit environment configuration.
+31. `test_env_dev_example_contains_development_configuration`: Verifies `.env.dev.example` provides complete local development defaults and Docker Compose commands.
+32. `test_docker_compose_enforces_mandatory_secrets_and_rejects_missing_values`: Verifies main `docker-compose.yml` enforces explicit secrets via `${VAR:?error}` syntax and rejects silent fallbacks.
 
 ### Integration Tests (`backend/tests/integration/test_postgres_lifecycle.py`) — 22 Tests
 1. `test_postgres_connection_and_session_lifecycle`: Live connectivity and query execution.
@@ -237,12 +250,44 @@ The database test suite covers all categories specified in the requirements:
 20. `test_postgres_hnsw_indexes_exist_and_downgrade_upgrade_lifecycle`: HNSW index validation and reversible migrations.
 21. `test_postgres_vector_downgrade_preserves_external_dependent_objects_and_extension`: Verifies safe non-cascading downgrade preserving extension and external vector objects.
 22. `test_postgres_role_initialization_with_custom_credentials_and_reconciliation`: Genuine PostgreSQL credential reconciliation integration test that executes the actual `init-db.sh` / `init-db.sql` bootstrap mechanism with custom credentials, verifies authentication, re-executes bootstrap with rotated credentials to prove database-level password reconciliation, verifies new credentials succeed and old credentials are rejected, verifies catalog attributes (`rolsuper=false, rolbypassrls=false, rolcreatedb=false, rolcreaterole=false`), verifies runtime role does not own tenant-scoped tables and cannot bypass RLS, and cleans up test roles safely.
-23. `test_init_db_sh_missing_secrets_failure_outside_development`: Unit test verifying `init-db.sh` fails immediately without silent fallbacks when required secrets are missing in non-development environments.
-24. `test_init_db_sh_local_development_initialization`: Unit test verifying `init-db.sh` sets convenient local development defaults when `ENVIRONMENT=development`.
 
 ---
 
-## 8. Local Setup & Testing Instructions
+## 8. Development & Production Deployment Workflows
+
+### 8.1 Local Development Workflow
+Local development isolates development secrets and hot-reloading configurations in `.env.dev.example` and `docker-compose.dev.yml`:
+
+```bash
+# 1. Copy local development environment template
+cp .env.dev.example .env.dev
+
+# 2. Launch complete local development stack (with live hot reload & debug logging)
+docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml up -d
+
+# 3. View logs
+docker compose --env-file .env.dev -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.dev.yml logs -f
+```
+
+### 8.2 Production & Staging Deployment Workflow
+Production deployments require explicit configuration of high-entropy secrets and environment identification:
+
+```bash
+# 1. Copy production environment template
+cp .env.example .env
+
+# 2. Configure mandatory production secrets in .env:
+#    - ENVIRONMENT=production
+#    - POSTGRES_SUPERUSER_PASSWORD=<min-32-char-high-entropy-secret>
+#    - POSTGRES_MIGRATION_PASSWORD=<min-32-char-high-entropy-secret>
+#    - POSTGRES_PASSWORD=<min-32-char-high-entropy-secret>
+#    - JWT_SECRET_KEY, MFA_ENCRYPTION_KEY, BACKUP_CODE_PEPPER
+
+# 3. Launch hardened production stack (docker-compose will abort immediately if any required secret is missing)
+docker compose --env-file .env -f infrastructure/docker/docker-compose.yml up -d
+```
+
+### 8.3 Quality Gates & Testing Instructions
 
 ### Prerequisites
 - Python 3.11 with virtual environment initialized (`poetry install` or `pip install -r backend/requirements-dev.txt`).
