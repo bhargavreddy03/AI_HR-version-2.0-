@@ -26,6 +26,14 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 IDEMPOTENCY_PREFIX = "idempotency:task:"
 
+# State-dependent retention lifetimes (in seconds)
+# Submission retention must comfortably exceed queue waiting times (24 hours)
+DEFAULT_SUBMISSION_TTL = 86400  # 24 hours for PENDING submissions in queue
+DEFAULT_WORKER_LOCK_TTL = 360  # Active worker execution lock lease (refreshed by heartbeat)
+DEFAULT_RESULT_TTL = 86400  # 24 hours retention for COMPLETED results
+DEFAULT_FAILURE_TTL = 86400  # 24 hours retention for FAILED task records
+DEFAULT_DISPATCH_UNKNOWN_TTL = 1800  # 30 minutes retention for uncertain broker dispatch
+
 
 def format_scoped_key(
     key: str,
@@ -36,9 +44,9 @@ def format_scoped_key(
     """Format an idempotency key strictly scoped by tenant, user, and task type.
 
     Guarantees cross-tenant and cross-task isolation in distributed storage.
+    Client-provided keys are never returned unchanged or trusted, even if they
+    start with or contain an idempotency prefix.
     """
-    if key.startswith(IDEMPOTENCY_PREFIX):
-        return key
     t_part = str(tenant_id) if tenant_id else "global"
     u_part = str(user_id) if user_id else "anonymous"
     type_part = str(task_type) if task_type else "general"
@@ -53,7 +61,7 @@ def format_scoped_key(
 LUA_REGISTER_SUBMISSION = """
 local key = KEYS[1]
 local task_id = ARGV[1]
-local lock_ttl = tonumber(ARGV[2])
+local submission_ttl = tonumber(ARGV[2])
 local created_at = ARGV[3]
 local tenant_id = ARGV[4]
 local user_id = ARGV[5]
@@ -71,7 +79,7 @@ if not val then
         created_at = created_at,
         result = cjson.null
     })
-    redis.call('SET', key, payload, 'EX', lock_ttl)
+    redis.call('SET', key, payload, 'EX', submission_ttl)
     return {1, payload}
 end
 
@@ -241,10 +249,11 @@ redis.call('SET', key, new_payload, 'EX', result_ttl)
 return 1
 """
 
-# Atomic lock release: deletes key strictly if lock_token matches current owner
+# Atomic lock release: restores PENDING state with retention TTL (or deletes key) strictly if lock_token matches current owner
 LUA_RELEASE = """
 local key = KEYS[1]
 local lock_token = ARGV[1]
+local pending_ttl = tonumber(ARGV[2])
 
 if not lock_token or lock_token == "" then
     return 0
@@ -261,7 +270,14 @@ if not data.lock_token or data.lock_token == cjson.null or data.lock_token == ""
 end
 
 if data.lock_token == lock_token then
-    redis.call('DEL', key)
+    if pending_ttl and pending_ttl > 0 then
+        data.status = "PENDING"
+        data.lock_token = cjson.null
+        local new_payload = cjson.encode(data)
+        redis.call('SET', key, new_payload, 'EX', pending_ttl)
+    else
+        redis.call('DEL', key)
+    end
     return 1
 end
 
@@ -333,12 +349,16 @@ class IdempotencyManager:
         self,
         key: str,
         task_id: str,
-        lock_ttl: int = 360,
+        submission_ttl: int = DEFAULT_SUBMISSION_TTL,
         tenant_id: UUID | str | None = None,
         user_id: UUID | str | None = None,
         task_type: str | None = None,
+        **kwargs: Any,
     ) -> tuple[bool, dict[str, Any] | None]:
         """Atomically register task submission with initial PENDING state and real task ID.
+
+        Uses submission_ttl (default 24h) to retain PENDING state while waiting in queue.
+        Do not confuse worker lock lease (lock_ttl) with submission retention.
 
         Returns:
             (True, None) if registered fresh.
@@ -346,6 +366,7 @@ class IdempotencyManager:
         Raises:
             ServiceUnavailableException if Redis is unreachable or operation fails.
         """
+        effective_ttl = kwargs.get("lock_ttl", submission_ttl)
         redis_key = self._format_key(key)
         created_at = datetime.now(UTC).isoformat()
         t_str = str(tenant_id) if tenant_id else ""
@@ -357,7 +378,7 @@ class IdempotencyManager:
                 1,
                 redis_key,
                 task_id,
-                str(lock_ttl),
+                str(effective_ttl),
                 created_at,
                 t_str,
                 u_str,
@@ -536,8 +557,16 @@ class IdempotencyManager:
                 error_code="IDEMPOTENCY_UNAVAILABLE",
             ) from exc
 
-    def release(self, key: str, lock_token: str | None = None) -> bool:
-        """Release lock allowing subsequent retry. Strictly enforces matching lock_token."""
+    def release(
+        self,
+        key: str,
+        lock_token: str | None = None,
+        pending_ttl: int = DEFAULT_SUBMISSION_TTL,
+    ) -> bool:
+        """Release worker lock allowing subsequent retry while preserving PENDING idempotency record.
+
+        Strictly enforces matching lock_token.
+        """
         if not lock_token or not lock_token.strip():
             logger.warning("Rejected release() attempt without valid lock_token for key %s", key)
             return False
@@ -549,6 +578,7 @@ class IdempotencyManager:
                 1,
                 redis_key,
                 lock_token,
+                str(pending_ttl),
             )
             return bool(res)
         except Exception as exc:
@@ -573,16 +603,21 @@ class IdempotencyManager:
         client: AsyncRedis[Any],
         key: str,
         task_id: str,
-        lock_ttl: int = 360,
+        submission_ttl: int = DEFAULT_SUBMISSION_TTL,
         tenant_id: UUID | str | None = None,
         user_id: UUID | str | None = None,
         task_type: str | None = None,
+        **kwargs: Any,
     ) -> tuple[bool, dict[str, Any] | None]:
         """Asynchronously register a task submission with status PENDING and real task ID.
+
+        Uses submission_ttl (default 24h) to retain PENDING state while waiting in queue.
+        Do not confuse worker lock lease (lock_ttl) with submission retention.
 
         Raises:
             ServiceUnavailableException if Redis operation fails.
         """
+        effective_ttl = kwargs.get("lock_ttl", submission_ttl)
         redis_key = f"{IDEMPOTENCY_PREFIX}{key}" if not key.startswith(IDEMPOTENCY_PREFIX) else key
         created_at = datetime.now(UTC).isoformat()
         t_str = str(tenant_id) if tenant_id else ""
@@ -594,7 +629,7 @@ class IdempotencyManager:
                 1,
                 redis_key,
                 task_id,
-                str(lock_ttl),
+                str(effective_ttl),
                 created_at,
                 t_str,
                 u_str,
@@ -719,7 +754,7 @@ class IdempotencyManager:
         client: AsyncRedis[Any],
         key: str,
         new_status: str = "PENDING",
-        ttl: int = 360,
+        ttl: int = DEFAULT_SUBMISSION_TTL,
     ) -> bool:
         """Atomically reconcile DISPATCH_UNKNOWN state back to PENDING or active state."""
         redis_key = f"{IDEMPOTENCY_PREFIX}{key}" if not key.startswith(IDEMPOTENCY_PREFIX) else key
@@ -901,8 +936,12 @@ def idempotent_task(
                 )
                 return result
             except TransientTaskError:
-                # Release lock with ownership token so retry can acquire
-                manager.release(scoped_key, lock_token=lock_token)
+                # Release worker lock lease and restore PENDING status with retention TTL so retry can acquire
+                manager.release(
+                    scoped_key,
+                    lock_token=lock_token,
+                    pending_ttl=DEFAULT_SUBMISSION_TTL,
+                )
                 raise
             except Exception as exc:
                 manager.fail(

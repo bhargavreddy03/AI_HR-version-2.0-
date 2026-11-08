@@ -294,3 +294,115 @@ async def test_task_service_reconciles_dispatch_unknown_on_retry() -> None:
         # apply_async must have been called with the EXACT same task_id
         mock_task.apply_async.assert_called_once()
         assert mock_task.apply_async.call_args.kwargs["task_id"] == "original-task-id-123"
+
+
+@pytest.mark.asyncio
+async def test_task_service_delayed_queue_execution_and_duplicate_submission() -> None:
+    """Verify that a task waiting in a queue longer than 360s retains its PENDING idempotency record.
+
+    A duplicate submission after the original 360-second period must be recognized
+    as duplicate and suppressed, without dispatching a duplicate task.
+    """
+    from uuid import uuid4
+
+    from app.core.tasks.idempotency import DEFAULT_SUBMISSION_TTL
+
+    mock_celery = MagicMock()
+    mock_task = MagicMock()
+    mock_task.name = "delayed_sample_task"
+    mock_async_result = MagicMock()
+    mock_async_result.id = "original-delayed-task-id"
+    mock_task.apply_async.return_value = mock_async_result
+
+    tenant_id = uuid4()
+    client_key = "delayed-task-client-key"
+
+    mock_redis = AsyncMock()
+
+    # Step 1: Initial submission at t=0
+    mock_redis.eval.return_value = [1, "{}"]  # Fresh registration
+    service = TaskService(app_celery=mock_celery)
+
+    res1 = await service.submit_task(
+        task=mock_task,
+        idempotency_key=client_key,
+        tenant_id=tenant_id,
+        redis_client=mock_redis,
+    )
+    assert res1.duplicate is False
+    assert res1.status == "PENDING"
+    assert res1.task_id is not None
+    orig_task_id = res1.task_id
+
+    # Verify that registration used DEFAULT_SUBMISSION_TTL (86400s), NOT the worker lock lease 360s
+    reg_eval_call = mock_redis.eval.call_args_list[0]
+    actual_ttl = int(reg_eval_call[0][4])  # ARGV[2] is submission_ttl
+    assert actual_ttl == DEFAULT_SUBMISSION_TTL
+    assert actual_ttl >= 86400
+
+    # Step 2: Simulate delayed execution - e.g. 600 seconds (10 minutes) later, the task is still in Celery queue
+    # The client retries or sends a duplicate request with the same Idempotency-Key
+    mock_redis.eval.reset_mock()
+    mock_task.apply_async.reset_mock()
+
+    pending_record = json.dumps(
+        {
+            "status": "PENDING",
+            "task_id": orig_task_id,
+            "tenant_id": str(tenant_id),
+            "created_at": "2026-11-08T19:00:00+00:00",
+        }
+    )
+    # Redis still holds the record (has not expired after 360s)
+    mock_redis.eval.return_value = [0, pending_record]
+
+    res2 = await service.submit_task(
+        task=mock_task,
+        idempotency_key=client_key,
+        tenant_id=tenant_id,
+        redis_client=mock_redis,
+    )
+
+    # Must be recognized as duplicate and suppressed
+    assert res2.duplicate is True
+    assert res2.task_id == orig_task_id
+    assert res2.status == "PENDING"
+    # apply_async must NOT be called on duplicate
+    mock_task.apply_async.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_task_service_crafted_prefix_key_cannot_collide_across_tenants() -> None:
+    """Verify that an attacker attempting to use an idempotency:task: crafted key cannot access victim data."""
+    from uuid import uuid4
+
+    from app.core.tasks.idempotency import IDEMPOTENCY_PREFIX
+
+    tenant_victim = uuid4()
+    tenant_attacker = uuid4()
+
+    mock_celery = MagicMock()
+    mock_task = MagicMock()
+    mock_task.name = "critical_task"
+    mock_task.apply_async.return_value = MagicMock(id="attacker-task-id")
+
+    mock_redis = AsyncMock()
+    mock_redis.eval.return_value = [1, "{}"]
+
+    service = TaskService(app_celery=mock_celery)
+
+    # Attacker passes a crafted key attempting to target tenant_victim
+    crafted_key = f"{IDEMPOTENCY_PREFIX}{tenant_victim}:user1:critical_task:victim-operation"
+
+    await service.submit_task(
+        task=mock_task,
+        idempotency_key=crafted_key,
+        tenant_id=tenant_attacker,
+        redis_client=mock_redis,
+    )
+
+    # Check the key actually passed to Redis
+    actual_redis_key = mock_redis.eval.call_args[0][2]
+    # It must be scoped under tenant_attacker, preventing any collision with tenant_victim
+    assert f"{IDEMPOTENCY_PREFIX}{tenant_attacker}" in actual_redis_key
+    assert actual_redis_key.startswith(f"{IDEMPOTENCY_PREFIX}{tenant_attacker}")

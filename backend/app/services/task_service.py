@@ -18,6 +18,7 @@ from redis.asyncio import Redis as AsyncRedis
 from app.core.celery_app import celery_app
 from app.core.errors import AuthorizationException, ServiceUnavailableException
 from app.core.tasks.idempotency import (
+    DEFAULT_SUBMISSION_TTL,
     IdempotencyManager,
     format_scoped_key,
 )
@@ -110,7 +111,7 @@ class TaskService:
                 client=redis_client,
                 key=scoped_key,
                 task_id=assigned_task_id,
-                lock_ttl=360,
+                submission_ttl=DEFAULT_SUBMISSION_TTL,
                 tenant_id=tenant_id,
                 user_id=user_id,
                 task_type=task_name,
@@ -178,6 +179,7 @@ class TaskService:
                             client=redis_client,
                             key=scoped_key,
                             new_status="PENDING",
+                            ttl=DEFAULT_SUBMISSION_TTL,
                         )
                         return TaskSubmissionResult(
                             task_id=existing_task_id,

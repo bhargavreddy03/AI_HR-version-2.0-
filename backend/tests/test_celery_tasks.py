@@ -299,3 +299,68 @@ def test_idempotent_task_bounded_lease_exceeds_task_time_limit() -> None:
         actual_lock_ttl = int(call_args[0][5])  # ARGV[3] is lock_ttl
         expected_min = settings.CELERY_TASK_TIME_LIMIT + 60
         assert actual_lock_ttl >= expected_min
+
+
+def test_format_scoped_key_prevents_prefix_injection_and_bypass() -> None:
+    """Verify malicious client cannot bypass tenant isolation by prefixing idempotency key with idempotency:task:."""
+    from uuid import uuid4
+
+    from app.core.tasks.idempotency import IDEMPOTENCY_PREFIX, format_scoped_key
+
+    tenant_attacker = uuid4()
+    tenant_victim = uuid4()
+
+    # Malicious client sends a key crafted to impersonate victim tenant
+    crafted_key = f"{IDEMPOTENCY_PREFIX}{tenant_victim}:admin:system_ping:victim-payment-1"
+
+    scoped_key = format_scoped_key(
+        key=crafted_key,
+        tenant_id=tenant_attacker,
+        user_id="attacker-user",
+        task_type="system_ping",
+    )
+
+    # Scoped key must strictly reside within tenant_attacker's namespace
+    expected_prefix = f"{IDEMPOTENCY_PREFIX}{tenant_attacker}:attacker-user:system_ping:"
+    assert scoped_key.startswith(expected_prefix)
+    assert str(tenant_attacker) in scoped_key
+
+    # It must never match the victim's legitimate scoped key
+    victim_key = format_scoped_key(
+        key="victim-payment-1",
+        tenant_id=tenant_victim,
+        user_id="admin",
+        task_type="system_ping",
+    )
+    assert scoped_key != victim_key
+
+
+def test_delayed_worker_execution_acquires_long_waiting_pending_task() -> None:
+    """Verify that a worker picking up a task delayed in queue (e.g. > 360s) transitions PENDING to PROCESSING."""
+    mock_redis = MagicMock()
+    # Lua acquire transitions PENDING to PROCESSING with worker lock lease
+    mock_redis.eval.side_effect = [
+        [1, "worker-token-xyz", "{}"],  # acquire succeeds
+        1,  # complete succeeds
+    ]
+
+    manager = IdempotencyManager(sync_client=mock_redis)
+
+    # Worker acquires lock for the delayed task
+    acquired, token, existing = manager.acquire(
+        key="delayed-scoped-key",
+        task_id="original-delayed-task-id",
+        lock_ttl=360,
+    )
+    assert acquired is True
+    assert token == "worker-token-xyz"
+
+    # Worker completes the delayed task
+    completed = manager.complete(
+        key="delayed-scoped-key",
+        result={"status": "finished"},
+        task_id="original-delayed-task-id",
+        lock_token=token,
+        result_ttl=86400,
+    )
+    assert completed is True
