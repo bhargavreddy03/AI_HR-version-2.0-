@@ -621,9 +621,10 @@ async def test_live_redis_started_race_preserves_dispatch_unknown_and_worker_com
     async_redis = create_redis_client(settings)
     manager = IdempotencyManager(sync_client=sync_redis, settings=settings)
 
+    task_name = getattr(system_ping, "name", "system_ping")
     test_key = "live-started-race-" + uuid.uuid4().hex
     task_id = "live-task-" + uuid.uuid4().hex
-    scoped_key = format_scoped_key(key=test_key, tenant_id=TENANT_A, task_type="system_ping")
+    scoped_key = format_scoped_key(key=test_key, tenant_id=TENANT_A, task_type=task_name)
 
     try:
         # Step 1: Initial submission registered in live Redis
@@ -632,7 +633,7 @@ async def test_live_redis_started_race_preserves_dispatch_unknown_and_worker_com
             key=scoped_key,
             task_id=task_id,
             tenant_id=TENANT_A,
-            task_type="system_ping",
+            task_type=task_name,
         )
         assert reg_ok is True
 
