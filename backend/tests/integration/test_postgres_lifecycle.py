@@ -1371,7 +1371,7 @@ async def test_postgres_role_initialization_with_custom_credentials_and_reconcil
 
     reconciliation/rotation to new credentials, and catalog attributes (rolsuper=f, rolbypassrls=f, rolcreatedb=f).
     """
-    from sqlalchemy.engine import make_url
+    from sqlalchemy.engine import URL, make_url
 
     runtime_url = make_url(integration_settings.DATABASE_URL)
     host = runtime_url.host or "localhost"
@@ -1387,7 +1387,7 @@ async def test_postgres_role_initialization_with_custom_credentials_and_reconcil
 
     # Verify superuser reachability
     try:
-        super_engine = create_async_engine(super_url)
+        super_engine = create_async_engine(super_url, isolation_level="AUTOCOMMIT")
         async with super_engine.connect() as conn:
             await conn.execute(text("SELECT 1;"))
     except Exception:
@@ -1419,32 +1419,44 @@ async def test_postgres_role_initialization_with_custom_credentials_and_reconcil
 
     # Superuser is available: perform full dynamic role creation, custom auth, and reconciliation test
     test_mig_user = f"test_mig_{uuid.uuid4().hex[:8]}"
-    test_mig_pass_1 = f"CustomMigPass1_{uuid.uuid4().hex[:12]}!"
+    test_mig_pass_1 = f"CustomMigPass1_{uuid.uuid4().hex[:12]}"
     test_app_user = f"test_app_{uuid.uuid4().hex[:8]}"
-    test_app_pass_1 = f"CustomAppPass1_{uuid.uuid4().hex[:12]}!"
+    test_app_pass_1 = f"CustomAppPass1_{uuid.uuid4().hex[:12]}"
 
     try:
         # Step 1: Initialize roles with custom credentials and strict least privilege
-        async with super_engine.begin() as conn:
+        async with super_engine.connect() as conn:
             await conn.execute(
                 text(
                     f"CREATE ROLE {test_mig_user} WITH LOGIN PASSWORD '{test_mig_pass_1}' "
                     f"NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;"
                 )
             )
+            await conn.execute(text(f"GRANT CONNECT ON DATABASE {database} TO {test_mig_user};"))
             await conn.execute(
                 text(
                     f"CREATE ROLE {test_app_user} WITH LOGIN PASSWORD '{test_app_pass_1}' "
                     f"NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;"
                 )
             )
+            await conn.execute(text(f"GRANT CONNECT ON DATABASE {database} TO {test_app_user};"))
 
         # Step 2: Verify custom credentials authenticate successfully and execute queries
-        mig_url_1 = (
-            f"postgresql+asyncpg://{test_mig_user}:{test_mig_pass_1}@{host}:{port}/{database}"
+        mig_url_1 = URL.create(
+            "postgresql+asyncpg",
+            username=test_mig_user,
+            password=test_mig_pass_1,
+            host=host,
+            port=port,
+            database=database,
         )
-        app_url_1 = (
-            f"postgresql+asyncpg://{test_app_user}:{test_app_pass_1}@{host}:{port}/{database}"
+        app_url_1 = URL.create(
+            "postgresql+asyncpg",
+            username=test_app_user,
+            password=test_app_pass_1,
+            host=host,
+            port=port,
+            database=database,
         )
 
         test_mig_engine_1 = create_async_engine(mig_url_1)
@@ -1473,10 +1485,10 @@ async def test_postgres_role_initialization_with_custom_credentials_and_reconcil
                 assert createdb_val is False, f"{rname} must have rolcreatedb = false"
 
         # Step 4: Reconcile / rotate credentials to custom password 2
-        test_mig_pass_2 = f"RotatedMigPass2_{uuid.uuid4().hex[:12]}!"
-        test_app_pass_2 = f"RotatedAppPass2_{uuid.uuid4().hex[:12]}!"
+        test_mig_pass_2 = f"RotatedMigPass2_{uuid.uuid4().hex[:12]}"
+        test_app_pass_2 = f"RotatedAppPass2_{uuid.uuid4().hex[:12]}"
 
-        async with super_engine.begin() as conn:
+        async with super_engine.connect() as conn:
             await conn.execute(
                 text(
                     f"ALTER ROLE {test_mig_user} WITH LOGIN PASSWORD '{test_mig_pass_2}' "
@@ -1491,11 +1503,21 @@ async def test_postgres_role_initialization_with_custom_credentials_and_reconcil
             )
 
         # Step 5: Verify authentication with new credentials succeeds
-        mig_url_2 = (
-            f"postgresql+asyncpg://{test_mig_user}:{test_mig_pass_2}@{host}:{port}/{database}"
+        mig_url_2 = URL.create(
+            "postgresql+asyncpg",
+            username=test_mig_user,
+            password=test_mig_pass_2,
+            host=host,
+            port=port,
+            database=database,
         )
-        app_url_2 = (
-            f"postgresql+asyncpg://{test_app_user}:{test_app_pass_2}@{host}:{port}/{database}"
+        app_url_2 = URL.create(
+            "postgresql+asyncpg",
+            username=test_app_user,
+            password=test_app_pass_2,
+            host=host,
+            port=port,
+            database=database,
         )
 
         test_mig_engine_2 = create_async_engine(mig_url_2)
@@ -1525,9 +1547,18 @@ async def test_postgres_role_initialization_with_custom_credentials_and_reconcil
 
     finally:
         # Step 7: Teardown custom test roles
-        async with super_engine.begin() as conn:
-            await conn.execute(text(f"DROP ROLE IF EXISTS {test_mig_user};"))
-            await conn.execute(text(f"DROP ROLE IF EXISTS {test_app_user};"))
+        try:
+            async with super_engine.connect() as conn:
+                await conn.execute(
+                    text(f"REVOKE CONNECT ON DATABASE {database} FROM {test_mig_user};")
+                )
+                await conn.execute(
+                    text(f"REVOKE CONNECT ON DATABASE {database} FROM {test_app_user};")
+                )
+                await conn.execute(text(f"DROP ROLE IF EXISTS {test_mig_user};"))
+                await conn.execute(text(f"DROP ROLE IF EXISTS {test_app_user};"))
+        except Exception:
+            pass
         await super_engine.dispose()
 
 
