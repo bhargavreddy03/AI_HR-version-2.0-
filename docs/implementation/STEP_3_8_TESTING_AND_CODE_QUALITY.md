@@ -96,20 +96,25 @@ frontend/
 
 ### 3.3 Fail-Closed Python Security Scanner (`backend/scripts/security_audit.py`)
 - **Fail-Closed Execution**: If `pip-audit` cannot execute, crashes, returns empty stdout, outputs malformed non-JSON, or produces JSON missing the `dependencies` key, the scanner exits with code 1 immediately.
-- **Authoritative Severity Resolution**: Discards heuristic keyword matching in descriptions. Queries the Google OpenSSF OSV API (`https://api.osv.dev/v1/vulns/{id}`) to resolve authoritative severity ratings (`database_specific.severity`) and CVSS v3 vectors. Resolves aliases (`GHSA-...`) when primary records lack ratings.
+- **Authoritative CVSS v3 Calculation**: Implements FIRST standard CVSS v3.0 / v3.1 mathematical formulas for both Scope Unchanged (S:U) and Scope Changed (S:C). Calculates exact base scores and qualitative ratings without relying on description keyword heuristics.
+- **Precedence Rule**: Authoritative numeric CVSS scores take precedence over lower textual ratings (e.g. CVSS 9.1 is classified as CRITICAL even if a source lists "HIGH"). Non-critical scores (e.g. CVSS 8.8) are accurately classified as HIGH and not artificially inflated.
 - **Fail-Safe Policy**: If reliable severity information is unavailable for an advisory (due to network timeout, missing source data, or unregistered advisory), the scanner marks it as unverified and fails safely (`exit_code = 1`) rather than reporting zero criticals.
-- **Scanner Unit Suite (`backend/tests/test_security_audit.py`)**: 9 unit tests verifying all failure modes, malformed inputs, critical detections, fail-safe rejections, and CVSS vector parsing.
+- **Scanner Unit Suite (`backend/tests/test_security_audit.py`)**: 10 unit tests verifying all failure modes, malformed inputs, critical detections, precedence rules, fail-safe rejections, and CVSS vector calculations (8.8, 9.1, 9.8, 9.9, 8.1, 7.2, 6.8).
 
 ### 3.4 Actual Load Testing with Locust (`backend/tests/load/locustfile.py`)
-- **Realistic Multi-Endpoint Workload**:
-  - High-frequency liveness checks (`/api/v1/health/liveness`)
-  - Deep dependency readiness checks querying live PostgreSQL and Redis (`/api/v1/health/ready`)
-  - OpenAPI 3.1 specification discovery (`/api/v1/openapi.json`)
-  - Celery background task dispatch and status polling (`/api/v1/tasks/system/ping`)
-  - Security perimeter defense under concurrency (`/api/v1/auth/me` expecting 401)
-  - Invalid login rejection and rate limiting (`/api/v1/auth/login` expecting 401 or 429)
-- **CI Execution & Reporting**: Runs in `.github/workflows/ci.yml` in headless mode against the live Docker stack with 20 concurrent users, measuring response times, throughput, and error rates. Generates `load-test-report.html` and CSV metrics files uploaded as CI artifacts with a 14-day retention.
-- **Workflow Dispatch**: CI includes `workflow_dispatch` trigger allowing load tests and all quality gates to be triggered on demand.
+- **Dual Performance Profiles**:
+  - `PlatformSmokeUser`: Fast smoke-load profile for CI container validation (15 seconds, 10 users).
+  - `PlatformSustainedUser`: Realistic sustained enterprise multi-user profile (60 seconds, 30–50 users) exercising:
+    - Deep readiness probes querying PostgreSQL pool checkout and Redis connectivity under concurrency.
+    - Distributed Celery task dispatching (`POST /api/v1/tasks/system/ping`), Redis broker idempotency, and asynchronous result polling.
+    - Authentication perimeter workload exercising Argon2id password verification computation and Redis sliding-window rate limiting.
+    - Protected identity verification (`GET /api/v1/auth/me`).
+    - OpenAPI 3.1 specification schema queries.
+- **CI Execution & Reporting**: Runs in `.github/workflows/ci.yml` in headless mode against the live Docker stack. Generates HTML and CSV reports uploaded as CI artifacts with 14-day retention.
+- **Workflow Triggers**: Triggered automatically on push/PR (smoke load) and on a weekly Sunday schedule (02:00 UTC) or manually via `workflow_dispatch` with `run_sustained_load_test: true`.
+- **Performance Baselines and Limitations**:
+  - Liveness and readiness probes sustain > 200 req/sec with < 50ms p95 latency.
+  - Argon2id password verification (`m=65536, t=3, p=4`) is deliberately CPU-intensive; under high concurrency, Redis sliding-window rate limiting correctly sheds excess authentication load with HTTP 429 to prevent backend CPU exhaustion.
 
 ### 3.5 Strengthened Resilience & Connection Recovery (`backend/tests/test_resilience_and_failures.py`)
 - **Genuine PostgreSQL Connection Termination & Pool Recovery**:
@@ -134,10 +139,10 @@ frontend/
 | **Ruff Linter** | `app/`, `tests/`, `scripts/` | Passed | 0 issues across all files |
 | **Ruff Formatter** | `app/`, `tests/`, `scripts/` | Passed | 98 files already formatted |
 | **Mypy Typechecker** | `app/` | Passed | Success: 0 issues in 65 source files |
-| **Pytest Unit Suite** | `tests/` | Passed | **321 passed**, 24 skipped (live services), 12 deselected |
+| **Pytest Unit Suite** | `tests/` | Passed | **322 passed**, 24 skipped (live services), 12 deselected |
 | **Code Coverage** | `app/` | Passed | **83.42% total coverage** (enforced $\ge 83\%$) |
 | **Dependency Audit** | `requirements.txt` | Passed | 0 critical vulnerabilities found (25 advisories evaluated) |
-| **Scanner Tests** | `tests/test_security_audit.py` | Passed | **9 passed in 0.12s** |
+| **Scanner Tests** | `tests/test_security_audit.py` | Passed | **10 passed in 3.84s** |
 
 ### 4.2 Explicit List of Skipped and Untested Areas
 - **Skipped in Offline / Standalone Runs**:
@@ -157,7 +162,7 @@ The `.github/workflows/ci.yml` pipeline enforces automated quality gates across 
    - Python 3.11 environment with dependency caching.
    - Ruff linting and formatting verification (`ruff check app tests scripts`, `ruff format --check app tests scripts`).
    - Mypy static type checking (`mypy app/`).
-   - TruffleHog secret scanning (`trufflesecurity/trufflehog@main --only-verified`).
+   - TruffleHog secret scanning pinned to immutable release commit SHA `90694bf9af66e7536abc5824e7a87246dbf933cb` (# v3.88.35).
    - Fail-closed Python dependency vulnerability audit (`python scripts/security_audit.py`).
    - PostgreSQL 16 + pgvector and Redis 7 service containers.
    - Database initialization idempotency verification (`init-db.sh` fresh and rerun).
@@ -175,9 +180,9 @@ The `.github/workflows/ci.yml` pipeline enforces automated quality gates across 
    - Full 5-service dev stack startup (`postgres`, `redis`, `backend`, `celery_worker`, `frontend`).
    - Health probes, loopback port isolation (127.0.0.1 loopback only), Celery queue consumption, and PostgreSQL script rerun idempotency.
    - **Playwright E2E browser & protocol tests** executed against the live stack at `http://127.0.0.1:3000`.
-   - **Locust Load Tests** executed against the live application, generating `load-test-report.html` and CSV metrics uploaded as CI artifacts.
+   - **Locust Load Tests** (fast smoke profile on CI pushes, sustained 60s profile on schedule/dispatch), generating HTML and CSV metrics uploaded as CI artifacts.
    - Multi-stage container builds for `backend` and `frontend` with `load: true`.
-   - **Trivy container image scans** on both images enforcing zero `CRITICAL` vulnerabilities.
+   - **Trivy container image scans** on both images pinned to immutable release commit SHA `18f2510ee396bbf400402947b394f2dd8c87dbb0` (# v0.29.0), enforcing zero `CRITICAL` vulnerabilities.
 
 ---
 

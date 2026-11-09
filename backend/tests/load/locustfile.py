@@ -1,28 +1,53 @@
 """Locust performance and load testing suite for the AI HR Intelligence Platform.
 
-Simulates concurrent user load against actual running backend services:
-1. High-frequency liveness and readiness probe verification.
-2. OpenAPI 3.1 specification schema queries.
-3. Background task submission and asynchronous polling.
-4. Unauthenticated resource rejection and security perimeter enforcement.
-5. Invalid credential rejection under concurrency.
+Provides dual profiles:
+1. PlatformSmokeUser: Short smoke verification for CI container startup validation.
+2. PlatformSustainedUser: Realistic sustained enterprise workload exercising:
+   - Deep PostgreSQL and Redis dependency readiness under concurrency.
+   - Distributed Celery task dispatching, queue routing, and result polling.
+   - Authentication perimeter, Argon2id verification, and sliding-window rate limiting.
+   - OpenAPI 3.1 specification discovery.
 """
 
 from __future__ import annotations
 
+import time
 import uuid
 
 from locust import HttpUser, between, task
 
 
-class PlatformLoadTestUser(HttpUser):
-    """Simulates realistic enterprise platform traffic under concurrent multi-user load."""
+class PlatformSmokeUser(HttpUser):
+    """Lightweight smoke load profile for CI validation."""
+
+    wait_time = between(0.1, 0.5)
+
+    @task(3)
+    def liveness_smoke(self) -> None:
+        self.client.get("/api/v1/health/liveness", name="/api/v1/health/liveness [smoke]")
+
+    @task(2)
+    def readiness_smoke(self) -> None:
+        self.client.get("/api/v1/health/ready", name="/api/v1/health/ready [smoke]")
+
+    @task(1)
+    def task_ping_smoke(self) -> None:
+        self.client.post(
+            "/api/v1/tasks/system/ping",
+            json={"message": "smoke-ping"},
+            headers={"Content-Type": "application/json"},
+            name="/api/v1/tasks/system/ping [smoke]",
+        )
+
+
+class PlatformSustainedUser(HttpUser):
+    """Realistic sustained multi-user enterprise workload profile."""
 
     wait_time = between(0.05, 0.25)
 
-    @task(6)
+    @task(5)
     def liveness_check(self) -> None:
-        """Sustained liveness verification under concurrency."""
+        """Sustained liveness verification under concurrent throughput."""
         with self.client.get(
             "/api/v1/health/liveness",
             name="/api/v1/health/liveness",
@@ -31,24 +56,28 @@ class PlatformLoadTestUser(HttpUser):
             if response.status_code == 200:
                 response.success()
             else:
-                response.failure(f"Liveness probe failed with HTTP {response.status_code}")
+                response.failure(f"Liveness failed: HTTP {response.status_code}")
 
     @task(4)
-    def readiness_check(self) -> None:
-        """Deep readiness probe verifying PostgreSQL and Redis health under concurrency."""
+    def deep_readiness_probe(self) -> None:
+        """Deep readiness probe exercising PostgreSQL pool checkout and Redis ping."""
         with self.client.get(
             "/api/v1/health/ready",
             name="/api/v1/health/ready",
             catch_response=True,
         ) as response:
             if response.status_code == 200:
-                response.success()
+                data = response.json()
+                if data.get("database") == "connected" and data.get("redis") == "connected":
+                    response.success()
+                else:
+                    response.failure(f"Dependencies degraded: {data}")
             else:
-                response.failure(f"Readiness probe failed with HTTP {response.status_code}")
+                response.failure(f"Readiness probe failed: HTTP {response.status_code}")
 
     @task(2)
     def openapi_schema_discovery(self) -> None:
-        """Fetch OpenAPI 3.1 schema specification."""
+        """Fetch OpenAPI 3.1 specification schema under concurrency."""
         with self.client.get(
             "/api/v1/openapi.json",
             name="/api/v1/openapi.json",
@@ -57,66 +86,67 @@ class PlatformLoadTestUser(HttpUser):
             if response.status_code == 200:
                 response.success()
             else:
-                response.failure(
-                    f"OpenAPI schema retrieval failed with HTTP {response.status_code}"
-                )
+                response.failure(f"OpenAPI schema retrieval failed: HTTP {response.status_code}")
 
     @task(3)
-    def submit_and_poll_diagnostic_task(self) -> None:
-        """Simulate distributed Celery task dispatch and subsequent status polling."""
-        task_payload = {"message": f"load-test-ping-{uuid.uuid4()}"}
+    def submit_and_poll_celery_task(self) -> None:
+        """Exercise Celery worker dispatching, Redis broker idempotency, and result polling."""
+        payload = {"message": f"sustained-load-{uuid.uuid4().hex[:12]}"}
         with self.client.post(
             "/api/v1/tasks/system/ping",
-            json=task_payload,
+            json=payload,
             headers={"Content-Type": "application/json"},
             name="/api/v1/tasks/system/ping",
             catch_response=True,
         ) as submit_res:
             if submit_res.status_code in (200, 202):
                 submit_res.success()
-                data = submit_res.json()
-                task_id = data.get("task_id")
+                task_data = submit_res.json()
+                task_id = task_data.get("task_id")
                 if task_id:
-                    self.client.get(
-                        f"/api/v1/tasks/{task_id}/status",
-                        name="/api/v1/tasks/[task_id]/status",
-                    )
+                    # Poll status up to 3 times to observe asynchronous worker progression
+                    for _ in range(3):
+                        time.sleep(0.05)
+                        self.client.get(
+                            f"/api/v1/tasks/{task_id}/status",
+                            name="/api/v1/tasks/[task_id]/status",
+                        )
             else:
-                submit_res.failure(f"Task dispatch failed with HTTP {submit_res.status_code}")
+                submit_res.failure(f"Task dispatch failed: HTTP {submit_res.status_code}")
 
     @task(2)
-    def unauthenticated_security_perimeter_rejection(self) -> None:
-        """Verify protected endpoints enforce HTTP 401 under concurrency."""
+    def unauthenticated_perimeter_defense(self) -> None:
+        """Verify protected authentication dependencies reject unauthenticated calls with HTTP 401."""
         with self.client.get(
             "/api/v1/auth/me",
-            name="/api/v1/auth/me [expected-401]",
+            name="/api/v1/auth/me [perimeter-defense]",
             catch_response=True,
         ) as response:
             if response.status_code == 401:
                 response.success()
             else:
-                response.failure(
-                    f"Expected HTTP 401 unauthorized, received HTTP {response.status_code}"
-                )
+                response.failure(f"Expected HTTP 401 unauthorized, got {response.status_code}")
 
-    @task(1)
-    def invalid_credentials_auth_rejection(self) -> None:
-        """Verify password authentication rejects bogus credentials with HTTP 401 under load."""
-        login_payload = {
-            "email": f"nonexistent-{uuid.uuid4().hex[:8]}@enterprise-loadtest.com",
-            "password": "WrongPassword999!",
+    @task(2)
+    def authentication_login_workload(self) -> None:
+        """Exercise login endpoint: Argon2id password hash computation and Redis rate limiting."""
+        payload = {
+            "email": f"load-test-{uuid.uuid4().hex[:8]}@enterprise-example.com",
+            "password": "WrongPassword123!",
         }
         with self.client.post(
             "/api/v1/auth/login",
-            json=login_payload,
+            json=payload,
             headers={"Content-Type": "application/json"},
-            name="/api/v1/auth/login [expected-401]",
+            name="/api/v1/auth/login [rate-limit-and-crypto]",
             catch_response=True,
         ) as response:
             if response.status_code in (401, 429):
-                # HTTP 401 is invalid credentials, HTTP 429 is expected rate limiting under high concurrency
+                # 401: Credential rejected, 429: Rate limit sliding window triggered
                 response.success()
             else:
-                response.failure(
-                    f"Unexpected response code on invalid login: {response.status_code}"
-                )
+                response.failure(f"Unexpected login response: HTTP {response.status_code}")
+
+
+# Default user class when invoking locustfile without specifying class name
+PlatformLoadTestUser = PlatformSustainedUser
