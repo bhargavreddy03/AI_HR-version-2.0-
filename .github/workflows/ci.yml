@@ -62,6 +62,16 @@ jobs:
           cd backend
           mypy app/
 
+      - name: Run TruffleHog Secret Scanning
+        uses: trufflesecurity/trufflehog@main
+        with:
+          extra_args: --only-verified
+
+      - name: Run Python Dependency Security Audit
+        run: |
+          cd backend
+          python scripts/security_audit.py
+
       - name: Initialize PostgreSQL Roles and Extensions (Fresh Run)
         env:
           POSTGRES_SUPERUSER: postgres
@@ -113,7 +123,7 @@ jobs:
           CELERY_RESULT_BACKEND: redis://localhost:6379/2
         run: |
           cd backend
-          pytest -v --cov=app --cov-report=term-missing
+          pytest -v --cov=app --cov-fail-under=83 --cov-report=term-missing
 
   frontend-lint-and-typecheck:
     name: Frontend CI (Next.js 14 & Node.js 20)
@@ -133,7 +143,13 @@ jobs:
       - name: Install Node Dependencies
         run: |
           cd frontend
-          npm install
+          npm install --package-lock-only
+          npm ci
+
+      - name: Run NPM Security Audit
+        run: |
+          cd frontend
+          npm audit --audit-level=critical
 
       - name: Run ESLint
         run: |
@@ -152,10 +168,10 @@ jobs:
             exit 1
           fi
 
-      - name: Run Vitest Frontend Unit Tests
+      - name: Run Vitest Frontend Tests with Coverage
         run: |
           cd frontend
-          npm run test
+          npm run test:coverage
 
       - name: Build Frontend (Next.js Standalone)
         run: |
@@ -380,6 +396,16 @@ jobs:
 
           echo "SUCCESS: All 5 container services started, verified healthy, and passed all integration and security checks."
 
+      - name: Run Playwright End-to-End Tests Against Running Stack
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:3000
+        run: |
+          cd frontend
+          npm install --package-lock-only
+          npm ci
+          npx playwright install --with-deps chromium
+          npx playwright test
+
       - name: Teardown Docker Compose Development Stack
         if: always()
         run: |
@@ -394,6 +420,7 @@ jobs:
           context: ./backend
           file: ./backend/Dockerfile
           push: false
+          load: true
           tags: ai-hr/backend:ci-test
 
       - name: Build Frontend Docker Image
@@ -402,4 +429,25 @@ jobs:
           context: ./frontend
           file: ./frontend/Dockerfile
           push: false
+          load: true
           tags: ai-hr/frontend:ci-test
+
+      - name: Run Trivy Vulnerability Scan on Backend Image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ai-hr/backend:ci-test
+          format: table
+          exit-code: 1
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL
+
+      - name: Run Trivy Vulnerability Scan on Frontend Image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ai-hr/frontend:ci-test
+          format: table
+          exit-code: 1
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL

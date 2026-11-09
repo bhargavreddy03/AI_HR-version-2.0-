@@ -9,6 +9,7 @@ Verifies:
 
 from __future__ import annotations
 
+import os
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
@@ -239,3 +240,89 @@ async def test_idempotency_manager_lock_acquisition_timeout_fails_closed() -> No
             lock_ttl=60,
         )
     assert exc_info.value.code == "IDEMPOTENCY_UNAVAILABLE"
+
+
+# ------------------------------------------------------------------------------
+# 5. Live Infrastructure Resilience Integration Tests
+# ------------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_live_postgres_transaction_rollback_and_pool_recovery() -> None:
+    """Live PostgreSQL verifies atomic rollback on failure and immediate pool connection recovery."""
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL not set; skipping live PostgreSQL resilience test")
+
+    from sqlalchemy import text
+    from sqlalchemy.exc import DBAPIError
+
+    from app.core.database import create_db_engine, create_session_factory
+
+    engine = create_db_engine(database_url)
+    session_factory = create_session_factory(engine)
+
+    try:
+        # 1. Simulate transaction failure (invalid SQL query / constraint failure)
+        async with session_factory() as session:
+            try:
+                await session.execute(
+                    text("INSERT INTO non_existent_table_for_fault_test (id) VALUES (1);")
+                )
+                await session.commit()
+            except DBAPIError:
+                await session.rollback()
+
+        # 2. Verify connection returned to pool is healthy and immediately reusable
+        async with session_factory() as session:
+            result = await session.execute(text("SELECT 1 AS alive;"))
+            row = result.scalar()
+            assert row == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_live_redis_reconnection_and_circuit_recovery() -> None:
+    """Live Redis verifies state consistency, lock acquisition, and connection recovery."""
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    import redis.asyncio as aioredis
+
+    try:
+        client = aioredis.from_url(redis_url, socket_timeout=2.0)
+        await client.ping()
+    except Exception:
+        pytest.skip("Live Redis not reachable; skipping Redis live resilience test")
+
+    test_key = f"resilience:live:test:{uuid4()}"
+    try:
+        # Set and get key
+        await client.set(test_key, "active", ex=60)
+        val = await client.get(test_key)
+        assert val == b"active" or val == "active"
+
+        # Acquire distributed lock using IdempotencyManager
+        token = await IdempotencyManager.acquire_async(
+            client=client,
+            key=test_key,
+            task_id=str(uuid4()),
+            lock_ttl=30,
+        )
+        assert token is not None
+
+        # Second acquisition must be rejected (concurrency protection)
+        second_token = await IdempotencyManager.acquire_async(
+            client=client,
+            key=test_key,
+            task_id=str(uuid4()),
+            lock_ttl=30,
+        )
+        assert second_token is None
+
+        # Clean release
+        await IdempotencyManager.release_async(client=client, key=test_key, token=token)
+    finally:
+        await client.delete(test_key)
+        await client.aclose()

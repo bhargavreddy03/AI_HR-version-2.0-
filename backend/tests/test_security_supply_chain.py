@@ -118,3 +118,41 @@ def test_no_hardcoded_secrets_or_private_keys_in_app() -> None:
                 violations.append(f"Possible {desc} found in {py_file.relative_to(app_dir)}")
 
     assert not violations, "Secret leak patterns detected:\n" + "\n".join(violations)
+
+
+def test_docker_base_images_pinned_and_unprivileged() -> None:
+    """Dockerfiles enforce pinned base images and unprivileged execution."""
+    repo_root = get_backend_root().parent
+    backend_dockerfile = repo_root / "backend" / "Dockerfile"
+    frontend_dockerfile = repo_root / "frontend" / "Dockerfile"
+
+    assert backend_dockerfile.exists(), "Backend Dockerfile not found"
+    assert frontend_dockerfile.exists(), "Frontend Dockerfile not found"
+
+    backend_content = backend_dockerfile.read_text(encoding="utf-8")
+    assert "FROM python:3.11-slim" in backend_content
+    assert "useradd" in backend_content
+    assert "USER appuser" in backend_content or "chown" in backend_content
+
+    frontend_content = frontend_dockerfile.read_text(encoding="utf-8")
+    assert "FROM node:20-alpine" in frontend_content
+    assert "latest" not in frontend_content.split("FROM")[1].split()[0]
+
+
+def test_frontend_package_json_dependency_standards() -> None:
+    """Frontend package dependencies contain bounded semantic versions and no banned libraries."""
+    import json
+
+    repo_root = get_backend_root().parent
+    pkg_file = repo_root / "frontend" / "package.json"
+    assert pkg_file.exists(), "frontend/package.json not found"
+
+    data = json.loads(pkg_file.read_text(encoding="utf-8"))
+    deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+
+    banned_js_packages = {"request", "left-pad", "node-uuid", "event-stream"}
+    for pkg_name, version in deps.items():
+        assert (
+            pkg_name not in banned_js_packages
+        ), f"Banned or deprecated JS package detected: {pkg_name}"
+        assert not version.endswith("*"), f"Wildcard version forbidden for {pkg_name}: {version}"
