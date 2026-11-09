@@ -1,4 +1,4 @@
-# Step 3.9 — Legacy AI HR Integration Preparation (Corrected)
+# Step 3.9 — Legacy AI HR Integration Preparation (Refined)
 
 ## 1. Executive Summary & Scope Definition
 
@@ -39,7 +39,7 @@ Every capability is evaluated against four strict readiness categories:
 | **1** | **Resume & Document Ingestion** | `utils.py`, `app.py` | None | Celery queue `document_processing`, `BaseTask` retry logic, `parse_document` placeholder task in `backend/app/modules/documents/tasks.py` | Tier 1 (`pdfplumber`) text extraction, Tier 2 (`AWS Textract`) OCR fallback, SHA-256 deduplication, S3 bucket storage | **Ready after specified modifications** | S3 bucket integration, document database schema & migrations |
 | **2** | **Skill Extraction & Taxonomy** | `skill_extractor.py` | None | Package `__init__.py` in `backend/app/modules/screening/` | Port `_RAW_TAXONOMY`, `TextNormalizer`, and `ExactMatcher` into `backend/app/modules/screening/skills/` | **Ready for future integration** | None (pure Python / regex domain logic) |
 | **3** | **Candidate-Job Matching & Scoring** | `hr_agent.py`, `preprocessing.py` | None | Vector storage, dimension validation & cosine similarity in `backend/app/modules/embeddings/service.py`; design doc in `docs/architecture/14_candidate_matching_design.md` | Implement 5-component explainable scoring service in `backend/app/modules/screening/matching/` | **Ready after specified modifications** | Skill extraction service (Cap 2), candidate/job database schemas |
-| **4** | **Interview Question Generation** | `question_generator.py` | None | Package `__init__.py` in `backend/app/modules/interviews/` | Adapt `_KNOWLEDGE` bank and seniority tier heuristics into `backend/app/modules/interviews/questions/` with PII-redacted LLM fallback | **Ready for future integration** | LLM Provider Gateway integration (for fallback only) |
+| **4** | **Interview Question Generation** | `question_generator.py` | None | Package `__init__.py` in `backend/app/modules/interviews/` | Adapt `_KNOWLEDGE` bank, seniority tiers, and difficulty levels into `backend/app/modules/interviews/questions/` with PII-redacted LLM fallback | **Ready for future integration** | LLM Provider Gateway integration (for fallback only) |
 | **5** | **Interview Scheduling & Calendar** | `hr_agent.py` | None | Package `__init__.py` in `backend/app/modules/interviews/` | Database-backed interview slot reservation, optimistic concurrency locking, RFC 5545 iCalendar generation | **Ready after specified modifications** | Interview database schemas, calendar invite generator |
 | **6** | **Pipeline Management & Transitions** | `hr_agent.py` | None | Package `__init__.py` in `backend/app/modules/pipeline/` | Port `VALID_TRANSITIONS` FSM into database-backed transition service with RLS and immutable audit logging | **Ready after specified modifications** | Application database schema, audit log service |
 | **7** | **AI/ML Model Training & Evaluation** | `train_models.py`, `models/` | None | None | None | **Not recommended for reuse** | Permanently discarded due to demographic bias and synthetic target leakage |
@@ -85,7 +85,7 @@ flowchart TD
      # Legacy snippet from external preprocessing.py:
      if age > 45:
          hr_score -= 0.25 * ((age - 45) / 5.0)
-```
+     ```
    - Both `age` and `gender_encoded` were persisted as active inputs in `models/feature_names.pkl` and ingested by `XGBoost`.
    - **Remediation**: The synthetic dataset, tabular ML training scripts, and serialized `.pkl` models are rejected and will not be imported into `VER 2.0`.
 
@@ -156,17 +156,21 @@ flowchart TD
 ### 6.1 Regulatory Context & Limitations of the Four-Fifths Rule
 1. **Four-Fifths (80%) Rule as a Preliminary Screening Indicator**:
    - In accordance with the EEOC Uniform Guidelines on Employee Selection Procedures (29 C.F.R. § 1607.4(D)), the Four-Fifths rule states that a selection rate for any race, sex, or ethnic group which is less than four-fifths (80%) of the rate for the group with the highest selection rate will generally be regarded as evidence of adverse impact.
-   - **Crucial Clarification**: The Four-Fifths rule is **an administrative screening tool, not conclusive proof of legal compliance or discrimination**.
-     - An employer whose selection rates pass the 80% threshold can still be liable for unlawful discrimination if intentional bias or statistically significant disparities are demonstrated.
-     - Conversely, selection rates failing the 80% threshold do not constitute an automatic violation if the selection criteria are proven to be job-related for the position in question and consistent with business necessity.
-2. **Sample-Size and Statistical Limitations**:
-   - The Four-Fifths rule is mathematically sensitive to sample size. In small applicant pools ($N < 30$ per demographic subgroup), the difference of a single hiring decision can swing the selection ratio across the 80% boundary.
-   - Therefore, the platform's fairness auditing must combine the Four-Fifths ratio with **formal statistical significance tests** (e.g., Fisher's exact test for small samples, or the two-standard-deviation / Z-test rule for large candidate cohorts).
-3. **Voluntary, Decoupled Demographic Data Handling**:
-   - Demographic data (gender, race/ethnicity, age) collected for EEOC/OFCCP reporting must be strictly voluntary and gathered via an independent candidate self-identification flow.
-   - **Storage Isolation**: Demographic attributes must reside in separate, access-restricted compliance tables with distinct database permissions.
-   - **Strict Decoupling**: Demographic tables must **never** be joined or queried by the screening, candidate-matching, or interview evaluation services. Recruiters, hiring managers, and AI algorithms will have zero access to demographic self-identification data during the selection process.
+   - **Crucial Qualification**: The Four-Fifths rule is **strictly an administrative screening indicator, NOT conclusive proof of legal compliance or illegal discrimination**.
+     - An employer whose selection rates pass the 80% threshold can still be liable for unlawful discrimination if intentional discrimination, disparate treatment, or statistically significant disparities are demonstrated in larger samples.
+     - Conversely, selection rates failing the 80% threshold do not constitute an automatic violation of Title VII if the selection criteria are proven to be job-related for the position in question and consistent with business necessity.
+2. **Methodological and Sample-Size Limitations**:
+   - Sample-size thresholds cannot be reduced to a single universal threshold. The statistical power and reliability of adverse impact analyses depend on multiple factors:
+     - The specific analytical test deployed (e.g., Fisher's exact test for 2x2 contingency tables with small or sparse cell frequencies, hypergeometric distribution models, chi-square tests with Yates' continuity correction, or the two-standard-deviation / Z-test rule for large applicant cohorts).
+     - The overall applicant pool size, the base selection rate, and the proportional representation of protected vs. non-protected groups.
+     - In small candidate pools or skewed subgroup distributions, the outcome of a single applicant can drastically swing the selection ratio across the 80% boundary. Consequently, formal statistical significance testing must accompany impact ratio calculations rather than relying on an arbitrary universal sample cutoff.
+3. **Demographic Data Decoupling & Voluntary Self-Identification**:
+   - Demographic data (gender, race/ethnicity, age) collected for EEOC, OFCCP, or jurisdictional reporting must be strictly voluntary and collected through an independent candidate self-identification flow.
+   - **Storage Isolation**: Demographic attributes must reside in separate, access-restricted compliance tables with distinct encryption and access permissions.
+   - **Strict Architectural Decoupling**: Demographic tables must **never** be joined or queried by screening, candidate-matching, or interview evaluation services. Recruiters, hiring managers, and AI algorithms will have zero access to demographic self-identification data during the selection process.
    - **Auditing Execution**: Fairness audits must run asynchronously, out-of-band, across aggregated completed hiring cycles.
+4. **Explicit Legal Disclaimer**:
+   - **Legal compliance has NOT been established.** The mechanisms described herein represent architectural and technical compliance preparation targets. Full legal, regulatory, and privacy sign-off across all operating jurisdictions (e.g. EU AI Act, GDPR, UK GDPR, Title VII, ADEA, CCPA/CPRA, and state/local labor codes) is required prior to production deployment.
 
 ### 6.2 Reality of Algorithmic Bias in Matching Formulas
 - **No Formula is Inherently Unbiased**: While the approved 5-factor matching formula ($S_{\text{total}} = 0.40 \cdot S_{\text{req\_skills}} + 0.25 \cdot S_{\text{experience}} + 0.15 \cdot S_{\text{qualifications}} + 0.10 \cdot S_{\text{pref\_skills}} + 0.10 \cdot S_{\text{semantic\_align}}$) eliminates direct demographic inputs (`age`, `gender`), it is **not inherently immune to bias**.
@@ -179,56 +183,59 @@ flowchart TD
 
 ---
 
-## 7. Multi-Tenant Data Ownership, Lifecycle & Privacy (Section 12.D)
+## 7. Multi-Tenant Data Ownership, Lifecycle & Privacy: Proposed Architectural Options (Section 12.D)
 
-### 7.1 Separation of Global Identity vs. Tenant Application Records
+> [!IMPORTANT]
+> **PROPOSED ARCHITECTURAL OPTION — NOT AN APPROVED IMPLEMENTATION DECISION**
+> The candidate identity models and lifecycle flows described in this section represent proposed design options currently undergoing product, security, privacy, and legal evaluation. **No global candidate-sharing mechanism will be implemented without formal stakeholder approval.**
+
+### 7.1 Architecture Option Comparison: Global Identity vs. Siloed Profiles
 
 ```mermaid
-erDiagram
-    GLOBAL_CANDIDATE ||--o{ TENANT_APPLICATION : submits
-    TENANT_ORGANIZATION ||--o{ TENANT_APPLICATION : owns
-    TENANT_APPLICATION ||--o{ SCREENING_EVALUATION : produces
-    TENANT_APPLICATION ||--o{ INTERVIEW_SCHEDULE : schedules
-
-    GLOBAL_CANDIDATE {
-        uuid id PK
-        string email UK
-        string full_name
-        string phone
-        jsonb parsed_profile
-        timestamp created_at
-    }
-
-    TENANT_ORGANIZATION {
-        uuid id PK
-        string name
-        string slug UK
-    }
-
-    TENANT_APPLICATION {
-        uuid id PK
-        uuid organization_id FK
-        uuid candidate_id FK
-        uuid job_id FK
-        string stage
-        string status
-        timestamp applied_at
-    }
-
-    SCREENING_EVALUATION {
-        uuid id PK
-        uuid organization_id FK
-        uuid application_id FK
-        numeric total_score
-        jsonb component_breakdown
-        jsonb matched_skills
-        timestamp evaluated_at
-    }
+flowchart TD
+    subgraph Option A: Global Identity with Tenant Applications
+        GC["Global Candidate Profile (Single Master ID)"] --> APP_1["Tenant A Application<br/>(RLS Scoped)"]
+        GC --> APP_2["Tenant B Application<br/>(RLS Scoped)"]
+        APP_1 -.->|Strict Barrier: No Access| APP_2
+    end
+    subgraph Option B: Strict Organization-Specific Siloed Profiles
+        CAND_A["Tenant A Candidate Record"] --> APP_A["Tenant A Application"]
+        CAND_B["Tenant B Candidate Record"] --> APP_B["Tenant B Application"]
+    end
 ```
 
-1. **Global Candidate Profile (`candidates`)**: Represents the individual job seeker across the platform. Governed by candidate consent under GDPR/CCPA; candidate retains the right to export and request erasure of their global profile.
-2. **Tenant Application Record (`applications`, `screening_evaluations`)**: Represents the employer's evaluation record. Bound strictly by PostgreSQL Row-Level Security (`organization_id = current_setting('app.current_org_id')`). Maintained per organizational compliance retention schedules (e.g. 2-year EEOC retention) even if a candidate withdraws active consideration.
-3. **PII Redaction Before External LLM Inference**: Candidate names, contact information, and institutional names will be sanitized via entity tokenization before any prompt payload is transmitted to external model providers.
+| Dimension | Option A: Global Candidate Identity with Tenant Applications | Option B: Strict Organization-Specific Siloed Profiles |
+|---|---|---|
+| **Identity Model** | Single master candidate record across SaaS; applications linked via foreign keys. | Completely isolated candidate record per organization; no cross-tenant linking. |
+| **Candidate Experience** | Single sign-on; portable master profile, credentials, and resume library. | Separate account or separate application record per employer; duplicate data entry. |
+| **Tenant Isolation Risk** | Higher complexity: requires foreign key bridges and strict cross-tenant isolation enforcement. | Lowest risk: standard multi-tenant RLS applies uniformly to candidates and applications. |
+| **Regulatory Roles (GDPR)** | Platform operates as Joint Data Controller for global profile, and Data Processor for tenant applications. | Platform operates purely as a Data Processor for each tenant organization. |
+| **Consent Management** | Requires distinct, unbundled consent for global profile vs. tenant-specific applications. | Single consent flow tied directly to the employer's privacy notice. |
+
+### 7.2 Data Ownership, Consent, and Legal Governance Analysis
+1. **Candidate Consent and Lawful Basis**:
+   - Under GDPR (Art. 6(1)(a) consent vs. Art. 6(1)(b) pre-contractual steps) and CCPA/CPRA, the platform cannot assume a uniform lawful basis across all data operations.
+   - If Option A is pursued, cross-tenant profile sharing or common account access requires explicit, freely given, specific, and informed candidate consent that is completely unbundled from individual job applications.
+2. **Cross-Organization Data Access Restrictions**:
+   - Under either option, strict cryptographic and row-level boundaries must ensure Tenant A can never query, infer, or view candidate applications, interview status, notes, or evaluations from Tenant B.
+3. **Organization-Specific Resumes and Evaluation Records**:
+   - Resumes submitted to a specific employer, interviewer scorecards, recruiter feedback, internal salary notes, and algorithmic match scores are confidential trade secrets and proprietary property belonging exclusively to that tenant organization.
+4. **Candidate Withdrawal vs. Erasure Rights**:
+   - If a candidate withdraws an application from Tenant A, active applications at Tenant B remain unaffected.
+   - **GDPR Right to Erasure (Article 17) vs. Legal Retention Exceptions**:
+     - Candidate erasure rights under GDPR or CCPA **do not override mandatory statutory employer recordkeeping or the defense of legal claims**.
+     - Under GDPR Article 17(3)(b) (compliance with a legal obligation) and Article 17(3)(e) (establishment, exercise, or defense of legal claims), an employer is legally entitled and often required to retain candidate application records and evaluation data for statutory limitation periods (e.g. against discrimination claims) even if the candidate requests erasure.
+5. **Retention Obligations and Applicable Circumstances**:
+   - **United States (EEOC/OFCCP)**: Under EEOC regulations (29 C.F.R. § 1602.14), private employers with 15 or more employees must preserve all personnel or employment records (including applications and resumes) for at least 1 year from the date of the record creation or personnel action. Federal contractors subject to Executive Order 11246 / OFCCP (41 C.F.R. § 60-1.12) must retain records for 2 years (or 1 year for contractors under 150 employees or contracts under $150,000). If a discrimination charge or lawsuit is filed, records must be retained until final disposition.
+   - **Global Jurisdictions**: Global SaaS deployment requires jurisdiction-specific privacy and employment law review (e.g., German AGG 6-month retention, French CNIL 2-year limitation, UK Equality Act).
+6. **Required Authorization and Audit Controls**:
+   - Access to candidate data requires strict RBAC (`candidates:read`, `evaluations:read`, `evaluations:write`), tenant RLS enforcement (`current_setting('app.current_org_id')`), and immutable audit logging for all candidate data read and export events.
+
+### 7.3 Unresolved Decisions Requiring Product, Security, Privacy, and Legal Approval
+1. **Decision on Global Identity vs. Siloed Profiles**: Formally select Option A (Global Identity) or Option B (Siloed Profiles) based on corporate strategy, privacy liability, and market positioning.
+2. **Data Controller vs. Processor Classification**: Formalize whether the SaaS vendor acts as a joint controller or purely as a data processor under GDPR Article 28.
+3. **Right to Erasure Conflict Resolution Protocol**: Establish automated technical workflows reconciling candidate deletion requests with statutory employer retention obligations.
+4. **Cross-Border Candidate Data Transfer**: Define mechanisms (e.g. EU Standard Contractual Clauses, local data residency) for international candidate applications.
 
 ---
 
@@ -279,49 +286,108 @@ class SkillExtractionResponse(BaseModel):
     normalized_duration_ms: float
 ```
 
-### 8.2 Proposed Candidate Matching DTOs
+### 8.2 Proposed Candidate Matching DTOs (With Reproducible Audit Metadata)
 ```python
+from datetime import datetime
 from uuid import UUID
 from pydantic import BaseModel, Field
 
 
-class MatchingComponentScores(BaseModel):
+class DeterministicComponentScores(BaseModel):
     required_skills_score: float = Field(
-        ..., ge=0.0, le=1.0, description="Weight 0.40"
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Weight 0.40: exact & taxonomy rule recall",
     )
     experience_fit_score: float = Field(
-        ..., ge=0.0, le=1.0, description="Weight 0.25"
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Weight 0.25: nonlinear years fit curve",
     )
     qualifications_score: float = Field(
-        ..., ge=0.0, le=1.0, description="Weight 0.15"
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Weight 0.15: degree/credential level rule match",
     )
     preferred_skills_score: float = Field(
-        ..., ge=0.0, le=1.0, description="Weight 0.10"
+        ..., ge=0.0, le=1.0, description="Weight 0.10: bonus skill rule match"
     )
+
+
+class EmbeddingSimilarityScore(BaseModel):
     semantic_alignment_score: float = Field(
-        ..., ge=0.0, le=1.0, description="Weight 0.10"
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Weight 0.10: cosine similarity from vector embeddings",
+    )
+    embedding_model_id: str = Field(
+        ..., description="Identifier of registered embedding model"
+    )
+    embedding_model_version: str = Field(
+        ..., description="Version of model used to produce vector"
+    )
+    raw_cosine_similarity: float = Field(
+        ..., ge=-1.0, le=1.0, description="Unscaled cosine similarity result"
+    )
+    vector_dimension: int = Field(
+        default=1536, description="Embedding dimension verified in pgvector"
     )
 
 
-class CandidateMatchResult(BaseModel):
-    application_id: UUID
-    candidate_id: UUID
-    job_id: UUID
-    overall_score: float = Field(
+class MatchingComponentScores(BaseModel):
+    deterministic: DeterministicComponentScores
+    embedding_similarity: EmbeddingSimilarityScore
+    weighted_total_score: float = Field(
         ..., ge=0.0, le=100.0, description="Composite score out of 100"
     )
-    components: MatchingComponentScores
+
+
+class MatchingAuditEvidence(BaseModel):
     matched_required_skills: list[str]
     missing_required_skills: list[str]
     matched_preferred_skills: list[str]
     experience_years_detected: float
     target_experience_years: float
+    qualifications_detected: list[str]
+    evaluation_input_hash: str = Field(
+        ...,
+        description="SHA-256 hash of normalized candidate & job inputs for tamper detection",
+    )
+
+
+class CandidateMatchResult(BaseModel):
+    evaluation_id: UUID = Field(
+        ..., description="Unique immutable evaluation audit identifier"
+    )
+    evaluated_at: datetime = Field(
+        ..., description="UTC timestamp when evaluation was computed"
+    )
+    application_id: UUID
+    candidate_id: UUID
+    job_id: UUID
+    scoring_config_version: str = Field(
+        ...,
+        description="Version of scoring weights/formula used (e.g., 'weights-v1.0')",
+    )
+    matching_algorithm_version: str = Field(
+        ...,
+        description="Version of matching calculation engine (e.g., 'alg-5factor-v2.1')",
+    )
+    overall_score: float = Field(
+        ..., ge=0.0, le=100.0, description="Composite score out of 100"
+    )
+    components: MatchingComponentScores
+    audit_evidence: MatchingAuditEvidence
     explanation_summary: str = Field(
         ..., description="Auditable natural language justification"
     )
 ```
 
-### 8.3 Proposed Interview Question DTOs
+### 8.3 Proposed Interview Question DTOs (Separating Seniority from Difficulty)
 ```python
 from enum import Enum
 from pydantic import BaseModel, Field
@@ -332,6 +398,12 @@ class SeniorityTier(str, Enum):
     MID = "mid"
     SENIOR = "senior"
     LEAD = "lead"
+
+
+class QuestionDifficulty(str, Enum):
+    EASY = "easy"
+    MEDIUM = "medium"
+    HARD = "hard"
 
 
 class QuestionCategory(str, Enum):
@@ -345,7 +417,12 @@ class InterviewQuestionItem(BaseModel):
     question_id: str
     category: QuestionCategory
     topic: str
-    difficulty: SeniorityTier
+    target_seniority: SeniorityTier = Field(
+        ..., description="Target candidate career level"
+    )
+    difficulty: QuestionDifficulty = Field(
+        ..., description="Relative technical problem complexity"
+    )
     prompt_text: str
     evaluation_criteria: list[str]
     expected_key_concepts: list[str]
@@ -355,12 +432,13 @@ class QuestionGenerationRequest(BaseModel):
     job_title: str
     detected_skills: list[str]
     experience_years: float
-    tier: SeniorityTier | None = None
+    target_seniority: SeniorityTier | None = None
+    difficulty: QuestionDifficulty | None = None
     question_count: int = Field(default=5, ge=1, le=20)
 
 
 class QuestionGenerationResponse(BaseModel):
-    seniority_tier: SeniorityTier
+    target_seniority: SeniorityTier
     primary_domain: str
     questions: list[InterviewQuestionItem]
     generation_source: str = Field(
@@ -457,8 +535,13 @@ Every planned component must satisfy the following criteria prior to production 
 | **DEC-3.9-05** | **Skill Taxonomy** | Port `_RAW_TAXONOMY` and regex normalizer. | **Ready for future integration** | Self-contained, high-quality domain assets ready to be ported into `backend/app/modules/screening/skills/`. |
 | **DEC-3.9-06** | **Question Bank** | Adapt curated rule-based knowledge bank. | **Ready for future integration** | Self-contained domain dictionary ready to be ported into `backend/app/modules/interviews/questions/`. |
 
-### 12.2 Outstanding Dependencies & Blockers Register
-- **Current Blockers**: **ZERO BLOCKERS.** All prerequisite infrastructure from Steps 3.2 through 3.8 (FastAPI, PostgreSQL RLS, pgvector, Celery/Redis, security foundation, automated test harness) is operational and verified.
-- **Outstanding Dependencies for Future Steps**:
-  - *Step 3.10*: Database schema migrations for candidate profiles, resumes, extracted skills, and job requirements.
-  - *Step 3.10*: S3 bucket client integration for document storage and OCR fallback.
+### 12.2 Outstanding Dependencies & Unresolved Governance Decisions
+- **Current Technical Blockers**: **ZERO BLOCKERS.** All prerequisite infrastructure from Steps 3.2 through 3.8 (FastAPI, PostgreSQL RLS, pgvector, Celery/Redis, security foundation, automated test harness) is operational and verified.
+- **Unresolved Governance & Legal Decisions**:
+  1. *Candidate Identity Architecture*: Product/Legal decision on Option A (Global Identity with Tenant Applications) vs. Option B (Strict Siloed Profiles).
+  2. *Regulatory Classification*: Legal determination of Data Controller vs. Data Processor role under GDPR Article 28.
+  3. *Erasure vs. Retention Protocol*: Finalization of automated deletion workflows accommodating statutory employer defense exceptions (GDPR Art. 17(3)(b)/(e) and EEOC 29 C.F.R. § 1602.14).
+  4. *Jurisdiction-Specific Privacy Audits*: Completion of privacy and employment-law impact assessments across deployment jurisdictions.
+- **Outstanding Implementation Dependencies for Step 3.10**:
+  - Database schema migrations for candidate profiles, resumes, extracted skills, and job requirements.
+  - S3 bucket client integration for document storage and OCR fallback.
