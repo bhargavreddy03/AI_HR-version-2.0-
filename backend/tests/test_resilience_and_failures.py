@@ -285,6 +285,63 @@ async def test_live_postgres_transaction_rollback_and_pool_recovery() -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_live_postgres_genuine_connection_interruption_and_pool_recovery() -> None:
+    """Proves that killing an active PostgreSQL backend connection via pg_terminate_backend
+    triggers an operational disconnect error, and the SQLAlchemy connection pool gracefully
+    invalidates the broken connection and recovers on subsequent session checkouts."""
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL not set; skipping live PostgreSQL resilience test")
+
+    from sqlalchemy import text
+    from sqlalchemy.exc import DBAPIError, OperationalError
+
+    from app.core.database import create_db_engine, create_session_factory
+
+    engine = create_db_engine(database_url)
+    session_factory = create_session_factory(engine)
+
+    try:
+        victim_pid: int | None = None
+        # Step 1: Open victim session and capture its backend PID
+        async with session_factory() as session1:
+            res = await session1.execute(text("SELECT pg_backend_pid();"))
+            victim_pid = res.scalar()
+            assert isinstance(victim_pid, int) and victim_pid > 0
+
+            # Step 2: From a separate admin connection, forcefully terminate the victim backend PID
+            admin_engine = create_db_engine(database_url)
+            admin_session_factory = create_session_factory(admin_engine)
+            try:
+                async with admin_session_factory() as admin_session:
+                    term_res = await admin_session.execute(
+                        text("SELECT pg_terminate_backend(:pid);"),
+                        {"pid": victim_pid},
+                    )
+                    assert term_res.scalar() is True
+                    await admin_session.commit()
+            finally:
+                await admin_engine.dispose()
+
+            # Step 3: Verify the interrupted connection raises an OperationalError / DBAPI disconnect
+            with pytest.raises((OperationalError, DBAPIError)):
+                await session1.execute(text("SELECT 1;"))
+
+        # Step 4: Verify pool invalidation and recovery on the next session checkout
+        async with session_factory() as session2:
+            res2 = await session2.execute(text("SELECT pg_backend_pid();"))
+            new_pid = res2.scalar()
+            assert isinstance(new_pid, int)
+            assert new_pid != victim_pid  # Must be a newly established backend connection
+
+            res_alive = await session2.execute(text("SELECT 1 AS pool_recovered;"))
+            assert res_alive.scalar() == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_live_redis_reconnection_and_circuit_recovery() -> None:
     """Live Redis verifies state consistency, lock acquisition, and connection recovery."""
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -326,3 +383,57 @@ async def test_live_redis_reconnection_and_circuit_recovery() -> None:
     finally:
         await client.delete(test_key)
         await client.aclose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_live_redis_genuine_client_termination_and_reconnection() -> None:
+    """Proves that forcefully terminating a client connection via CLIENT KILL triggers
+    a connection drop, and the Redis connection pool detects the disconnect, reconnects,
+    and reliably completes subsequent operations."""
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    import redis.asyncio as aioredis
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    try:
+        victim_client = aioredis.from_url(redis_url, socket_timeout=2.0)
+        await victim_client.ping()
+    except Exception:
+        pytest.skip("Live Redis not reachable; skipping Redis live resilience test")
+
+    admin_client = aioredis.from_url(redis_url, socket_timeout=2.0)
+    test_key = f"resilience:live:kill:{uuid4()}"
+
+    try:
+        # Step 1: Obtain the victim client connection ID
+        victim_id = await victim_client.client_id()
+        assert isinstance(victim_id, int) and victim_id > 0
+
+        # Step 2: Using admin client, kill the victim client connection via CLIENT KILL ID
+        killed_count = await admin_client.execute_command("CLIENT", "KILL", "ID", str(victim_id))
+        assert killed_count >= 1
+
+        # Step 3: Attempting to use the victim socket triggers disconnection or causes reconnection
+        try:
+            await victim_client.execute_command("PING")
+        except (RedisConnectionError, ConnectionResetError, OSError):
+            pass
+
+        # Step 4: Verify client pool transparent reconnection and subsequent operation success
+        await victim_client.set(test_key, "recovered_after_kill", ex=30)
+        val = await victim_client.get(test_key)
+        assert val in (b"recovered_after_kill", "recovered_after_kill")
+
+        # Verify idempotency acquisition functions normally on recovered connection
+        lock_token = await IdempotencyManager.acquire_async(
+            client=victim_client,
+            key=test_key,
+            task_id=str(uuid4()),
+            lock_ttl=30,
+        )
+        assert lock_token is not None
+        await IdempotencyManager.release_async(client=victim_client, key=test_key, token=lock_token)
+    finally:
+        await victim_client.delete(test_key)
+        await victim_client.aclose()
+        await admin_client.aclose()

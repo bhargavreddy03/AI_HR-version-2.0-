@@ -6,11 +6,11 @@ Step 3.8 establishes a comprehensive, automated, multi-tiered testing and qualit
 
 - **Backend Unit & Domain Testing**: Business logic, vector embeddings, multi-dimensional authentication pipeline, resilience under failure, API contracts, RFC 7807 problem details conformance, cryptographic calibration, and AST security auditing.
 - **Frontend Component, Form, & Accessibility Testing**: Next.js 14 test runner using Vitest, React Testing Library, and happy-dom covering user authentication forms, validation constraints, loading states, role-based navigation, accessibility landmarks, and `@vitest/coverage-v8` threshold enforcement.
-- **End-to-End (E2E) Browser Testing**: Playwright test suite exercising browser workflows against the running Docker stack, verifying page health, form validation, invalid credential rejection, and unauthenticated route redirection.
-- **Performance & Load Testing**: Locust load simulation (`backend/tests/load/locustfile.py`), concurrent asynchronous client load tests, and cryptographic benchmarks with accurate Argon2id AC-SEC-03 calibration (`m=65536` = 64 MiB, `t=3`, `p=4`).
-- **Resilience & Fault Recovery Testing**: Mocked failure injection coupled with live PostgreSQL transaction rollback and connection pool recovery, plus live Redis reconnection and circuit recovery.
-- **Security & Supply-Chain Scanning**: Automated dependency auditing (`pip-audit` via custom evaluator, `npm audit --audit-level=critical`), secret detection (TruffleHog), container image vulnerability scanning (Trivy), and AST security inspection.
-- **CI/CD Quality Gates**: Fully automated GitHub Actions workflow enforcing Ruff linting, Ruff formatting, Mypy type checking, Pytest with $\ge 83\%$ coverage enforcement, Frontend ESLint, TypeScript compilation, Vitest coverage thresholds, Playwright E2E execution, and Trivy vulnerability scans.
+- **End-to-End (E2E) Browser & Protocol Testing**: Playwright test suite exercising browser workflows against the running Docker stack, asserting actual backend HTTP 401 responses on invalid credentials, client-side redirection, and server-level rejection of unauthenticated requests to protected endpoints.
+- **Performance & Load Testing**: Locust load simulation (`backend/tests/load/locustfile.py`) exercising realistic API traffic against the running Docker application, measuring latency, throughput, failures, and concurrent users, exporting HTML/CSV reports in CI.
+- **Resilience & Fault Recovery Testing**: Mocked failure injection coupled with genuine PostgreSQL server-side connection termination (`pg_terminate_backend`) and connection pool recovery, plus genuine Redis client termination (`CLIENT KILL ID`) and automatic pool reconnection.
+- **Security & Supply-Chain Scanning**: Fail-closed Python dependency scanner (`backend/scripts/security_audit.py`) backed by unit tests, authoritative severity evaluation via OSV/GHSA/PyPA, `npm audit --audit-level=critical`, secret detection (TruffleHog), container image vulnerability scanning (Trivy), and AST security inspection.
+- **CI/CD Quality Gates & Reproducibility**: Fully automated GitHub Actions workflow with reproducible `npm ci` referencing committed `frontend/package-lock.json`, enforcing Ruff linting/formatting, Mypy type checking, Pytest with $\ge 83\%$ coverage, Frontend ESLint, TypeScript compilation, Vitest coverage thresholds, Playwright E2E execution, Locust load tests, and Trivy container scans.
 
 ---
 
@@ -19,13 +19,13 @@ Step 3.8 establishes a comprehensive, automated, multi-tiered testing and qualit
 ```
 backend/
 ├── scripts/
-│   └── security_audit.py                # Automated pip-audit CVE evaluator (critical severity gate)
+│   └── security_audit.py                # Fail-closed pip-audit CVE evaluator (authoritative OSV severity)
 ├── tests/
 │   ├── integration/
 │   │   ├── test_celery_redis.py         # Live Redis idempotency & lock contention
 │   │   └── test_postgres_lifecycle.py   # Deterministic RLS isolation, sole admin concurrency, token revocation
 │   ├── load/
-│   │   └── locustfile.py                # Locust load testing suite for liveness, readiness, and tasks
+│   │   └── locustfile.py                # Locust load testing suite (health, readiness, tasks, auth)
 │   ├── test_api_contracts_and_openapi.py# OpenAPI 3.1 specification & RFC 7807 Problem Details
 │   ├── test_auth_api.py                 # Auth endpoint request/response flows
 │   ├── test_auth_authorization.py       # Multi-tenant RBAC & permission checking
@@ -45,8 +45,9 @@ backend/
 │   ├── test_instance_isolation.py       # Multi-tenant boundary isolation
 │   ├── test_middleware.py               # Security headers, correlation IDs, and rate limiting
 │   ├── test_performance_benchmarks.py   # Argon2id calibration, AES-256-GCM, JWT, & async load
-│   ├── test_resilience_and_failures.py  # Fault injection & live PostgreSQL/Redis recovery
+│   ├── test_resilience_and_failures.py  # Mocked faults & genuine PostgreSQL/Redis termination & recovery
 │   ├── test_security.py                 # Password policies & basic sanitization
+│   ├── test_security_audit.py           # Unit tests for security scanner fail-closed behaviors
 │   ├── test_security_foundation.py      # Enterprise security controls from Step 3.7
 │   ├── test_security_supply_chain.py    # Static AST audit, secret scans, and dependency pinning
 │   ├── test_task_api.py                 # Background task submission & status API
@@ -54,7 +55,8 @@ backend/
 
 frontend/
 ├── e2e/
-│   └── auth.spec.ts                     # Playwright browser end-to-end authentication tests
+│   └── auth.spec.ts                     # Playwright browser end-to-end authentication & protocol tests
+├── package-lock.json                    # Committed, fully synchronized reproducible lockfile
 ├── playwright.config.ts                 # Playwright test configuration for localhost:3000
 ├── src/
 │   ├── components/
@@ -78,13 +80,13 @@ frontend/
 
 ## 3. Test Suite Implementation Details
 
-### 3.1 End-to-End (E2E) Browser Testing (`frontend/e2e/auth.spec.ts`)
-- **Technology**: Playwright using Desktop Chrome, configured to test against `http://127.0.0.1:3000`.
-- **Coverage**:
-  - Landing page rendering, heading verification, and presence of navigation landmarks.
-  - Client-side validation: Submitting blank fields triggers standard HTML5/custom validation states.
-  - Invalid credentials handling: Submitting invalid credentials against the real backend surfaces an accessible error alert (`role="alert"`).
-  - Protected route redirection: Navigating directly to `/dashboard` without an active session triggers client-side redirect to `/login`.
+### 3.1 End-to-End (E2E) Browser & Protocol Testing (`frontend/e2e/auth.spec.ts`)
+- **Technology**: Playwright using Desktop Chrome against `http://127.0.0.1:3000` (frontend) and `http://127.0.0.1:8000/api/v1` (backend).
+- **Hardened Assertions**:
+  - `page.waitForResponse(...)` captures the actual HTTP POST to `/auth/login`, verifying that the backend returned HTTP 401 and an error payload containing problem details (`detail`, `code`, or `title`). This guarantees that network disconnects or wrong endpoints cannot cause false-positive test passes.
+  - Client-side validation: Submitting empty or malformed fields triggers validation states and disables request dispatching.
+  - Client-side redirect: Accessing `/dashboard` unauthenticated redirects to `/login`.
+  - Protocol-Level Server Defense: A direct test using Playwright's `request` fixture requests `GET /auth/me` without cookies and verifies that the backend directly rejects the request with HTTP 401, proving access control is enforced at the API layer, not merely by frontend JavaScript.
 
 ### 3.2 Frontend Testing & Coverage (`frontend/src/__tests__/`)
 - **Authentication Forms (`auth.test.tsx`)**: Validates email format constraints, minimum password lengths, form submission payloads to `/auth/login`, loading indicator disablement during submission, HTTP 401 error message rendering, and network error handling.
@@ -92,30 +94,35 @@ frontend/
 - **Accessibility Testing (`accessibility.test.tsx`)**: Tests WCAG compliance including semantic `<main>` and `<nav aria-label="Main Navigation">` landmarks, input-to-label associations (`htmlFor`), dynamic `aria-invalid` attributes on error, and `aria-describedby` linkage to error descriptions.
 - **Coverage Enforcement**: Configured `@vitest/coverage-v8` in `vitest.config.ts` with strict thresholds: 75% statements, 75% lines, 75% functions, and 70% branches.
 
-### 3.3 Security Vulnerability Scanning & Supply Chain
-- **Python Dependency Audit**: `backend/scripts/security_audit.py` runs `pip-audit -r requirements.txt -f json`, evaluates all advisories against CVSS score and severity, logs all findings, and fails CI on any `CRITICAL` severity vulnerability.
-- **Node.js Dependency Audit**: Automated `npm audit --audit-level=critical` step integrated into frontend CI.
-- **Secret Scanning**: TruffleHog integration (`trufflesecurity/trufflehog@main --only-verified`) in CI scanning all commits for verified credentials.
-- **Container Vulnerability Scanning**: Aqua Security Trivy Action (`aquasecurity/trivy-action@master`) scanning both `ai-hr/backend:ci-test` and `ai-hr/frontend:ci-test` Docker images with `severity: CRITICAL` and `exit-code: 1`.
-- **Static AST Inspection**: Recursively audits all Python files for prohibited constructs (`eval`, `exec`, `pickle`, `marshal`).
+### 3.3 Fail-Closed Python Security Scanner (`backend/scripts/security_audit.py`)
+- **Fail-Closed Execution**: If `pip-audit` cannot execute, crashes, returns empty stdout, outputs malformed non-JSON, or produces JSON missing the `dependencies` key, the scanner exits with code 1 immediately.
+- **Authoritative Severity Resolution**: Discards heuristic keyword matching in descriptions. Queries the Google OpenSSF OSV API (`https://api.osv.dev/v1/vulns/{id}`) to resolve authoritative severity ratings (`database_specific.severity`) and CVSS v3 vectors. Resolves aliases (`GHSA-...`) when primary records lack ratings.
+- **Fail-Safe Policy**: If reliable severity information is unavailable for an advisory (due to network timeout, missing source data, or unregistered advisory), the scanner marks it as unverified and fails safely (`exit_code = 1`) rather than reporting zero criticals.
+- **Scanner Unit Suite (`backend/tests/test_security_audit.py`)**: 9 unit tests verifying all failure modes, malformed inputs, critical detections, fail-safe rejections, and CVSS vector parsing.
 
-### 3.4 Performance & Load Testing (`backend/tests/test_performance_benchmarks.py` & Locust)
-- **Argon2id Calibration Documentation**: Explicitly documented calibration matching AC-SEC-03: `m=65536` (64 MiB), `t=3`, `p=4`, generating hashes with prefix `$argon2id$v=19$m=65536,t=3,p=4$`. Tests verify cryptographic properties and enforce relaxed upper bounds (< 10.0s) to prevent false positives on virtual CI runners while enforcing minimum bounds (> 5ms) for brute-force resistance.
-- **Concurrent API Load Test**: Executes 50 concurrent asynchronous HTTP requests using `httpx.AsyncClient` against `/api/v1/health/liveness`, asserting 100% HTTP 200 responses and aggregate duration < 5.0 seconds.
-- **Locust Load Suite (`backend/tests/load/locustfile.py`)**: Realistic user simulation exercising `/api/v1/health/liveness` (weight 5), `/api/v1/health/ready` (weight 2), and background task submission `/api/v1/tasks/system/ping` (weight 1).
-- **Cryptographic Throughput**: AES-256-GCM symmetric encryption (> 400 ops/sec) and JWT signing/verification throughput.
+### 3.4 Actual Load Testing with Locust (`backend/tests/load/locustfile.py`)
+- **Realistic Multi-Endpoint Workload**:
+  - High-frequency liveness checks (`/api/v1/health/liveness`)
+  - Deep dependency readiness checks querying live PostgreSQL and Redis (`/api/v1/health/ready`)
+  - OpenAPI 3.1 specification discovery (`/api/v1/openapi.json`)
+  - Celery background task dispatch and status polling (`/api/v1/tasks/system/ping`)
+  - Security perimeter defense under concurrency (`/api/v1/auth/me` expecting 401)
+  - Invalid login rejection and rate limiting (`/api/v1/auth/login` expecting 401 or 429)
+- **CI Execution & Reporting**: Runs in `.github/workflows/ci.yml` in headless mode against the live Docker stack with 20 concurrent users, measuring response times, throughput, and error rates. Generates `load-test-report.html` and CSV metrics files uploaded as CI artifacts with a 14-day retention.
+- **Workflow Dispatch**: CI includes `workflow_dispatch` trigger allowing load tests and all quality gates to be triggered on demand.
 
-### 3.5 Resilience & Failure Recovery Testing (`backend/tests/test_resilience_and_failures.py`)
-- **Mocked Failure Injection**: Verifies database operational error sanitization, integrity constraint rollbacks, rate limiter fail-closed vs. fail-open policies, and task broker disconnection handling.
-- **Live Infrastructure Integration**:
-  - `test_live_postgres_transaction_rollback_and_pool_recovery`: Executes an intentional PostgreSQL syntax error inside a transaction, asserts rollback, and verifies the connection pool remains healthy by immediately executing a subsequent query.
-  - `test_live_redis_reconnection_and_circuit_recovery`: Tests live Redis ping, sets key/value with TTL, verifies readback, and proves circuit and connection pool stability.
-
-### 3.6 Embeddings & Authentication Domain Testing
-- **Embeddings Validation**: Finite vector validation (rejecting NaN, +/-inf, zero magnitude), model catalog enforcement, and cosine distance math.
-- **Auth Pipeline Micro-Validation**: Three-tier micro-validation pipeline covering State A (Redis affirmative cache hit), Token Version Fence (immediate eviction on stale version), State B (reachable cache miss), and State C (PostgreSQL fallback on Redis failure).
-- **Password Reset Security**: Atomic `GETDEL` token consumption concurrency and token version validation.
-- **Sole Administrator Protection**: Deterministic PostgreSQL row locking preventing concurrent removal or demotion of the last organization admin.
+### 3.5 Strengthened Resilience & Connection Recovery (`backend/tests/test_resilience_and_failures.py`)
+- **Genuine PostgreSQL Connection Termination & Pool Recovery**:
+  - Checks out a session from the connection pool and obtains its PostgreSQL backend PID via `SELECT pg_backend_pid()`.
+  - From a separate connection, executes `SELECT pg_terminate_backend(:pid)` to kill the backend process on the database server.
+  - Verifies that the victim session raises a genuine `OperationalError` / `DBAPIError`.
+  - Asserts that subsequent sessions checked out from the pool transparently discard the dead socket, establish a new backend connection (`new_pid != victim_pid`), and execute queries successfully.
+- **Genuine Redis Client Termination & Reconnection**:
+  - Checks out a client connection and retrieves its client ID via `CLIENT ID`.
+  - From a separate client, executes `CLIENT KILL ID <id>`.
+  - Verifies that the victim client experiences a disconnection event.
+  - Asserts that the client connection pool transparently reconnects, successfully performs writes/reads with TTL, and acquires/releases distributed idempotency locks.
+- **Mocked Fault Injection**: Preserves database operational error sanitization, integrity constraint rollbacks, rate limiter fail-closed vs. fail-open policies, and task broker disconnection handling.
 
 ---
 
@@ -125,16 +132,17 @@ frontend/
 | Tool | Scope | Status | Result |
 | :--- | :--- | :--- | :--- |
 | **Ruff Linter** | `app/`, `tests/`, `scripts/` | Passed | 0 issues across all files |
-| **Ruff Formatter** | `app/`, `tests/`, `scripts/` | Passed | 97 files already formatted |
+| **Ruff Formatter** | `app/`, `tests/`, `scripts/` | Passed | 98 files already formatted |
 | **Mypy Typechecker** | `app/` | Passed | Success: 0 issues in 65 source files |
-| **Pytest Unit Suite** | `tests/` | Passed | **312 passed**, 24 skipped (live services), 10 deselected |
+| **Pytest Unit Suite** | `tests/` | Passed | **321 passed**, 24 skipped (live services), 12 deselected |
 | **Code Coverage** | `app/` | Passed | **83.42% total coverage** (enforced $\ge 83\%$) |
-| **Dependency Audit** | `requirements.txt` | Passed | 0 critical vulnerabilities found |
+| **Dependency Audit** | `requirements.txt` | Passed | 0 critical vulnerabilities found (25 advisories evaluated) |
+| **Scanner Tests** | `tests/test_security_audit.py` | Passed | **9 passed in 0.12s** |
 
 ### 4.2 Explicit List of Skipped and Untested Areas
 - **Skipped in Offline / Standalone Runs**:
-  - `tests/integration/test_postgres_lifecycle.py` (22 tests) and Section 5 in `tests/test_resilience_and_failures.py` (2 tests): Marked with `@pytest.mark.integration`. These tests require a live, active PostgreSQL database with pgvector and live Redis. In local offline development without background containers running, they are safely skipped (`24 skipped`). They are automatically executed during GitHub Actions CI where PostgreSQL and Redis services are active.
-  - 10 tests deselected via `-m "not integration"` when running unit-only sweeps.
+  - `tests/integration/test_postgres_lifecycle.py` (22 tests) and Section 5 in `tests/test_resilience_and_failures.py` (4 tests: transaction rollback, genuine connection termination, Redis lock lifecycle, genuine client kill): Marked with `@pytest.mark.integration`. These tests require a live, active PostgreSQL database with pgvector and live Redis. In local offline development without background containers running, they are safely skipped (`24 skipped`). They are automatically executed during GitHub Actions CI where PostgreSQL and Redis services are active.
+  - 12 tests deselected via `-m "not integration"` when running unit-only sweeps.
 - **Areas Not Covered by Automated Unit Tests**:
   - Physical network partition simulations (e.g. split-brain netem / iptables drop) requiring orchestrated container infrastructure are verified via Docker Compose health check timeouts rather than unit tests.
   - Third-party SSO providers (Google/GitHub OAuth2 external redirection) are verified via mocked token exchange flows; live end-to-end OAuth consent screen interaction requires human browser login.
@@ -147,16 +155,16 @@ The `.github/workflows/ci.yml` pipeline enforces automated quality gates across 
 
 1. **Backend CI (`backend-lint-and-test`)**:
    - Python 3.11 environment with dependency caching.
-   - Ruff linting and formatting verification (`ruff check app tests`, `ruff format --check app tests`).
+   - Ruff linting and formatting verification (`ruff check app tests scripts`, `ruff format --check app tests scripts`).
    - Mypy static type checking (`mypy app/`).
    - TruffleHog secret scanning (`trufflesecurity/trufflehog@main --only-verified`).
-   - Python dependency vulnerability audit (`python scripts/security_audit.py`).
+   - Fail-closed Python dependency vulnerability audit (`python scripts/security_audit.py`).
    - PostgreSQL 16 + pgvector and Redis 7 service containers.
    - Database initialization idempotency verification (`init-db.sh` fresh and rerun).
    - Pytest execution with strict coverage threshold enforcement: `pytest -v --cov=app --cov-fail-under=83 --cov-report=term-missing`.
 2. **Frontend CI (`frontend-lint-and-typecheck`)**:
-   - Node.js 20 environment with npm caching.
-   - Clean dependency installation using `npm install --package-lock-only && npm ci`.
+   - Node.js 20 environment with npm caching keyed directly to `frontend/package-lock.json`.
+   - Clean, reproducible dependency installation using committed lockfile: `npm ci` (fails if `package.json` and `package-lock.json` are inconsistent).
    - Security vulnerability audit (`npm audit --audit-level=critical`).
    - ESLint code quality check (`npm run lint`).
    - TypeScript compiler type check (`npm run typecheck`).
@@ -166,7 +174,8 @@ The `.github/workflows/ci.yml` pipeline enforces automated quality gates across 
    - Docker Compose configuration validation for development and production modes.
    - Full 5-service dev stack startup (`postgres`, `redis`, `backend`, `celery_worker`, `frontend`).
    - Health probes, loopback port isolation (127.0.0.1 loopback only), Celery queue consumption, and PostgreSQL script rerun idempotency.
-   - **Playwright E2E browser tests** executed against the live stack at `http://127.0.0.1:3000`.
+   - **Playwright E2E browser & protocol tests** executed against the live stack at `http://127.0.0.1:3000`.
+   - **Locust Load Tests** executed against the live application, generating `load-test-report.html` and CSV metrics uploaded as CI artifacts.
    - Multi-stage container builds for `backend` and `frontend` with `load: true`.
    - **Trivy container image scans** on both images enforcing zero `CRITICAL` vulnerabilities.
 
@@ -184,10 +193,13 @@ cd backend
 # 2. Type Checking
 .venv\Scripts\python.exe -m mypy --config-file pyproject.toml app
 
-# 3. Dependency Vulnerability Audit
+# 3. Fail-Closed Dependency Vulnerability Audit
 .venv\Scripts\python.exe scripts/security_audit.py
 
-# 4. Unit Test Suite with Coverage (Threshold >= 83%)
+# 4. Scanner Unit Suite
+.venv\Scripts\python.exe -m pytest tests/test_security_audit.py
+
+# 5. Full Unit Test Suite with Coverage (Threshold >= 83%)
 .venv\Scripts\python.exe -m pytest tests -m "not integration" --cov=app --cov-fail-under=83 --cov-report=term-missing
 ```
 
@@ -204,4 +216,10 @@ npm run test:coverage
 
 # 3. Browser End-to-End Tests (requires stack running on localhost:3000)
 npx playwright test
+```
+
+### Load Testing
+```bash
+# Requires running platform stack on localhost:8000
+locust -f backend/tests/load/locustfile.py --headless -u 20 -r 5 --run-time 15s --host http://127.0.0.1:8000 --html load-test-report.html
 ```
