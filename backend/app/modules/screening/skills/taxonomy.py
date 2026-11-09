@@ -1,0 +1,252 @@
+"""Foundational Skill Taxonomy Data and Version Governance.
+
+Ported from legacy AI HR skill extraction system conforming to Step 3.10 architecture.
+Provides canonical skill names, normalized aliases, and domain categories.
+"""
+
+from __future__ import annotations
+
+from typing import Final
+
+# Release identity and provenance for audit trails
+TAXONOMY_VERSION: Final[str] = "1.0.0"
+TAXONOMY_SOURCE_PROVENANCE: Final[str] = "Legacy AI HR Production Taxonomy v3"
+
+# Raw Hierarchical Taxonomy: Category -> Canonical Display Name -> Aliases
+RAW_TAXONOMY: Final[dict[str, dict[str, list[str]]]] = {
+    # ── Programming Languages ────────────────────────────────
+    "Programming Languages": {
+        "Python": ["py", "python3", "python2", "cpython", "micropython"],
+        "Java": ["jdk", "jvm", "j2ee", "java8", "java11", "java17"],
+        "C": ["c language", "c programming", "ansi c"],
+        "C++": ["cpp", "c plus plus", "cplusplus", "c++11", "c++14", "c++17", "c++20"],
+        "C#": ["csharp", "c sharp", "dotnet c#", ".net c#"],
+        ".NET": ["dotnet", ".net core", "dotnet core", ".net framework"],
+        "Go": ["golang", "go lang"],
+        "Rust": ["rust lang", "rustlang"],
+        "Kotlin": ["kotlin jvm", "android kotlin"],
+        "Swift": ["swift ios", "swiftui"],
+        "TypeScript": ["ts", "typescript js"],
+        "JavaScript": ["js", "es6", "es2015", "ecmascript", "vanilla js", "node js"],
+        "PHP": ["php7", "php8", "laravel php", "symfony php"],
+        "Ruby": ["ruby on rails", "ror", "rails"],
+        "Scala": ["scala spark", "akka"],
+        "R": ["r language", "r programming", "rstats", "r studio"],
+        "MATLAB": ["matlab simulink"],
+        "Perl": ["perl5"],
+        "Shell": ["bash", "shell scripting", "zsh", "ksh", "sh scripting", "powershell"],
+        "Dart": ["flutter dart"],
+    },
+    # ── Core CS Concepts ─────────────────────────────────────
+    "Core CS": {
+        "Data Structures and Algorithms": [
+            "dsa",
+            "data structures",
+            "algorithms",
+            "ds algo",
+            "data structures & algorithms",
+            "competitive programming",
+            "algorithm design",
+            "problem solving",
+            "leetcode",
+            "hackerrank",
+        ],
+        "Operating Systems": [
+            "os",
+            "linux internals",
+            "kernel",
+            "process management",
+            "concurrency",
+        ],
+        "Computer Networks": [
+            "networking",
+            "network protocols",
+            "tcp/ip",
+            "http",
+            "dns",
+            "osi model",
+            "cn",
+        ],
+        "Database Management": [
+            "dbms",
+            "database systems",
+            "rdbms",
+            "sql fundamentals",
+            "normalization",
+        ],
+        "Object Oriented Programming": [
+            "oop",
+            "oops",
+            "object oriented",
+            "design patterns",
+            "solid principles",
+            "inheritance",
+            "polymorphism",
+            "encapsulation",
+        ],
+        "Compiler Design": ["compilers", "parsing", "lexical analysis", "code generation"],
+        "Computer Architecture": ["cpu architecture", "memory hierarchy", "cache", "pipelining"],
+        "Discrete Mathematics": ["discrete math", "combinatorics", "graph theory", "logic"],
+        "Theory of Computation": ["automata", "turing machines", "formal languages", "toc"],
+        "Software Engineering": ["sdlc", "software design", "agile", "scrum", "waterfall", "tdd"],
+    },
+    # ── Web & Frontend ────────────────────────────────────────
+    "Web & Frontend": {
+        "React": ["reactjs", "react.js", "react hooks", "react native", "nextjs", "next.js"],
+        "Angular": ["angularjs", "angular2+", "ng"],
+        "Vue.js": ["vuejs", "vue", "nuxt", "nuxtjs"],
+        "HTML": ["html5", "html/css", "markup"],
+        "CSS": ["css3", "sass", "scss", "less", "tailwind", "tailwindcss", "bootstrap"],
+        "Node.js": ["nodejs", "node", "expressjs", "express.js", "express"],
+        "GraphQL": ["gql", "graphql api", "apollo"],
+        "REST APIs": ["rest", "restful", "api design", "openapi", "swagger"],
+        "WebSockets": ["ws", "socket.io", "real-time"],
+        "Redux": ["redux toolkit", "state management", "mobx", "zustand"],
+        "Django": ["django rest framework", "drf"],
+        "Flask": ["flask python", "flask api"],
+        "FastAPI": ["fast api", "fastapi python"],
+        "Spring Boot": ["spring", "spring mvc", "spring framework", "java spring"],
+        "ASP.NET": ["asp.net core", "dotnet web", ".net mvc"],
+    },
+    # ── Data & AI/ML ─────────────────────────────────────────
+    "Data & AI/ML": {
+        "Machine Learning": [
+            "ml",
+            "supervised learning",
+            "unsupervised learning",
+            "sklearn",
+            "scikit-learn",
+        ],
+        "Deep Learning": ["dl", "neural networks", "ann", "cnn", "rnn", "lstm"],
+        "Natural Language Processing": [
+            "nlp",
+            "text mining",
+            "text analytics",
+            "computational linguistics",
+            "language models",
+            "tokenization",
+            "ner",
+        ],
+        "Computer Vision": ["cv", "image processing", "object detection", "yolo", "opencv"],
+        "Generative AI": [
+            "genai",
+            "gen ai",
+            "llm",
+            "large language models",
+            "gpt",
+            "chatgpt",
+            "stable diffusion",
+            "dall-e",
+            "diffusion models",
+        ],
+        "LLMs": [
+            "large language model",
+            "language model",
+            "foundation models",
+            "gpt-4",
+            "claude",
+            "llama",
+            "mistral",
+        ],
+        "Reinforcement Learning": ["rl", "q-learning", "policy gradient", "dqn"],
+        "Data Science": [
+            "data scientist",
+            "statistical modeling",
+            "exploratory data analysis",
+            "eda",
+        ],
+        "Data Analysis": ["data analytics", "business intelligence", "bi", "reporting"],
+        "Data Engineering": ["data pipelines", "etl", "elt", "data warehouse", "lakehouse"],
+        "TensorFlow": ["tensorflow2", "tf", "keras", "tf.keras"],
+        "PyTorch": ["torch", "pytorch lightning"],
+        "Pandas": ["pandas python", "dataframes"],
+        "NumPy": ["numpy python", "numerical python"],
+        "Scikit-learn": ["sklearn", "scikit learn"],
+        "Hugging Face": ["transformers library", "huggingface", "hf transformers"],
+    },
+    # ── Databases ─────────────────────────────────────────────
+    "Databases": {
+        "SQL": ["mysql", "postgresql", "sqlite", "ms sql", "sql server", "pl/sql", "t-sql"],
+        "PostgreSQL": ["postgres", "pg", "psql"],
+        "MySQL": ["mysql8", "mariadb"],
+        "MongoDB": ["mongo", "nosql mongo", "document database"],
+        "Redis": ["redis cache", "in-memory db", "redis sentinel"],
+        "Cassandra": ["apache cassandra", "wide-column"],
+        "Elasticsearch": ["elastic", "es", "elk", "opensearch"],
+        "DynamoDB": ["aws dynamodb", "dynamo"],
+        "Neo4j": ["graph database", "cypher"],
+        "Snowflake": ["snowflake dwh", "snowflake cloud"],
+        "BigQuery": ["google bigquery", "gcp bigquery"],
+        "Apache Spark": ["spark", "pyspark", "spark sql", "databricks"],
+        "Kafka": ["apache kafka", "kafka streams", "event streaming"],
+    },
+    # ── DevOps & Cloud ────────────────────────────────────────
+    "DevOps & Cloud": {
+        "Docker": ["containerization", "dockerfile", "docker compose", "docker-compose"],
+        "Kubernetes": ["k8s", "k8", "helm", "kubectl", "eks", "gke", "aks"],
+        "AWS": ["amazon web services", "ec2", "s3", "lambda", "aws cloud", "boto3"],
+        "Azure": ["microsoft azure", "azure cloud", "azure devops"],
+        "GCP": ["google cloud", "google cloud platform", "gcp cloud"],
+        "Terraform": ["terraform iac", "hashicorp terraform", "infrastructure as code"],
+        "Ansible": ["ansible playbooks", "configuration management"],
+        "CI/CD": [
+            "continuous integration",
+            "continuous delivery",
+            "continuous deployment",
+            "github actions",
+            "gitlab ci",
+            "jenkins",
+            "circleci",
+        ],
+        "Jenkins": ["jenkins ci", "jenkinsfile"],
+        "Linux": ["ubuntu", "centos", "debian", "rhel", "unix", "linux admin"],
+        "Git": ["github", "gitlab", "version control", "git flow"],
+        "DevOps": ["site reliability", "sre", "platform engineering", "devsecops"],
+        "Nginx": ["reverse proxy", "nginx config"],
+        "Prometheus": ["prometheus monitoring", "grafana", "observability"],
+        "Serverless": ["lambda functions", "cloud functions", "serverless framework", "faas"],
+        "Microservices": ["service mesh", "istio", "api gateway", "distributed systems"],
+    },
+    # ── Cybersecurity ─────────────────────────────────────────
+    "Cybersecurity": {
+        "Cybersecurity": ["information security", "infosec", "cyber security"],
+        "Network Security": ["firewall", "ids", "ips", "vpn", "network hardening"],
+        "Penetration Testing": [
+            "pen testing",
+            "pentesting",
+            "ethical hacking",
+            "red team",
+            "kali linux",
+        ],
+        "Application Security": ["appsec", "owasp", "secure coding", "sast", "dast"],
+        "Cloud Security": ["iam policies", "zero trust", "cspm", "cloud hardening"],
+        "SIEM": ["splunk", "qradar", "siem tools"],
+        "Cryptography": ["encryption", "pki", "tls", "ssl", "hash functions"],
+        "Incident Response": ["ir", "digital forensics", "blue team", "soc"],
+    },
+    # ── Emerging Tech ─────────────────────────────────────────
+    "Emerging Tech": {
+        "Blockchain": ["distributed ledger", "web3", "dlt"],
+        "Web3": ["web 3", "decentralized web", "dapps", "defi"],
+        "Smart Contracts": ["solidity", "ethereum", "evm"],
+        "IoT": ["internet of things", "embedded systems", "mqtt", "arduino"],
+        "Edge Computing": ["fog computing", "edge ai"],
+        "Quantum Computing": ["quantum algorithms", "qiskit"],
+        "AR/VR": ["augmented reality", "virtual reality", "xr", "unity3d", "unreal engine"],
+    },
+    # ── Mobile ────────────────────────────────────────────────
+    "Mobile": {
+        "Android": ["android sdk", "android studio", "android development"],
+        "iOS": ["ios development", "xcode", "objective-c"],
+        "Flutter": ["flutter sdk", "dart flutter"],
+        "React Native": ["rn", "react-native"],
+    },
+    # ── Tools & Practices ─────────────────────────────────────
+    "Tools & Practices": {
+        "Agile": ["scrum", "kanban", "sprint", "agile methodology"],
+        "Jira": ["project management", "atlassian"],
+        "Power BI": ["powerbi", "microsoft bi", "power bi desktop"],
+        "Tableau": ["tableau desktop", "tableau server"],
+        "Excel": ["microsoft excel", "spreadsheets", "vba"],
+    },
+}
