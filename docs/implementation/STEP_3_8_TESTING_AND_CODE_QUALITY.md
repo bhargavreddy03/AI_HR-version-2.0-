@@ -96,10 +96,11 @@ frontend/
 
 ### 3.3 Fail-Closed Python Security Scanner (`backend/scripts/security_audit.py`)
 - **Fail-Closed Execution**: If `pip-audit` cannot execute, crashes, returns empty stdout, outputs malformed non-JSON, or produces JSON missing the `dependencies` key, the scanner exits with code 1 immediately.
-- **Authoritative CVSS v3 Calculation**: Strictly parses CVSS version prefixes (`CVSS:3.0` vs. `CVSS:3.1`) and implements FIRST standard mathematical formulas for both Scope Unchanged (`S:U`) and Scope Changed (`S:C`). Resolves version-specific Privileges Required weights (`PR:L` and `PR:H` under `S:C`) and version-specific rounding semantics (`_cvss_v31_roundup` integer scaling vs. `_cvss_v30_roundup`). Rejects malformed and unsupported vectors (e.g. CVSS:2.0, CVSS:4.0, missing/duplicate metrics).
+- **Strict CVSS v3 Vector Validation**: Strictly requires parsed metric keys to match the exact set `{AV, AC, PR, UI, S, C, I, A}`. Rejects all unknown or extra metrics (e.g. temporal metrics like `E:H`, `RL:O`, or arbitrary extensions), rejects empty sections (`//`), leading separators, trailing separators (`/`), and duplicate metric keys. Ensures every malformed vector returns `None`.
+- **Authoritative CVSS v3 Calculation**: Strictly parses CVSS version prefixes (`CVSS:3.0` vs. `CVSS:3.1`) and implements FIRST standard mathematical formulas for both Scope Unchanged (`S:U`) and Scope Changed (`S:C`). Resolves version-specific Privileges Required weights (`PR:L` and `PR:H` under `S:C`) and version-specific rounding semantics (`_cvss_v31_roundup` integer scaling vs. `_cvss_v30_roundup`).
 - **Precedence Rule**: Authoritative numeric CVSS scores take precedence over lower textual ratings (e.g. CVSS 9.1 is classified as CRITICAL even if a source lists "HIGH"). Non-critical scores (e.g. CVSS 8.8) are accurately classified as HIGH and not artificially inflated.
 - **Fail-Safe Policy**: If reliable severity information is unavailable for an advisory (due to network timeout, missing source data, or unregistered advisory), the scanner marks it as unverified and fails safely (`exit_code = 1`) rather than reporting zero criticals.
-- **Scanner Unit Suite (`backend/tests/test_security_audit.py`)**: 12 unit tests verifying all failure modes, malformed inputs, critical detections, precedence rules, fail-safe rejections, and CVSS vector calculations (8.8, 9.1, 9.8, 9.9, 8.1, 7.2, 6.8 across v3.0 and v3.1).
+- **Scanner Unit Suite (`backend/tests/test_security_audit.py`)**: 12 unit tests verifying all failure modes, malformed inputs, extra/unknown metrics, empty/trailing separators, critical detections, precedence rules, fail-safe rejections, and CVSS vector calculations (8.8, 9.1, 9.8, 9.9, 8.1, 7.2, 6.8 across v3.0 and v3.1).
 
 ### 3.4 Actual Load Testing with Locust (`backend/tests/load/locustfile.py`)
 - **Dual Performance Profiles**:
@@ -110,8 +111,10 @@ frontend/
     - Authentication perimeter workload exercising **real Argon2id password verification computation** and Redis sliding-window rate limiting.
     - Protected identity verification (`GET /api/v1/auth/me`).
     - OpenAPI 3.1 specification schema queries.
-- **Isolated Load-Test Account Provisioning**: Pre-provisions dedicated, isolated load-test worker accounts (`loadtest.worker@platform.local` and a deterministic worker pool) via standard public registration. Idempotent: HTTP 201 indicates initial registration and HTTP 409 indicates existing accounts on repeated runs, preventing uncontrolled duplicate accounts.
-- **Real Argon2id Verification Under Load**: Login tasks target existing provisioned accounts with an intentionally incorrect password. Because the account exists in PostgreSQL, the authentication service executes `verify_password()` (full Argon2id computation) before rejecting the credentials with HTTP 401. Under high concurrency, requests exceeding the sliding-window threshold exercise Redis rate limiting (HTTP 429), measuring real CPU crypto overhead and rate-limiting resilience without introducing backdoors.
+- **Reliable One-Time Account Provisioning**: Pre-provisions dedicated, isolated load-test worker accounts (`loadtest.worker@platform.local` and a deterministic worker pool) exactly once before load generation begins via the `@events.test_start` lifecycle hook. Redundant account provisioning is completely removed from virtual-user `on_start()` calls.
+- **Strict Setup Failure Handling**: All accounts must be verified as either freshly registered (HTTP 201) or confirmed existing (HTTP 409). Any unexpected response (e.g. HTTP 500), network failure, or incomplete provisioning raises `RuntimeError`, sets `PROVISIONING_SUCCEEDED = False`, and aborts the Locust runner.
+- **Gated Argon2id Verification Under Load**: `authentication_login_workload` enforces that `PROVISIONING_SUCCEEDED` is `True` before starting, ensuring that Argon2id verification executes exclusively against genuine database accounts with valid hashes before rejecting invalid passwords with HTTP 401 (or shedding with HTTP 429 under sustained concurrency).
+- **Load Workload Test Suite (`backend/tests/test_load_workload.py`)**: 14 unit tests validating account constants, one-time idempotent provisioning (HTTP 201, HTTP 409, mixed), failure handling (HTTP 500, network error, incomplete provisioning), event listener runner shutdown, removal of redundant `on_start`, and 401/429 response handling.
 - **CI Execution & Reporting**: Runs in `.github/workflows/ci.yml` in headless mode against the live Docker stack. Generates HTML and CSV reports uploaded as CI artifacts with 14-day retention.
 - **Workflow Triggers**: Triggered automatically on push/PR (smoke load) and on a weekly Sunday schedule (02:00 UTC) or manually via `workflow_dispatch` with `run_sustained_load_test: true`.
 - **Performance Baselines and Limitations**:
@@ -139,12 +142,13 @@ frontend/
 | Tool | Scope | Status | Result |
 | :--- | :--- | :--- | :--- |
 | **Ruff Linter** | `app/`, `tests/`, `scripts/` | Passed | 0 issues across all files |
-| **Ruff Formatter** | `app/`, `tests/`, `scripts/` | Passed | 100 files already formatted |
+| **Ruff Formatter** | `app/`, `tests/`, `scripts/` | Passed | 99 files already formatted |
 | **Mypy Typechecker** | `app/` | Passed | Success: 0 issues in 65 source files |
-| **Pytest Unit Suite** | `tests/` | Passed | **330 passed**, 24 skipped (live services), 12 deselected |
+| **Pytest Unit Suite** | `tests/` | Passed | **338 passed**, 24 skipped (live services), 12 deselected |
 | **Code Coverage** | `app/` | Passed | **83.42% total coverage** (enforced $\ge 83\%$) |
 | **Dependency Audit** | `requirements.txt` | Passed | 0 critical vulnerabilities found (25 advisories evaluated) |
-| **Scanner Tests** | `tests/test_security_audit.py` | Passed | **12 passed in 3.82s** |
+| **Scanner Tests** | `tests/test_security_audit.py` | Passed | **12 passed in 4.00s** |
+| **Load Suite Tests** | `tests/test_load_workload.py` | Passed | **14 passed in 0.85s** |
 
 ### 4.2 Explicit List of Skipped and Untested Areas
 - **Skipped in Offline / Standalone Runs**:

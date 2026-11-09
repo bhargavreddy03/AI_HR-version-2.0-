@@ -53,17 +53,25 @@ LOAD_TEST_INVALID_PASSWORD = "IntentionallyIncorrectPassword123!"
 # Pool of deterministic load-test worker accounts to exercise concurrent Argon2id hashing
 LOAD_TEST_ACCOUNT_POOL = [f"loadtest.worker.{i}@platform.local" for i in range(5)]
 
+# Shared provisioning flag ensuring Argon2id workload only starts if setup verified
+PROVISIONING_SUCCEEDED: bool = False
 
-def provision_load_test_accounts(host: str) -> None:
+
+def provision_load_test_accounts(host: str) -> bool:
     """Ensure dedicated, isolated load-test accounts exist in the database with valid Argon2id hashes.
 
-    Uses the standard public registration endpoint (/api/v1/auth/register).
-    Deterministic email addresses prevent uncontrolled duplicate account creation across test runs.
-    - HTTP 201: Account created with fresh Argon2id hash.
-    - HTTP 409: Account already exists from a prior test run (expected on repeated runs).
+    Executed once before load generation begins. Verifies that every required account is either
+    freshly registered (HTTP 201) or already confirmed to exist (HTTP 409).
+    Treats unexpected registration responses (e.g. HTTP 500), network failures, or incomplete
+    provisioning as setup failures, raising RuntimeError.
+
+    Returns True if and only if all required accounts are verified to exist.
     """
+    global PROVISIONING_SUCCEEDED
     clean_host = host.rstrip("/")
     all_accounts = [LOAD_TEST_ACCOUNT_EMAIL, *LOAD_TEST_ACCOUNT_POOL]
+    verified_accounts: set[str] = set()
+
     for email in all_accounts:
         payload = json.dumps(
             {
@@ -85,21 +93,52 @@ def provision_load_test_accounts(host: str) -> None:
             with urllib.request.urlopen(req, timeout=5.0) as resp:
                 if resp.status == 201:
                     logger.info("Successfully provisioned load-test account: %s", email)
+                    verified_accounts.add(email)
+                else:
+                    PROVISIONING_SUCCEEDED = False
+                    msg = f"Setup failure: Unexpected HTTP {resp.status} registering {email}"
+                    logger.error(msg)
+                    raise RuntimeError(msg)
         except urllib.error.HTTPError as exc:
             if exc.code == 409:
                 # 409 Conflict: Account already exists with valid Argon2id hash
-                pass
+                logger.info("Load-test account confirmed existing: %s", email)
+                verified_accounts.add(email)
             else:
-                logger.warning("Provisioning returned HTTP %d for %s", exc.code, email)
-        except Exception as exc:
-            logger.debug("Could not reach host to provision %s: %s", email, exc)
+                PROVISIONING_SUCCEEDED = False
+                msg = f"Setup failure: HTTP error {exc.code} provisioning {email}"
+                logger.error(msg)
+                raise RuntimeError(msg) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            PROVISIONING_SUCCEEDED = False
+            msg = f"Setup failure: Network error provisioning {email}: {exc}"
+            logger.error(msg)
+            raise RuntimeError(msg) from exc
+
+    if len(verified_accounts) != len(all_accounts):
+        PROVISIONING_SUCCEEDED = False
+        msg = (
+            f"Setup failure: Incomplete account provisioning "
+            f"({len(verified_accounts)}/{len(all_accounts)} accounts verified)"
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
+
+    PROVISIONING_SUCCEEDED = True
+    return True
 
 
 @events.test_start.add_listener
 def on_test_start(environment: Any, **kwargs: Any) -> None:
-    """Pre-provision dedicated load-test accounts when Locust test begins."""
+    """Pre-provision dedicated load-test accounts once when Locust test begins."""
     host = environment.host or "http://127.0.0.1:8000"
-    provision_load_test_accounts(host)
+    try:
+        provision_load_test_accounts(host)
+    except Exception as exc:
+        logger.critical("Aborting load test: account provisioning failed: %s", exc)
+        if hasattr(environment, "runner") and environment.runner is not None:
+            environment.runner.quit()
+        raise
 
 
 class PlatformSmokeUser(HttpUser):
@@ -129,11 +168,6 @@ class PlatformSustainedUser(HttpUser):
     """Realistic sustained multi-user enterprise workload profile."""
 
     wait_time = between(0.05, 0.25)
-
-    def on_start(self) -> None:
-        """Ensure load-test accounts exist for this virtual user session."""
-        base_url = getattr(self.client, "base_url", None) or "http://127.0.0.1:8000"
-        provision_load_test_accounts(base_url)
 
     @task(5)
     def liveness_check(self) -> None:
@@ -226,7 +260,13 @@ class PlatformSustainedUser(HttpUser):
         verify_password() (full Argon2id computation) before rejecting the credentials.
         Under sustained concurrency, requests beyond the sliding-window threshold exercise
         Redis rate limiting (HTTP 429).
+        Does not execute unless account provisioning has succeeded.
         """
+        if not PROVISIONING_SUCCEEDED:
+            raise RuntimeError(
+                "Cannot execute Argon2id workload: load-test account provisioning has not succeeded"
+            )
+
         target_email = random.choice([LOAD_TEST_ACCOUNT_EMAIL, *LOAD_TEST_ACCOUNT_POOL])
         payload = {
             "email": target_email,

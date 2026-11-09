@@ -89,19 +89,27 @@ def calculate_cvss_v3_score(vector: str) -> float | None:
         return None
 
     try:
-        parts = [p for p in clean.split("/") if p]
+        # Reject vectors with trailing separators, leading separators, or empty sections
+        if clean.endswith("/") or clean.startswith("/"):
+            return None
+
+        parts = clean.split("/")
+        # Reject duplicate separators and empty sections
+        if any(not p for p in parts):
+            return None
+
+        required = {"AV", "AC", "PR", "UI", "S", "C", "I", "A"}
         metrics: dict[str, str] = {}
         for part in parts:
             if ":" not in part:
                 return None
             k, v = part.split(":", 1)
-            if k in metrics:
-                # Reject duplicate metric keys
+            # Reject empty key or value, unknown metric keys, and duplicate metric keys
+            if not k or not v or k in metrics or k not in required:
                 return None
             metrics[k] = v
 
-        required = {"AV", "AC", "PR", "UI", "S", "C", "I", "A"}
-        if not required.issubset(metrics.keys()):
+        if metrics.keys() != required:
             return None
 
         av_map = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.20}

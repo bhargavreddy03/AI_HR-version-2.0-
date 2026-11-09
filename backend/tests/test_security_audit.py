@@ -107,7 +107,7 @@ def test_calculate_cvss_v30_and_v31_versioned_distinctions() -> None:
 
 
 def test_calculate_cvss_malformed_and_unsupported_vectors_rejected() -> None:
-    """Verify that unsupported versions, malformed syntax, and invalid metrics return None."""
+    """Verify that unsupported versions, malformed syntax, extra metrics, and invalid separators return None."""
     # Unsupported CVSS 2.0
     assert calculate_cvss_v3_score("CVSS:2.0/AV:N/AC:L/Au:N/C:C/I:C/A:C") is None
 
@@ -126,17 +126,36 @@ def test_calculate_cvss_malformed_and_unsupported_vectors_rejected() -> None:
     # Missing required metric (missing 'A')
     assert calculate_cvss_v3_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H") is None
 
-    # Invalid metric key
+    # Unknown metric key
     assert calculate_cvss_v3_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/UNKNOWN:H") is None
+
+    # Extra metric key (e.g. temporal metric E:H or environmental CR:H)
+    assert calculate_cvss_v3_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H/E:H") is None
+    assert calculate_cvss_v3_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H/RL:O") is None
+    assert calculate_cvss_v3_score("CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H/EXTRA:1") is None
+
+    # Trailing separator
+    assert calculate_cvss_v3_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H/") is None
+    assert calculate_cvss_v3_score("CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H/") is None
+
+    # Empty sections / duplicate separators
+    assert calculate_cvss_v3_score("CVSS:3.1/AV:N//AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H") is None
+    assert calculate_cvss_v3_score("CVSS:3.1//AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H") is None
+    assert calculate_cvss_v3_score("CVSS:3.0/AV:N/AC:L///PR:N/UI:N/S:U/C:H/I:H/A:H") is None
 
     # Invalid metric value (PR:X is invalid)
     assert calculate_cvss_v3_score("CVSS:3.1/AV:N/AC:L/PR:X/UI:N/S:U/C:H/I:H/A:H") is None
 
     # Duplicate metric key
     assert calculate_cvss_v3_score("CVSS:3.1/AV:N/AC:L/PR:N/PR:L/UI:N/S:U/C:H/I:H/A:H") is None
+    assert calculate_cvss_v3_score("CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H/AV:N") is None
 
     # Malformed part with no colon
     assert calculate_cvss_v3_score("CVSS:3.1/AV:N/NO_COLON/PR:N/UI:N/S:U/C:H/I:H/A:H") is None
+
+    # Empty key or value
+    assert calculate_cvss_v3_score("CVSS:3.1/AV:N/AC:L/:N/UI:N/S:U/C:H/I:H/A:H") is None
+    assert calculate_cvss_v3_score("CVSS:3.1/AV:N/AC:L/PR:/UI:N/S:U/C:H/I:H/A:H") is None
 
     # Non-string input
     assert calculate_cvss_v3_score(None) is None  # type: ignore[arg-type]
