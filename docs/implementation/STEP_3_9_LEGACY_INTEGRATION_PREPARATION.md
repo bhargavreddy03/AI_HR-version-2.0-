@@ -209,31 +209,44 @@ flowchart TD
 | **Identity Model** | Single master candidate record across SaaS; applications linked via foreign keys. | Completely isolated candidate record per organization; no cross-tenant linking. |
 | **Candidate Experience** | Single sign-on; portable master profile, credentials, and resume library. | Separate account or separate application record per employer; duplicate data entry. |
 | **Tenant Isolation Risk** | Higher complexity: requires foreign key bridges and strict cross-tenant isolation enforcement. | Lowest risk: standard multi-tenant RLS applies uniformly to candidates and applications. |
-| **Regulatory Roles (GDPR)** | Platform operates as Joint Data Controller for global profile, and Data Processor for tenant applications. | Platform operates purely as a Data Processor for each tenant organization. |
+| **Data Protection Roles (e.g., GDPR / UK GDPR)** | Role allocation depends on the degree to which the platform independently determines purposes/means for shared accounts; may involve joint-controller, separate controller, or processor relationships depending on contractual terms and feature architecture. | Typically aligns more closely with a pure Data Processor / Service Provider relationship for tenant recruitment data, but final classification depends on actual processing purposes, terms, and telemetry/service data usage. |
 | **Consent Management** | Requires distinct, unbundled consent for global profile vs. tenant-specific applications. | Single consent flow tied directly to the employer's privacy notice. |
 
 ### 7.2 Data Ownership, Consent, and Legal Governance Analysis
-1. **Candidate Consent and Lawful Basis**:
-   - Under GDPR (Art. 6(1)(a) consent vs. Art. 6(1)(b) pre-contractual steps) and CCPA/CPRA, the platform cannot assume a uniform lawful basis across all data operations.
-   - If Option A is pursued, cross-tenant profile sharing or common account access requires explicit, freely given, specific, and informed candidate consent that is completely unbundled from individual job applications.
-2. **Cross-Organization Data Access Restrictions**:
-   - Under either option, strict cryptographic and row-level boundaries must ensure Tenant A can never query, infer, or view candidate applications, interview status, notes, or evaluations from Tenant B.
-3. **Organization-Specific Resumes and Evaluation Records**:
-   - Resumes submitted to a specific employer, interviewer scorecards, recruiter feedback, internal salary notes, and algorithmic match scores are confidential trade secrets and proprietary property belonging exclusively to that tenant organization.
-4. **Candidate Withdrawal vs. Erasure Rights**:
-   - If a candidate withdraws an application from Tenant A, active applications at Tenant B remain unaffected.
-   - **GDPR Right to Erasure (Article 17) vs. Legal Retention Exceptions**:
-     - Candidate erasure rights under GDPR or CCPA **do not override mandatory statutory employer recordkeeping or the defense of legal claims**.
-     - Under GDPR Article 17(3)(b) (compliance with a legal obligation) and Article 17(3)(e) (establishment, exercise, or defense of legal claims), an employer is legally entitled and often required to retain candidate application records and evaluation data for statutory limitation periods (e.g. against discrimination claims) even if the candidate requests erasure.
-5. **Retention Obligations and Applicable Circumstances**:
-   - **United States (EEOC/OFCCP)**: Under EEOC regulations (29 C.F.R. § 1602.14), private employers with 15 or more employees must preserve all personnel or employment records (including applications and resumes) for at least 1 year from the date of the record creation or personnel action. Federal contractors subject to Executive Order 11246 / OFCCP (41 C.F.R. § 60-1.12) must retain records for 2 years (or 1 year for contractors under 150 employees or contracts under $150,000). If a discrimination charge or lawsuit is filed, records must be retained until final disposition.
-   - **Global Jurisdictions**: Global SaaS deployment requires jurisdiction-specific privacy and employment law review (e.g., German AGG 6-month retention, French CNIL 2-year limitation, UK Equality Act).
+1. **Lawful Basis Assessment by Processing Purpose**:
+   - The platform cannot assume a single uniform lawful basis across all data operations. Each processing purpose requires an independent lawful-basis assessment under applicable law (e.g., GDPR Article 6 / 9, CCPA/CPRA):
+     - **Candidate Self-Service**: Candidate account management, credentials, profile creation, and self-directed application tracking typically rely on contract necessity (performance of terms of service between candidate and platform under GDPR Art. 6(1)(b)) or candidate consent.
+     - **Employer Application Processing**: An employer reviewing submitted resumes, conducting technical screening, recording interview feedback, and reaching hiring decisions typically relies on steps taken prior to entering into an employment contract (GDPR Art. 6(1)(b)), the employer's legitimate business interests (GDPR Art. 6(1)(f)), or statutory employment authorizations under local law, rather than candidate consent.
+     - **Optional Cross-Tenant Profile Sharing**: If a feature allows a candidate's profile or resume to be discoverable by other tenant organizations beyond the specific employer applied to, the lawful basis must be rigorously established. Where candidate consent is relied upon, it must satisfy all applicable statutory validity requirements: it must be freely given, specific, informed, unambiguous, presented separately from mandatory job application terms, and easily revocable without detriment to the candidate's active applications.
+2. **Mandatory Cross-Tenant Data Isolation as a Technical Security Requirement**:
+   - Independent of legal classification or candidate sharing options, **strict cross-tenant data isolation is a mandatory architectural and security requirement**. Tenant A must never be permitted to query, access, infer, or observe candidate application records, interview feedback, evaluation scorecards, notes, or rejection statuses belonging to Tenant B.
+3. **Data Rights, Contractual Ownership, and Confidentiality**:
+   - Characterizing evaluation records cannot be reduced to a blanket assertion of 'employer-owned property'. Data governance must distinguish multiple intersecting legal rights:
+     - **Candidate Personal Data Rights**: Candidates retain statutory rights under data protection laws (e.g., GDPR rights of access, rectification, transparency, and data portability; CCPA/CPRA rights of access and correction) regarding personal data contained within application files and factual evaluation notes.
+     - **Employer Confidentiality and Trade Secrets**: Recruiter notes, internal hiring rubrics, comparative evaluation weights, and proprietary interviewer assessments represent confidential employer work product and trade secrets that are subject to employer confidentiality agreements and protections.
+     - **Platform Intellectual Property**: Scoring algorithm implementations, feature extraction pipelines, and vector embedding architectures remain the proprietary intellectual property of the SaaS platform.
+4. **Candidate Withdrawal and Statutory Deletion Exceptions**:
+   - When a candidate withdraws an application from a specific employer, that action must not disrupt the candidate's separate applications or records with other tenant employers.
+   - **Interplay Between Deletion Rights and Statutory Retention**:
+     - Statutory erasure rights (such as GDPR Article 17 or CCPA/CPRA deletion requests) are not absolute and are subject to specific statutory exceptions.
+     - Under GDPR Article 17(3)(b), the right to erasure does not apply to the extent that processing is necessary for compliance with a legal obligation under EU or Member State law to which the employer or platform is subject (e.g., mandatory personnel recordkeeping).
+     - Under GDPR Article 17(3)(e), processing is preserved where necessary for the establishment, exercise, or defense of legal claims (such as defending against potential unlawful discrimination or failure-to-hire claims).
+     - Under CCPA/CPRA (e.g., Cal. Civ. Code § 1798.105(d)), exceptions apply where retention is necessary to comply with legal obligations, exercise legal defenses, or complete transactions.
+     - Therefore, candidate deletion workflows must be carefully designed to distinguish personal profile deletion from records legally required to be retained under applicable statutory employer exceptions.
+5. **Regulatory Recordkeeping and Retention Requirements**:
+   - Recordkeeping and data retention mandates vary substantially based on employer status, operating jurisdiction, record category, and pending claims or proceedings. They cannot be stated as universal thresholds or fixed timelines across all tenants:
+     - **EEOC Statutory Regulations (Title VII, ADA, GINA)**: Under 29 C.F.R. Part 1602 (e.g., § 1602.14), covered employers are required to preserve personnel and employment records (such as job applications, resumes, screening evaluations, and test papers) for specified minimum periods (e.g., typically one year from the date of record creation or personnel action taken for covered private employers). If an employee or applicant files a charge of discrimination or an enforcement action is initiated, covered employers are legally obligated to retain all relevant records until final disposition of the matter.
+     - **Age Discrimination in Employment Act (ADEA)**: Under 29 C.F.R. Part 1627 (§ 1627.3), covered employers have distinct recordkeeping requirements for job applications, resumes, pre-employment tests, and physical examination results.
+     - **Office of Federal Contract Compliance Programs (OFCCP)**: For covered federal contractors and subcontractors subject to affirmative action regulations (such as 41 C.F.R. § 60-1.12 under Executive Order 11246, Section 503 of the Rehabilitation Act under 41 C.F.R. Part 60-741, and VEVRAA under 41 C.F.R. Part 60-300), specific record retention obligations apply to personnel and employment records (including applicant flow data, resumes, and test records), with applicable durations and requirements contingent on contractor size, contract value, and specific regulatory classifications.
+     - **State and Local Laws**: Various US state and municipal statutes impose separate, often longer retention rules or distinct applicant definition thresholds.
+     - **International Jurisdictions**: Cross-border and international operations are subject to jurisdiction-specific employment and data protection laws governing maximum storage limitation periods (e.g., national civil rights statutes, limitation periods for recruitment claims, and general data minimization mandates under GDPR Article 5(1)(e)).
+   - **Prerequisite for Production**: Production retention schedules and automated purging policies must not apply arbitrary uniform periods; they require formal, jurisdiction-specific legal and regulatory review tailored to each tenant's specific employer classification, contract status, and operating locations.
 6. **Required Authorization and Audit Controls**:
    - Access to candidate data requires strict RBAC (`candidates:read`, `evaluations:read`, `evaluations:write`), tenant RLS enforcement (`current_setting('app.current_org_id')`), and immutable audit logging for all candidate data read and export events.
 
 ### 7.3 Unresolved Decisions Requiring Product, Security, Privacy, and Legal Approval
 1. **Decision on Global Identity vs. Siloed Profiles**: Formally select Option A (Global Identity) or Option B (Siloed Profiles) based on corporate strategy, privacy liability, and market positioning.
-2. **Data Controller vs. Processor Classification**: Formalize whether the SaaS vendor acts as a joint controller or purely as a data processor under GDPR Article 28.
+2. **Data Controller vs. Processor Classification**: Formalize whether the SaaS vendor acts as a joint controller, independent controller, or purely as a data processor under GDPR Article 28 / CCPA service provider terms.
 3. **Right to Erasure Conflict Resolution Protocol**: Establish automated technical workflows reconciling candidate deletion requests with statutory employer retention obligations.
 4. **Cross-Border Candidate Data Transfer**: Define mechanisms (e.g. EU Standard Contractual Clauses, local data residency) for international candidate applications.
 
@@ -286,7 +299,7 @@ class SkillExtractionResponse(BaseModel):
     normalized_duration_ms: float
 ```
 
-### 8.2 Proposed Candidate Matching DTOs (With Reproducible Audit Metadata)
+### 8.2 Proposed Candidate Matching DTOs (Integrity Verification & Future Reproducibility Requirements)
 ```python
 from datetime import datetime
 from uuid import UUID
@@ -334,7 +347,8 @@ class EmbeddingSimilarityScore(BaseModel):
         ..., ge=-1.0, le=1.0, description="Unscaled cosine similarity result"
     )
     vector_dimension: int = Field(
-        default=1536, description="Embedding dimension verified in pgvector"
+        ...,
+        description="Embedding vector dimension validated against registered model and stored vector config",
     )
 
 
@@ -386,6 +400,24 @@ class CandidateMatchResult(BaseModel):
         ..., description="Auditable natural language justification"
     )
 ```
+
+#### Distinction Between Integrity Verification and Full Evaluation Reproducibility
+The proposed DTO includes `evaluation_input_hash` for **integrity verification and tamper detection** (proving that the recorded inputs and outputs have not been altered post-evaluation). However, **cryptographic hashing alone does not provide full historical evaluation reproducibility**. Full reproducibility—the ability for an auditor, regulator, or engineering team to re-run the matching pipeline months or years later and obtain the exact same component scores—requires comprehensive state preservation.
+
+Future integration in Step 3.10 and beyond must satisfy the following architectural requirements:
+1. **Immutable Scoring Configuration Versions**: Explicit tracking of scoring weights, tier thresholds, penalty parameters, and component coefficients (`scoring_config_version`).
+2. **Matching Algorithm Version and Release Identity**: Explicit tracking of the matching engine source code version, release tag, and build hash (`matching_algorithm_version`, `engine_release_id`).
+3. **Embedding Model Identifier and Immutable Model Version**: Explicit recording of the embedding model ID, frozen model weight version, tokenizer configuration, and vector normalization parameters (`embedding_model_id`, `embedding_model_version`).
+4. **Normalized Input Snapshots or Reconstructable Input References**: Securely retained immutable snapshots of the parsed candidate resume tokens and job requirement tokens, or cryptographically verified reconstructable input references stored under append-only audit storage.
+5. **Input Hashing and Integrity Verification**: Cryptographic hashing (`evaluation_input_hash`, SHA-256) computed over canonical JSON representations of normalized inputs and parameters for tamper evidence.
+6. **Evaluation Timestamp and Timezone**: Precise ISO 8601 UTC evaluation timestamps (`evaluated_at`) recording the exact historical evaluation epoch.
+7. **Component-Level Evidence Breakdown**: Granular recording of individual rule activations, skill match tokens, experience calculation intervals, and similarity scores.
+8. **Retention and Access Controls for Historical Evaluation Records**: Strict append-only storage permissions, audit-logging for historical evaluation access, and retention scheduling aligned with applicable compliance requirements.
+
+*(Note: These mechanisms are documented future requirements for the matching engine and will be designed and implemented in subsequent steps; no matching engine implementation is performed in Step 3.9.)*
+
+#### Vector Dimension Validation and Model Configuration
+Vector dimensions cannot be treated as a single universal constant (such as 1536) across arbitrary models. The vector dimension must be validated by `backend/app/modules/embeddings/service.py` (`_validate_vector_elements` and dimension checks) against the registered `EmbeddingModel` in the database and the actual stored vector configuration. The currently verified platform infrastructure detail uses a 1536-dimensional configuration (`DEFAULT_MODEL_DIMENSION = 1536` in `models.py`), representing the baseline pgvector deployment established in Step 3.4. Future models with alternate dimensions (e.g., 768, 1024, 3072) require registered model records and matching pgvector table schemas.
 
 ### 8.3 Proposed Interview Question DTOs (Separating Seniority from Difficulty)
 ```python
@@ -539,9 +571,10 @@ Every planned component must satisfy the following criteria prior to production 
 - **Current Technical Blockers**: **ZERO BLOCKERS.** All prerequisite infrastructure from Steps 3.2 through 3.8 (FastAPI, PostgreSQL RLS, pgvector, Celery/Redis, security foundation, automated test harness) is operational and verified.
 - **Unresolved Governance & Legal Decisions**:
   1. *Candidate Identity Architecture*: Product/Legal decision on Option A (Global Identity with Tenant Applications) vs. Option B (Strict Siloed Profiles).
-  2. *Regulatory Classification*: Legal determination of Data Controller vs. Data Processor role under GDPR Article 28.
-  3. *Erasure vs. Retention Protocol*: Finalization of automated deletion workflows accommodating statutory employer defense exceptions (GDPR Art. 17(3)(b)/(e) and EEOC 29 C.F.R. § 1602.14).
-  4. *Jurisdiction-Specific Privacy Audits*: Completion of privacy and employment-law impact assessments across deployment jurisdictions.
+  2. *Data Protection Role Classification*: Formal classification of SaaS platform and tenant employers as Independent Controllers, Joint Controllers (e.g. GDPR Art. 26), or Controller-to-Processor (GDPR Art. 28 / CCPA Service Provider) based on actual processing purposes and DPA terms.
+  3. *Lawful Basis and Consent Governance*: Formalization of purpose-specific lawful bases across candidate self-service, employer evaluation, and optional cross-tenant sharing.
+  4. *Erasure vs. Retention Protocol*: Finalization of automated deletion workflows accommodating statutory employer defense exceptions (e.g. GDPR Art. 17(3)(b)/(e), CCPA Cal. Civ. Code § 1798.105(d), Title VII, ADEA, and ADA recordkeeping).
+  5. *Jurisdiction-Specific Privacy and Retention Audits*: Completion of privacy, retention, and AI regulatory assessments across specific deployment jurisdictions prior to establishing automated production purging policies.
 - **Outstanding Implementation Dependencies for Step 3.10**:
   - Database schema migrations for candidate profiles, resumes, extracted skills, and job requirements.
   - S3 bucket client integration for document storage and OCR fallback.
