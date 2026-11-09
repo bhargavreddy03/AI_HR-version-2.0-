@@ -67,6 +67,83 @@ def test_calculate_cvss_v3_score_standards_compliance() -> None:
     assert cvss_score_to_severity(score_68) == "MODERATE"
 
 
+def test_calculate_cvss_v30_and_v31_versioned_distinctions() -> None:
+    """Verify version-specific CVSS calculations for v3.0 and v3.1 across Scope Changed (S:C)."""
+    # CVSS:3.0 Scope Changed with Low Privileges (PR:L) -> 9.9 CRITICAL
+    vec_30_pr_l = "CVSS:3.0/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H"
+    score_30_pr_l = calculate_cvss_v3_score(vec_30_pr_l)
+    assert score_30_pr_l == 9.9
+    assert cvss_score_to_severity(score_30_pr_l) == "CRITICAL"
+
+    # CVSS:3.1 Scope Changed with Low Privileges (PR:L) -> 9.9 CRITICAL
+    vec_31_pr_l = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H"
+    score_31_pr_l = calculate_cvss_v3_score(vec_31_pr_l)
+    assert score_31_pr_l == 9.9
+    assert cvss_score_to_severity(score_31_pr_l) == "CRITICAL"
+
+    # CVSS:3.0 Scope Changed with High Privileges (PR:H) -> 9.1 CRITICAL
+    vec_30_pr_h = "CVSS:3.0/AV:N/AC:L/PR:H/UI:N/S:C/C:H/I:H/A:H"
+    score_30_pr_h = calculate_cvss_v3_score(vec_30_pr_h)
+    assert score_30_pr_h == 9.1
+    assert cvss_score_to_severity(score_30_pr_h) == "CRITICAL"
+
+    # CVSS:3.1 Scope Changed with High Privileges (PR:H) -> 9.1 CRITICAL
+    vec_31_pr_h = "CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:C/C:H/I:H/A:H"
+    score_31_pr_h = calculate_cvss_v3_score(vec_31_pr_h)
+    assert score_31_pr_h == 9.1
+    assert cvss_score_to_severity(score_31_pr_h) == "CRITICAL"
+
+    # CVSS:3.0 Scope Unchanged with None Privileges and Required UI -> 8.8 HIGH
+    vec_30_pr_n = "CVSS:3.0/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H"
+    score_30_pr_n = calculate_cvss_v3_score(vec_30_pr_n)
+    assert score_30_pr_n == 8.8
+    assert cvss_score_to_severity(score_30_pr_n) == "HIGH"
+
+    # CVSS:3.1 Scope Unchanged with None Privileges and Required UI -> 8.8 HIGH
+    vec_31_pr_n = "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H"
+    score_31_pr_n = calculate_cvss_v3_score(vec_31_pr_n)
+    assert score_31_pr_n == 8.8
+    assert cvss_score_to_severity(score_31_pr_n) == "HIGH"
+
+
+def test_calculate_cvss_malformed_and_unsupported_vectors_rejected() -> None:
+    """Verify that unsupported versions, malformed syntax, and invalid metrics return None."""
+    # Unsupported CVSS 2.0
+    assert calculate_cvss_v3_score("CVSS:2.0/AV:N/AC:L/Au:N/C:C/I:C/A:C") is None
+
+    # Unsupported CVSS 4.0
+    assert (
+        calculate_cvss_v3_score("CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N")
+        is None
+    )
+
+    # Missing version prefix
+    assert calculate_cvss_v3_score("AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H") is None
+
+    # Invalid prefix
+    assert calculate_cvss_v3_score("INVALID:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H") is None
+
+    # Missing required metric (missing 'A')
+    assert calculate_cvss_v3_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H") is None
+
+    # Invalid metric key
+    assert calculate_cvss_v3_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/UNKNOWN:H") is None
+
+    # Invalid metric value (PR:X is invalid)
+    assert calculate_cvss_v3_score("CVSS:3.1/AV:N/AC:L/PR:X/UI:N/S:U/C:H/I:H/A:H") is None
+
+    # Duplicate metric key
+    assert calculate_cvss_v3_score("CVSS:3.1/AV:N/AC:L/PR:N/PR:L/UI:N/S:U/C:H/I:H/A:H") is None
+
+    # Malformed part with no colon
+    assert calculate_cvss_v3_score("CVSS:3.1/AV:N/NO_COLON/PR:N/UI:N/S:U/C:H/I:H/A:H") is None
+
+    # Non-string input
+    assert calculate_cvss_v3_score(None) is None  # type: ignore[arg-type]
+    assert calculate_cvss_v3_score(12345) is None  # type: ignore[arg-type]
+    assert calculate_cvss_v3_score("") is None
+
+
 def test_cvss_precedence_over_textual_ratings() -> None:
     # Scenario A: Textual rating says 'HIGH', but CVSS vector calculates to 9.1 (CRITICAL)
     # The higher authoritative CVSS score must NOT be overridden by a lower textual label

@@ -25,31 +25,81 @@ from typing import Any
 OSV_API_URL = "https://api.osv.dev/v1/vulns"
 
 
-def _cvss_roundup(input_val: float) -> float:
-    """Standard FIRST CVSS v3.1 roundup function."""
+def _cvss_v30_roundup(input_val: float) -> float:
+    """Standard FIRST CVSS v3.0 round up function."""
+    return math.ceil(round(input_val, 9) * 10) / 10.0
+
+
+def _cvss_v31_roundup(input_val: float) -> float:
+    """Standard FIRST CVSS v3.1 roundup function (Appendix A integer algorithm)."""
     int_input = round(input_val * 100000)
     if int_input % 10000 == 0:
         return int_input / 100000.0
     return (math.floor(int_input / 10000) + 1) / 10.0
 
 
+# Backward-compatible alias for existing callers
+_cvss_roundup = _cvss_v31_roundup
+
+
+# FIRST CVSS v3.0 Specification Privileges Required Base Metric Weights (Table 16)
+CVSS_V30_PR_WEIGHTS = {
+    "U": {"N": 0.85, "L": 0.62, "H": 0.27},
+    "C": {"N": 0.85, "L": 0.68, "H": 0.50},
+}
+
+# FIRST CVSS v3.1 Specification Privileges Required Base Metric Weights (Table 17)
+CVSS_V31_PR_WEIGHTS = {
+    "U": {"N": 0.85, "L": 0.62, "H": 0.27},
+    "C": {"N": 0.85, "L": 0.68, "H": 0.50},
+}
+
+CVSS_PR_WEIGHTS_BY_VERSION = {
+    "3.0": CVSS_V30_PR_WEIGHTS,
+    "3.1": CVSS_V31_PR_WEIGHTS,
+}
+
+
 def calculate_cvss_v3_score(vector: str) -> float | None:
     """Calculate the exact CVSS v3.0/v3.1 base score from a vector string.
 
-    Follows the official FIRST CVSS v3.1 specification equations.
-    Supports Scope Unchanged (S:U) and Scope Changed (S:C).
+    Parses the CVSS version from the vector prefix (CVSS:3.0 or CVSS:3.1).
+    Applies the exact FIRST specification weights for the corresponding version.
+    For Scope Changed (S:C) and Scope Unchanged (S:U), correctly applies
+    version-specific Privileges Required weights.
+    Rejects malformed, unsupported, or missing vector metrics.
     """
     if not isinstance(vector, str):
         return None
 
     clean = vector.strip()
-    for prefix in ("CVSS:3.1/", "CVSS:3.0/"):
-        if clean.startswith(prefix):
-            clean = clean[len(prefix) :]
-            break
+    version: str | None = None
+    if clean.startswith("CVSS:3.1/"):
+        version = "3.1"
+        clean = clean[len("CVSS:3.1/") :]
+    elif clean.startswith("CVSS:3.0/"):
+        version = "3.0"
+        clean = clean[len("CVSS:3.0/") :]
+    else:
+        # Unsupported CVSS version or missing standard prefix
+        return None
+
+    pr_version_weights = CVSS_PR_WEIGHTS_BY_VERSION.get(version)
+    if not pr_version_weights:
+        return None
 
     try:
-        metrics = dict(part.split(":", 1) for part in clean.split("/") if ":" in part)
+        parts = [p for p in clean.split("/") if p]
+        metrics: dict[str, str] = {}
+        for part in parts:
+            if ":" not in part:
+                return None
+            k, v = part.split(":", 1)
+            if k in metrics:
+                # Reject duplicate metric keys
+                return None
+            metrics[k] = v
+
         required = {"AV", "AC", "PR", "UI", "S", "C", "I", "A"}
         if not required.issubset(metrics.keys()):
             return None
@@ -59,16 +109,24 @@ def calculate_cvss_v3_score(vector: str) -> float | None:
         ui_map = {"N": 0.85, "R": 0.62}
         scope = metrics["S"]
 
-        if scope == "U":
-            pr_map = {"N": 0.85, "L": 0.62, "H": 0.27}
-        elif scope == "C":
-            pr_map = {"N": 0.85, "L": 0.68, "H": 0.50}
-        else:
+        if scope not in pr_version_weights:
             return None
+        pr_map = pr_version_weights[scope]
 
         c_map = {"H": 0.56, "L": 0.22, "N": 0.0}
         i_map = {"H": 0.56, "L": 0.22, "N": 0.0}
         a_map = {"H": 0.56, "L": 0.22, "N": 0.0}
+
+        if (
+            metrics["AV"] not in av_map
+            or metrics["AC"] not in ac_map
+            or metrics["PR"] not in pr_map
+            or metrics["UI"] not in ui_map
+            or metrics["C"] not in c_map
+            or metrics["I"] not in i_map
+            or metrics["A"] not in a_map
+        ):
+            return None
 
         av = av_map[metrics["AV"]]
         ac = ac_map[metrics["AC"]]
@@ -89,10 +147,12 @@ def calculate_cvss_v3_score(vector: str) -> float | None:
         if impact <= 0:
             return 0.0
 
+        roundup_fn = _cvss_v31_roundup if version == "3.1" else _cvss_v30_roundup
+
         if scope == "U":
-            return _cvss_roundup(min(impact + exploitability, 10.0))
+            return roundup_fn(min(impact + exploitability, 10.0))
         else:
-            return _cvss_roundup(min(1.08 * (impact + exploitability), 10.0))
+            return roundup_fn(min(1.08 * (impact + exploitability), 10.0))
     except Exception:
         return None
 

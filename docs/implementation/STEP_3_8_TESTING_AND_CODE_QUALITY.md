@@ -96,10 +96,10 @@ frontend/
 
 ### 3.3 Fail-Closed Python Security Scanner (`backend/scripts/security_audit.py`)
 - **Fail-Closed Execution**: If `pip-audit` cannot execute, crashes, returns empty stdout, outputs malformed non-JSON, or produces JSON missing the `dependencies` key, the scanner exits with code 1 immediately.
-- **Authoritative CVSS v3 Calculation**: Implements FIRST standard CVSS v3.0 / v3.1 mathematical formulas for both Scope Unchanged (S:U) and Scope Changed (S:C). Calculates exact base scores and qualitative ratings without relying on description keyword heuristics.
+- **Authoritative CVSS v3 Calculation**: Strictly parses CVSS version prefixes (`CVSS:3.0` vs. `CVSS:3.1`) and implements FIRST standard mathematical formulas for both Scope Unchanged (`S:U`) and Scope Changed (`S:C`). Resolves version-specific Privileges Required weights (`PR:L` and `PR:H` under `S:C`) and version-specific rounding semantics (`_cvss_v31_roundup` integer scaling vs. `_cvss_v30_roundup`). Rejects malformed and unsupported vectors (e.g. CVSS:2.0, CVSS:4.0, missing/duplicate metrics).
 - **Precedence Rule**: Authoritative numeric CVSS scores take precedence over lower textual ratings (e.g. CVSS 9.1 is classified as CRITICAL even if a source lists "HIGH"). Non-critical scores (e.g. CVSS 8.8) are accurately classified as HIGH and not artificially inflated.
 - **Fail-Safe Policy**: If reliable severity information is unavailable for an advisory (due to network timeout, missing source data, or unregistered advisory), the scanner marks it as unverified and fails safely (`exit_code = 1`) rather than reporting zero criticals.
-- **Scanner Unit Suite (`backend/tests/test_security_audit.py`)**: 10 unit tests verifying all failure modes, malformed inputs, critical detections, precedence rules, fail-safe rejections, and CVSS vector calculations (8.8, 9.1, 9.8, 9.9, 8.1, 7.2, 6.8).
+- **Scanner Unit Suite (`backend/tests/test_security_audit.py`)**: 12 unit tests verifying all failure modes, malformed inputs, critical detections, precedence rules, fail-safe rejections, and CVSS vector calculations (8.8, 9.1, 9.8, 9.9, 8.1, 7.2, 6.8 across v3.0 and v3.1).
 
 ### 3.4 Actual Load Testing with Locust (`backend/tests/load/locustfile.py`)
 - **Dual Performance Profiles**:
@@ -107,9 +107,11 @@ frontend/
   - `PlatformSustainedUser`: Realistic sustained enterprise multi-user profile (60 seconds, 30–50 users) exercising:
     - Deep readiness probes querying PostgreSQL pool checkout and Redis connectivity under concurrency.
     - Distributed Celery task dispatching (`POST /api/v1/tasks/system/ping`), Redis broker idempotency, and asynchronous result polling.
-    - Authentication perimeter workload exercising Argon2id password verification computation and Redis sliding-window rate limiting.
+    - Authentication perimeter workload exercising **real Argon2id password verification computation** and Redis sliding-window rate limiting.
     - Protected identity verification (`GET /api/v1/auth/me`).
     - OpenAPI 3.1 specification schema queries.
+- **Isolated Load-Test Account Provisioning**: Pre-provisions dedicated, isolated load-test worker accounts (`loadtest.worker@platform.local` and a deterministic worker pool) via standard public registration. Idempotent: HTTP 201 indicates initial registration and HTTP 409 indicates existing accounts on repeated runs, preventing uncontrolled duplicate accounts.
+- **Real Argon2id Verification Under Load**: Login tasks target existing provisioned accounts with an intentionally incorrect password. Because the account exists in PostgreSQL, the authentication service executes `verify_password()` (full Argon2id computation) before rejecting the credentials with HTTP 401. Under high concurrency, requests exceeding the sliding-window threshold exercise Redis rate limiting (HTTP 429), measuring real CPU crypto overhead and rate-limiting resilience without introducing backdoors.
 - **CI Execution & Reporting**: Runs in `.github/workflows/ci.yml` in headless mode against the live Docker stack. Generates HTML and CSV reports uploaded as CI artifacts with 14-day retention.
 - **Workflow Triggers**: Triggered automatically on push/PR (smoke load) and on a weekly Sunday schedule (02:00 UTC) or manually via `workflow_dispatch` with `run_sustained_load_test: true`.
 - **Performance Baselines and Limitations**:
@@ -137,12 +139,12 @@ frontend/
 | Tool | Scope | Status | Result |
 | :--- | :--- | :--- | :--- |
 | **Ruff Linter** | `app/`, `tests/`, `scripts/` | Passed | 0 issues across all files |
-| **Ruff Formatter** | `app/`, `tests/`, `scripts/` | Passed | 98 files already formatted |
+| **Ruff Formatter** | `app/`, `tests/`, `scripts/` | Passed | 100 files already formatted |
 | **Mypy Typechecker** | `app/` | Passed | Success: 0 issues in 65 source files |
-| **Pytest Unit Suite** | `tests/` | Passed | **322 passed**, 24 skipped (live services), 12 deselected |
+| **Pytest Unit Suite** | `tests/` | Passed | **330 passed**, 24 skipped (live services), 12 deselected |
 | **Code Coverage** | `app/` | Passed | **83.42% total coverage** (enforced $\ge 83\%$) |
 | **Dependency Audit** | `requirements.txt` | Passed | 0 critical vulnerabilities found (25 advisories evaluated) |
-| **Scanner Tests** | `tests/test_security_audit.py` | Passed | **10 passed in 3.84s** |
+| **Scanner Tests** | `tests/test_security_audit.py` | Passed | **12 passed in 3.82s** |
 
 ### 4.2 Explicit List of Skipped and Untested Areas
 - **Skipped in Offline / Standalone Runs**:
