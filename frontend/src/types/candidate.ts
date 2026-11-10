@@ -188,19 +188,41 @@ export interface CandidateApplicationSummary {
   id: string;
   job_id: string;
   tenant_id: string;
-  candidate_status: CandidateFacingStatus;
+  organization_name?: string | null;
+  job_title?: string | null;
+  job_department?: string | null;
+  job_location?: string | null;
+  remote_type?: string | null;
+  candidate_status: CandidateFacingStatus | string;
   applied_at: string;
-  job: JobPublicSummary;
+  withdrawn_at?: string | null;
+  withdrawal_reason?: string | null;
+  resume_id?: string | null;
+  resume_filename?: string | null;
   resume_version_applied?: number | null;
+  resume_snapshot_sha256?: string | null;
+  job?: JobPublicSummary;
 }
 
 export interface CandidateApplicationDetail extends CandidateApplicationSummary {
   cover_letter?: string | null;
+  answers?: Record<string, any> | null;
+  consent_records?: Record<string, any> | null;
   timeline: {
-    status: CandidateFacingStatus;
+    status: CandidateFacingStatus | string;
     changed_at: string;
     note?: string;
   }[];
+}
+
+export interface ApplicationSubmitResponse {
+  id: string;
+  job_id: string;
+  candidate_status: string;
+  resume_snapshot_sha256?: string;
+  resume_version_applied?: number;
+  message: string;
+  applied_at: string;
 }
 
 export interface CandidateNotification {

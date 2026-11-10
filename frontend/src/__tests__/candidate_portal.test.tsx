@@ -12,6 +12,9 @@ import CandidateResumesPage from "@/app/candidate/resumes/page";
 import CandidateJobsPage from "@/app/candidate/jobs/page";
 import CandidateJobDetailPage from "@/app/candidate/jobs/[id]/page";
 import CandidateSavedJobsPage from "@/app/candidate/saved-jobs/page";
+import CandidateApplicationsPage from "@/app/candidate/applications/page";
+import CandidateApplicationDetailPage from "@/app/candidate/applications/[id]/page";
+import { ApplicationSubmitModal } from "@/components/candidate/ApplicationSubmitModal";
 import { candidateApi } from "@/lib/candidateApi";
 
 // Mock next/navigation
@@ -423,7 +426,7 @@ describe("Candidate Portal Components", () => {
 
       expect(screen.getByText("Acme Corp")).toBeDefined();
       expect(screen.getByText("Nexus AI")).toBeDefined();
-      expect(screen.getByText("Applied")).toBeDefined();
+      expect(screen.getAllByText("Applied").length).toBeGreaterThanOrEqual(1);
     });
 
     it("allows toggling save/bookmark on a job", async () => {
@@ -615,6 +618,296 @@ describe("Candidate Portal Components", () => {
 
       await waitFor(() => {
         expect(unsaveSpy).toHaveBeenCalledWith("job-101");
+      });
+    });
+  });
+
+  describe("ApplicationSubmitModal", () => {
+    const mockJobDetail = {
+      id: "job-200",
+      tenant_id: "tenant-1",
+      organization_name: "Acme Cloud",
+      title: "Staff Site Reliability Engineer",
+      slug: "staff-sre",
+      department: "Infrastructure",
+      location: "San Francisco, CA",
+      remote_type: "remote",
+      employment_type: "full_time",
+      description: "Scale high-throughput kubernetes clusters.",
+      required_skills: ["Kubernetes", "Go", "Terraform"],
+      published_at: new Date().toISOString(),
+      created_at: new Date().toISOString(),
+    };
+
+    const mockResumes = [
+      {
+        id: "res-101",
+        file_name: "staff_sre_resume.pdf",
+        file_size_bytes: 120400,
+        mime_type: "application/pdf",
+        sha256_hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        version_number: 1,
+        is_default: true,
+        extracted_skills: ["Kubernetes", "Go"],
+        uploaded_at: new Date().toISOString(),
+      },
+    ];
+
+    it("guides candidate through multi-step application workflow and submits with consent", async () => {
+      vi.spyOn(candidateApi, "getResumes").mockResolvedValue(mockResumes);
+      const applySpy = vi.spyOn(candidateApi, "applyJob").mockResolvedValue({
+        id: "app-301",
+        job_id: "job-200",
+        candidate_status: "submitted",
+        resume_snapshot_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        resume_version_applied: 1,
+        message: "Application submitted successfully",
+        applied_at: new Date().toISOString(),
+      });
+
+      const handleClose = vi.fn();
+      const handleSuccess = vi.fn();
+
+      render(
+        <ApplicationSubmitModal
+          job={mockJobDetail}
+          onClose={handleClose}
+          onSuccess={handleSuccess}
+        />
+      );
+
+      // Step 1: Requisition Overview
+      expect(screen.getByText(/Staff Site Reliability Engineer/i)).toBeDefined();
+      expect(screen.getByText("Acme Cloud")).toBeDefined();
+
+      const continueBtn = screen.getByRole("button", { name: /Continue/i });
+      fireEvent.click(continueBtn);
+
+      // Step 2: Resume Selection
+      await waitFor(() => {
+        expect(screen.getByText("staff_sre_resume.pdf")).toBeDefined();
+      });
+      fireEvent.click(continueBtn);
+
+      // Step 3: Application Questionnaire
+      await waitFor(() => {
+        expect(screen.getByText("Application Questionnaire")).toBeDefined();
+      });
+      const coverLetterInput = screen.getByPlaceholderText(/Highlight your relevant experience/i);
+      fireEvent.change(coverLetterInput, {
+        target: { value: "Experienced SRE with 8+ years scaling production clusters." },
+      });
+      fireEvent.click(continueBtn);
+
+      // Step 4: Review & Legal Consents
+      await waitFor(() => {
+        expect(screen.getByText("Review & Confirm Submission")).toBeDefined();
+      });
+
+      // Check both checkboxes
+      const checkboxes = screen.getAllByRole("checkbox");
+      expect(checkboxes.length).toBe(2);
+      fireEvent.click(checkboxes[0]);
+      fireEvent.click(checkboxes[1]);
+
+      const submitBtn = screen.getByRole("button", { name: /Confirm & Submit Application/i });
+      fireEvent.click(submitBtn);
+
+      await waitFor(() => {
+        expect(applySpy).toHaveBeenCalledWith(
+          "job-200",
+          expect.objectContaining({
+            resume_id: "res-101",
+            cover_letter: "Experienced SRE with 8+ years scaling production clusters.",
+            answers: expect.objectContaining({
+              work_authorization: "authorized",
+            }),
+            consent_records: expect.objectContaining({
+              data_processing_consent: true,
+              accuracy_certified: true,
+            }),
+          })
+        );
+      });
+
+      await waitFor(() => {
+        expect(screen.getByText("Application Submitted Successfully!")).toBeDefined();
+      });
+      expect(handleSuccess).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("CandidateApplicationsPage", () => {
+    const mockApps = [
+      {
+        id: "app-1",
+        job_id: "job-101",
+        tenant_id: "tenant-1",
+        organization_name: "Acme Corp",
+        job_title: "Principal Cloud Architect",
+        job_department: "Engineering",
+        job_location: "San Francisco, CA",
+        remote_type: "remote",
+        candidate_status: "under_review",
+        applied_at: new Date().toISOString(),
+        resume_version_applied: 2,
+        resume_snapshot_sha256: "sha256_mock_hash",
+      },
+      {
+        id: "app-2",
+        job_id: "job-102",
+        tenant_id: "tenant-2",
+        organization_name: "Nexus AI",
+        job_title: "Senior AI Engineer",
+        job_department: "Research",
+        job_location: "New York, NY",
+        remote_type: "hybrid",
+        candidate_status: "withdrawn",
+        applied_at: new Date().toISOString(),
+        withdrawn_at: new Date().toISOString(),
+        withdrawal_reason: "Accepted another role",
+        resume_version_applied: 1,
+        resume_snapshot_sha256: "sha256_mock_hash_2",
+      },
+    ];
+
+    it("renders applications history with status badges and sealed evidence", async () => {
+      vi.spyOn(candidateApi, "getMyApplications").mockResolvedValue(mockApps);
+
+      render(<CandidateApplicationsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("Principal Cloud Architect")).toBeDefined();
+        expect(screen.getByText("Senior AI Engineer")).toBeDefined();
+      });
+
+      expect(screen.getByText("Acme Corp")).toBeDefined();
+      expect(screen.getByText("Nexus AI")).toBeDefined();
+      expect(screen.getByText("Resume v2")).toBeDefined();
+      expect(screen.getAllByText(/SHA-256 Sealed/i).length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("allows candidate to withdraw an eligible application with reason", async () => {
+      vi.spyOn(candidateApi, "getMyApplications").mockResolvedValue(mockApps);
+      const withdrawSpy = vi.spyOn(candidateApi, "withdrawApplication").mockResolvedValue({
+        ...mockApps[0],
+        candidate_status: "withdrawn",
+        withdrawn_at: new Date().toISOString(),
+        withdrawal_reason: "Personal circumstances",
+        timeline: [],
+      });
+
+      render(<CandidateApplicationsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("Principal Cloud Architect")).toBeDefined();
+      });
+
+      const withdrawBtn = screen.getByRole("button", { name: /^Withdraw$/i });
+      fireEvent.click(withdrawBtn);
+
+      await waitFor(() => {
+        expect(screen.getByText("Confirm Application Withdrawal")).toBeDefined();
+      });
+
+      const reasonInput = screen.getByPlaceholderText(/Accepted another/i);
+      fireEvent.change(reasonInput, { target: { value: "Personal circumstances" } });
+
+      const confirmBtn = screen.getByRole("button", { name: /Confirm Withdrawal/i });
+      fireEvent.click(confirmBtn);
+
+      await waitFor(() => {
+        expect(withdrawSpy).toHaveBeenCalledWith("app-1", "Personal circumstances");
+      });
+    });
+  });
+
+  describe("CandidateApplicationDetailPage", () => {
+    const mockAppDetail = {
+      id: "app-1",
+      job_id: "job-101",
+      tenant_id: "tenant-1",
+      organization_name: "Acme Corp",
+      job_title: "Principal Cloud Architect",
+      job_department: "Engineering",
+      job_location: "San Francisco, CA",
+      remote_type: "remote",
+      candidate_status: "under_review",
+      applied_at: new Date().toISOString(),
+      resume_version_applied: 2,
+      resume_filename: "principal_cloud_architect.pdf",
+      resume_snapshot_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      cover_letter: "Excited to apply for this leadership role.",
+      answers: {
+        work_authorization: "authorized",
+        visa_sponsorship_required: false,
+        earliest_start_date: "2 weeks notice",
+      },
+      consent_records: {
+        data_processing_consent: true,
+        accuracy_certified: true,
+      },
+      timeline: [
+        {
+          status: "submitted",
+          changed_at: new Date(Date.now() - 86400000).toISOString(),
+          note: "Application submitted and evidence sealed.",
+        },
+        {
+          status: "under_review",
+          changed_at: new Date().toISOString(),
+          note: "Application under hiring team review.",
+        },
+      ],
+    };
+
+    it("renders detailed application overview, timeline events, and questionnaire responses", async () => {
+      vi.spyOn(candidateApi, "getApplicationDetail").mockResolvedValue(mockAppDetail);
+
+      render(<CandidateApplicationDetailPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("Principal Cloud Architect")).toBeDefined();
+        expect(screen.getByText("Acme Corp")).toBeDefined();
+      });
+
+      expect(screen.getByText("Excited to apply for this leadership role.")).toBeDefined();
+      expect(screen.getByText("Application under hiring team review.")).toBeDefined();
+      expect(screen.getByText("principal_cloud_architect.pdf")).toBeDefined();
+      expect(screen.getByText("2 weeks notice")).toBeDefined();
+      expect(screen.getByText("SHA-256 Verified")).toBeDefined();
+    });
+
+    it("opens withdrawal dialog from detail view and updates candidate status", async () => {
+      vi.spyOn(candidateApi, "getApplicationDetail").mockResolvedValue(mockAppDetail);
+      const withdrawSpy = vi.spyOn(candidateApi, "withdrawApplication").mockResolvedValue({
+        ...mockAppDetail,
+        candidate_status: "withdrawn",
+        withdrawn_at: new Date().toISOString(),
+        withdrawal_reason: "Timing not aligned",
+      });
+
+      render(<CandidateApplicationDetailPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("Principal Cloud Architect")).toBeDefined();
+      });
+
+      const withdrawBtn = screen.getByRole("button", { name: /Withdraw Application/i });
+      fireEvent.click(withdrawBtn);
+
+      await waitFor(() => {
+        expect(screen.getByText(/Are you sure you wish to withdraw/i)).toBeDefined();
+      });
+
+      const reasonInput = screen.getByPlaceholderText(/Accepted another/i);
+      fireEvent.change(reasonInput, { target: { value: "Timing not aligned" } });
+
+      const confirmBtn = screen.getByRole("button", { name: /Confirm Withdrawal/i });
+      fireEvent.click(confirmBtn);
+
+      await waitFor(() => {
+        expect(withdrawSpy).toHaveBeenCalledWith("app-1", "Timing not aligned");
       });
     });
   });

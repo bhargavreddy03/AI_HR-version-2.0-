@@ -24,6 +24,7 @@ from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import UploadFile
 
 from app.core.database import get_db
@@ -560,6 +561,262 @@ async def test_withdraw_application_with_mandatory_reason() -> None:
     assert mock_app.candidate_status == CandidateFacingStatus.WITHDRAWN.value
     assert mock_app.withdrawal_reason == "Accepted another offer"
     mock_db.commit.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_to_job_with_answers_consents_and_idempotency() -> None:
+    """Verify application submission persists questionnaire answers, consents, and handles idempotency."""
+    candidate_id = uuid4()
+    job_id = uuid4()
+    resume_id = uuid4()
+    idempotency_key = "idemp_test_abc_123"
+    mock_db = AsyncMock()
+
+    mock_job = MagicMock(spec=Job)
+    mock_job.id = job_id
+    mock_job.status = JobStatus.PUBLISHED.value
+    mock_job.application_deadline = None
+
+    job_res = MagicMock()
+    job_res.first.return_value = (mock_job, "Acme AI Corp")
+
+    app_check_res = MagicMock()
+    app_check_res.scalar_one_or_none.return_value = None
+
+    mock_resume = MagicMock(spec=CandidateResume)
+    mock_resume.id = resume_id
+    mock_resume.user_id = candidate_id
+    mock_resume.version_number = 2
+    mock_resume.content_sha256 = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+
+    res_query = MagicMock()
+    res_query.scalar_one_or_none.return_value = mock_resume
+
+    mock_db.execute.side_effect = [job_res, app_check_res, res_query]
+
+    answers = {
+        "work_authorization": "authorized",
+        "visa_sponsorship_required": False,
+        "earliest_start_date": "2026-12-01",
+    }
+    consents = {
+        "data_processing_consent": True,
+        "accuracy_certified": True,
+        "consented_at": datetime.now(UTC).isoformat(),
+    }
+
+    res = await job_service.apply_to_job(
+        mock_db,
+        candidate_user_id=candidate_id,
+        job_id=job_id,
+        resume_id=resume_id,
+        cover_letter="I am very excited about scaling your platform.",
+        answers=answers,
+        consent_records=consents,
+        idempotency_key=idempotency_key,
+    )
+
+    assert res.candidate_status == CandidateFacingStatus.SUBMITTED.value
+    assert res.resume_version_applied == 2
+    assert res.resume_snapshot_sha256 == mock_resume.content_sha256
+    mock_db.commit.assert_awaited()
+
+    # Now verify idempotent retry returns existing submission
+    mock_app = MagicMock(spec=JobApplication)
+    mock_app.id = res.id
+    mock_app.candidate_status = CandidateFacingStatus.SUBMITTED.value
+    mock_app.resume_snapshot_sha256 = mock_resume.content_sha256
+    mock_app.resume_version_applied = 2
+    mock_app.idempotency_key = idempotency_key
+    mock_app.applied_at = datetime.now(UTC)
+
+    job_res_2 = MagicMock()
+    job_res_2.first.return_value = (mock_job, "Acme AI Corp")
+
+    app_check_res_2 = MagicMock()
+    app_check_res_2.scalar_one_or_none.return_value = mock_app
+
+    mock_db.execute.side_effect = [job_res_2, app_check_res_2]
+
+    res_retry = await job_service.apply_to_job(
+        mock_db,
+        candidate_user_id=candidate_id,
+        job_id=job_id,
+        idempotency_key=idempotency_key,
+    )
+
+    assert res_retry.id == res.id
+    assert "idempotent" in res_retry.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_apply_to_job_blocked_for_closed_and_expired_jobs() -> None:
+    """Verify application is rejected if job is not published or past deadline."""
+    candidate_id = uuid4()
+    job_id = uuid4()
+    mock_db = AsyncMock()
+
+    # 1. Closed job
+    mock_job_closed = MagicMock(spec=Job)
+    mock_job_closed.id = job_id
+    mock_job_closed.status = JobStatus.CLOSED.value
+    mock_job_closed.application_deadline = None
+
+    job_res_closed = MagicMock()
+    job_res_closed.first.return_value = (mock_job_closed, "Acme")
+    mock_db.execute.side_effect = [job_res_closed]
+
+    with pytest.raises(ValidationException) as exc_info:
+        await job_service.apply_to_job(mock_db, candidate_id, job_id)
+    assert exc_info.value.code == "JOB_NOT_ACCEPTING_APPLICATIONS"
+
+    # 2. Expired deadline job
+    mock_job_expired = MagicMock(spec=Job)
+    mock_job_expired.id = job_id
+    mock_job_expired.status = JobStatus.PUBLISHED.value
+    mock_job_expired.application_deadline = datetime(2020, 1, 1, tzinfo=UTC)
+
+    job_res_expired = MagicMock()
+    job_res_expired.first.return_value = (mock_job_expired, "Acme")
+    mock_db.execute.side_effect = [job_res_expired]
+
+    with pytest.raises(ValidationException) as exc_info:
+        await job_service.apply_to_job(mock_db, candidate_id, job_id)
+    assert exc_info.value.code == "DEADLINE_PASSED"
+
+
+@pytest.mark.asyncio
+async def test_apply_to_job_invalid_resume_ownership() -> None:
+    """Verify candidate cannot apply using a resume that does not belong to them (IDOR)."""
+    attacker_candidate_id = uuid4()
+    job_id = uuid4()
+    foreign_resume_id = uuid4()
+    mock_db = AsyncMock()
+
+    mock_job = MagicMock(spec=Job)
+    mock_job.id = job_id
+    mock_job.status = JobStatus.PUBLISHED.value
+    mock_job.application_deadline = None
+
+    job_res = MagicMock()
+    job_res.first.return_value = (mock_job, "Acme")
+
+    app_check_res = MagicMock()
+    app_check_res.scalar_one_or_none.return_value = None
+
+    # Resume query returns None because foreign_resume_id does not belong to attacker
+    res_query = MagicMock()
+    res_query.scalar_one_or_none.return_value = None
+
+    mock_db.execute.side_effect = [job_res, app_check_res, res_query]
+
+    with pytest.raises(EntityNotFoundException):
+        await job_service.apply_to_job(
+            mock_db,
+            candidate_user_id=attacker_candidate_id,
+            job_id=job_id,
+            resume_id=foreign_resume_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_apply_to_job_withdrawn_reapplication_restriction() -> None:
+    """Verify that a candidate cannot re-apply to a position they have withdrawn, preserving record."""
+    candidate_id = uuid4()
+    job_id = uuid4()
+    mock_db = AsyncMock()
+
+    mock_job = MagicMock(spec=Job)
+    mock_job.id = job_id
+    mock_job.status = JobStatus.PUBLISHED.value
+    mock_job.application_deadline = None
+
+    job_res = MagicMock()
+    job_res.first.return_value = (mock_job, "Acme")
+
+    mock_app = MagicMock(spec=JobApplication)
+    mock_app.candidate_status = CandidateFacingStatus.WITHDRAWN.value
+
+    app_check_res = MagicMock()
+    app_check_res.scalar_one_or_none.return_value = mock_app
+
+    mock_db.execute.side_effect = [job_res, app_check_res]
+
+    with pytest.raises(ValidationException) as exc_info:
+        await job_service.apply_to_job(mock_db, candidate_id, job_id)
+    assert exc_info.value.code == "ERR_APPLICATION_WITHDRAWN"
+
+
+@pytest.mark.asyncio
+async def test_apply_to_job_concurrency_integrity_error() -> None:
+    """Verify that database unique constraint conflicts (race condition) are cleanly handled."""
+    candidate_id = uuid4()
+    job_id = uuid4()
+    resume_id = uuid4()
+    mock_db = AsyncMock()
+
+    mock_job = MagicMock(spec=Job)
+    mock_job.id = job_id
+    mock_job.status = JobStatus.PUBLISHED.value
+    mock_job.application_deadline = None
+
+    job_res = MagicMock()
+    job_res.first.return_value = (mock_job, "Acme")
+
+    app_check_res = MagicMock()
+    app_check_res.scalar_one_or_none.return_value = None
+
+    mock_resume = MagicMock(spec=CandidateResume)
+    mock_resume.id = resume_id
+    mock_resume.user_id = candidate_id
+    mock_resume.version_number = 1
+    mock_resume.content_sha256 = "sha256_mock"
+
+    res_query = MagicMock()
+    res_query.scalar_one_or_none.return_value = mock_resume
+
+    mock_db.execute.side_effect = [job_res, app_check_res, res_query]
+    mock_db.commit.side_effect = IntegrityError("Unique violation", params=None, orig=Exception())
+
+    with pytest.raises(ValidationException) as exc_info:
+        await job_service.apply_to_job(mock_db, candidate_id, job_id, resume_id=resume_id)
+
+    assert exc_info.value.code == "ERR_DUPLICATE_APPLICATION"
+    mock_db.rollback.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_application_withdrawal_restrictions() -> None:
+    """Verify that applications already in terminal state or offer stage cannot be withdrawn."""
+    candidate_id = uuid4()
+    app_id = uuid4()
+    mock_db = AsyncMock()
+
+    # 1. Already concluded / not selected
+    mock_app_rejected = MagicMock(spec=JobApplication)
+    mock_app_rejected.id = app_id
+    mock_app_rejected.candidate_status = CandidateFacingStatus.NOT_SELECTED.value
+
+    app_res = MagicMock()
+    app_res.scalar_one_or_none.return_value = mock_app_rejected
+    mock_db.execute.side_effect = [app_res]
+
+    with pytest.raises(ValidationException) as exc_info:
+        await job_service.withdraw_application(mock_db, candidate_id, app_id, reason="Changed mind")
+    assert exc_info.value.code == "CANNOT_WITHDRAW_TERMINAL"
+
+    # 2. In offer stage
+    mock_app_offer = MagicMock(spec=JobApplication)
+    mock_app_offer.id = app_id
+    mock_app_offer.candidate_status = CandidateFacingStatus.OFFER_STAGE.value
+
+    app_res_2 = MagicMock()
+    app_res_2.scalar_one_or_none.return_value = mock_app_offer
+    mock_db.execute.side_effect = [app_res_2]
+
+    with pytest.raises(ValidationException) as exc_info:
+        await job_service.withdraw_application(mock_db, candidate_id, app_id, reason="Changed mind")
+    assert exc_info.value.code == "CANNOT_WITHDRAW_OFFER"
 
 
 # =============================================================================

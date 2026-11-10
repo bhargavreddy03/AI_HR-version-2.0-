@@ -123,7 +123,9 @@ class JobApplication(Base, TenantScopedMixin, TimestampMixin):
         ForeignKey("candidate_resumes.id", ondelete="SET NULL"),
         nullable=True,
     )
+    resume_version_applied: Mapped[int | None] = mapped_column(Integer, nullable=True)
     resume_snapshot_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     status: Mapped[str] = mapped_column(
         String(50), nullable=False, default="submitted", index=True
     )  # Internal ATS status
@@ -134,6 +136,10 @@ class JobApplication(Base, TenantScopedMixin, TimestampMixin):
         index=True,
     )  # Candidate portal facing status
     cover_letter: Mapped[str | None] = mapped_column(Text, nullable=True)
+    answers: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=dict)
+    consent_records: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=dict)
+    timeline: Mapped[list[dict]] = mapped_column(JSONB, nullable=False, default=list)
+    audit_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=dict)
     applied_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=utc_now
     )

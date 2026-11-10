@@ -15,6 +15,7 @@ import type {
   SavedJobItem,
   CandidateApplicationSummary,
   CandidateApplicationDetail,
+  ApplicationSubmitResponse,
   CandidateNotification,
 } from "@/types/candidate";
 
@@ -251,8 +252,17 @@ export const candidateApi = {
     }),
 
   // Applications
-  applyJob: (jobId: string, data: { resume_id?: string; cover_letter?: string }) =>
-    fetchWithAuth<CandidateApplicationSummary>(`/jobs/${jobId}/apply`, {
+  applyJob: (
+    jobId: string,
+    data: {
+      resume_id?: string;
+      cover_letter?: string;
+      answers?: Record<string, any>;
+      consent_records?: Record<string, any>;
+      idempotency_key?: string;
+    }
+  ) =>
+    fetchWithAuth<ApplicationSubmitResponse>(`/jobs/${jobId}/apply`, {
       method: "POST",
       body: JSON.stringify(data),
     }),
@@ -260,9 +270,9 @@ export const candidateApi = {
   getApplicationDetail: (applicationId: string) =>
     fetchWithAuth<CandidateApplicationDetail>(`/jobs/applications/me/${applicationId}`),
   withdrawApplication: (applicationId: string, withdrawal_reason: string) =>
-    fetchWithAuth<CandidateApplicationSummary>(`/jobs/applications/me/${applicationId}/withdraw`, {
+    fetchWithAuth<CandidateApplicationDetail>(`/jobs/applications/me/${applicationId}/withdraw`, {
       method: "POST",
-      body: JSON.stringify({ withdrawal_reason }),
+      body: JSON.stringify({ withdrawal_reason, reason: withdrawal_reason }),
     }),
 
   // Notifications

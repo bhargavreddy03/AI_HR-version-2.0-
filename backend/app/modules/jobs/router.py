@@ -152,6 +152,42 @@ async def list_my_applications(
 
 
 @job_router.get(
+    "/applications/me/{application_id}",
+    response_model=JobApplicationRead,
+    summary="Retrieve application detail for candidate",
+)
+async def get_my_application(
+    application_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+) -> JobApplicationRead:
+    return await job_service.get_candidate_application(db, sec.user_id, application_id)
+
+
+@job_router.post(
+    "/applications/me/{application_id}/withdraw",
+    response_model=JobApplicationRead,
+    summary="Withdraw candidate application with reason",
+)
+async def withdraw_my_application(
+    application_id: UUID,
+    payload: JobApplyRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    request: Request = None,  # type: ignore
+) -> JobApplicationRead:
+    # Accept withdrawal reason from JSON body
+    reason = "Candidate withdrew application"
+    if request:
+        try:
+            body = await request.json()
+            reason = body.get("withdrawal_reason") or body.get("reason") or reason
+        except Exception:
+            pass
+    return await job_service.withdraw_application(db, sec.user_id, application_id, reason)
+
+
+@job_router.get(
     "/{job_id}",
     response_model=JobRead,
     summary="Retrieve detailed published job requisition",
@@ -177,11 +213,14 @@ async def apply_to_job(
     db: AsyncSession = Depends(get_db),
     sec: SecurityContext = Depends(require_authenticated_user),
 ) -> ApplicationSubmitResponse:
-    """Submit application attaching selected resume version and optional cover letter."""
+    """Submit application attaching selected resume version, answers, consent, and optional cover letter."""
     return await job_service.apply_to_job(
         db=db,
         candidate_user_id=sec.user_id,
         job_id=job_id,
         resume_id=payload.resume_id,
         cover_letter=payload.cover_letter,
+        answers=payload.answers,
+        consent_records=payload.consent_records,
+        idempotency_key=payload.idempotency_key,
     )

@@ -20,6 +20,7 @@ import {
   ExternalLink,
 } from "lucide-react";
 import { candidateApi } from "@/lib/candidateApi";
+import { ApplicationSubmitModal } from "@/components/candidate/ApplicationSubmitModal";
 import type { JobDetail } from "@/types/candidate";
 
 export default function CandidateJobDetailPage() {
@@ -33,6 +34,7 @@ export default function CandidateJobDetailPage() {
   const [isSaved, setIsSaved] = useState(false);
   const [savingAction, setSavingAction] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [showApplyModal, setShowApplyModal] = useState(false);
 
   useEffect(() => {
     if (!jobId) return;
@@ -261,10 +263,7 @@ export default function CandidateJobDetailPage() {
               ) : (
                 <button
                   type="button"
-                  onClick={() => {
-                    // Navigate to Find Jobs with modal trigger or preserve seamless apply
-                    router.push(`/candidate/jobs?apply_job=${job.id}`);
-                  }}
+                  onClick={() => setShowApplyModal(true)}
                   className="px-6 py-2.5 bg-primary-600 hover:bg-primary-700 text-white text-xs font-semibold rounded-xl shadow-sm transition-colors"
                 >
                   Apply for Position
@@ -420,6 +419,17 @@ export default function CandidateJobDetailPage() {
           </div>
         </div>
       </div>
+
+      {/* Application Submission Stepper Modal */}
+      {showApplyModal && (
+        <ApplicationSubmitModal
+          job={job}
+          onClose={() => setShowApplyModal(false)}
+          onSuccess={() => {
+            setJob((prev) => (prev ? { ...prev, has_applied: true } : null));
+          }}
+        />
+      )}
     </div>
   );
 }

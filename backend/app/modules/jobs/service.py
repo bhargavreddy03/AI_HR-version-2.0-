@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy import String, delete, desc, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.base import generate_uuid7, utc_now
@@ -423,8 +424,12 @@ class JobService:
         job_id: UUID,
         resume_id: UUID | None = None,
         cover_letter: str | None = None,
+        answers: dict | None = None,
+        consent_records: dict | None = None,
+        idempotency_key: str | None = None,
+        audit_metadata: dict | None = None,
     ) -> ApplicationSubmitResponse:
-        """Submit candidate application with resume version snapshotting and duplicate prevention."""
+        """Submit candidate application with resume version snapshotting, consent, and duplicate protection."""
         # 1. Verify Job existence and active status
         job_stmt = (
             select(Job, Organization.name.label("org_name"))
@@ -447,7 +452,7 @@ class JobService:
                 "The application deadline for this position has passed", code="DEADLINE_PASSED"
             )
 
-        # 2. Prevent Duplicate Active Applications
+        # 2. Prevent Duplicate Active Applications & Check Idempotency
         app_check = await db.execute(
             select(JobApplication).where(
                 JobApplication.candidate_id == candidate_user_id,
@@ -456,14 +461,25 @@ class JobService:
         )
         existing_app = app_check.scalar_one_or_none()
         if existing_app:
-            if existing_app.candidate_status != CandidateFacingStatus.WITHDRAWN.value:
-                raise ValidationException(
-                    "You have already applied for this position",
-                    code="ERR_DUPLICATE_APPLICATION",
+            if idempotency_key and getattr(existing_app, "idempotency_key", None) == idempotency_key:
+                return ApplicationSubmitResponse(
+                    id=existing_app.id,
+                    job_id=job.id,
+                    candidate_status=existing_app.candidate_status,
+                    resume_snapshot_sha256=existing_app.resume_snapshot_sha256,
+                    resume_version_applied=getattr(existing_app, "resume_version_applied", 1),
+                    message="Application previously submitted (idempotent response)",
+                    applied_at=existing_app.applied_at,
                 )
-            # If previously withdrawn, delete old application or reuse
-            await db.delete(existing_app)
-            await db.flush()
+            if existing_app.candidate_status == CandidateFacingStatus.WITHDRAWN.value:
+                raise ValidationException(
+                    "You have previously withdrawn your application for this position. Re-application is not permitted.",
+                    code="ERR_APPLICATION_WITHDRAWN",
+                )
+            raise ValidationException(
+                "You have already applied for this position",
+                code="ERR_DUPLICATE_APPLICATION",
+            )
 
         # 3. Resolve Resume & Snapshot Hash
         target_resume: CandidateResume | None = None
@@ -505,16 +521,37 @@ class JobService:
         now = utc_now()
         app_id = generate_uuid7()
 
+        initial_timeline = [
+            {
+                "status": CandidateFacingStatus.SUBMITTED.value,
+                "changed_at": now.isoformat(),
+                "note": "Application received and cryptographic resume snapshot recorded.",
+            }
+        ]
+
+        target_version = getattr(target_resume, "version_number", 1) or 1
+        target_sha256 = getattr(
+            target_resume,
+            "content_sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+
         application = JobApplication(
             id=app_id,
             job_id=job.id,
             candidate_id=candidate_user_id,
             tenant_id=job.tenant_id,
             resume_id=target_resume.id,
-            resume_snapshot_sha256=target_resume.content_sha256,
+            resume_version_applied=target_version,
+            resume_snapshot_sha256=target_sha256,
+            idempotency_key=idempotency_key,
             status="submitted",
             candidate_status=CandidateFacingStatus.SUBMITTED.value,
             cover_letter=cover_letter.strip() if cover_letter else None,
+            answers=answers or {},
+            consent_records=consent_records or {},
+            timeline=initial_timeline,
+            audit_metadata=audit_metadata or {},
             applied_at=now,
         )
         db.add(application)
@@ -531,12 +568,21 @@ class JobService:
         )
         db.add(notif)
 
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError as exc:
+            await db.rollback()
+            raise ValidationException(
+                "You have already applied for this position",
+                code="ERR_DUPLICATE_APPLICATION",
+            ) from exc
 
         return ApplicationSubmitResponse(
             id=app_id,
             job_id=job.id,
             candidate_status=CandidateFacingStatus.SUBMITTED.value,
+            resume_snapshot_sha256=target_sha256,
+            resume_version_applied=target_version,
             message="Application submitted successfully",
             applied_at=now,
         )
@@ -566,6 +612,15 @@ class JobService:
         )
         rows = (await db.execute(stmt)).all()
 
+        def _safe_dict(v: Any) -> dict | None:
+            return v if isinstance(v, dict) else None
+
+        def _safe_list(v: Any) -> list:
+            return v if isinstance(v, list) else []
+
+        def _safe_int(v: Any, default: int = 1) -> int:
+            return v if isinstance(v, int) else default
+
         results: list[JobApplicationRead] = []
         for app, j_title, j_dept, j_loc, j_remote, org_name, resume_fn in rows:
             results.append(
@@ -581,13 +636,17 @@ class JobService:
                     remote_type=j_remote,
                     resume_id=app.resume_id,
                     resume_filename=resume_fn,
-                    resume_snapshot_sha256=app.resume_snapshot_sha256,
-                    status=app.status,
-                    candidate_status=app.candidate_status,
-                    cover_letter=app.cover_letter,
+                    resume_version_applied=_safe_int(getattr(app, "resume_version_applied", 1)),
+                    resume_snapshot_sha256=str(getattr(app, "resume_snapshot_sha256", "")),
+                    status=str(getattr(app, "status", "submitted")),
+                    candidate_status=str(getattr(app, "candidate_status", "submitted")),
+                    cover_letter=getattr(app, "cover_letter", None),
+                    answers=_safe_dict(getattr(app, "answers", None)),
+                    consent_records=_safe_dict(getattr(app, "consent_records", None)),
+                    timeline=_safe_list(getattr(app, "timeline", None)),
                     applied_at=app.applied_at,
-                    withdrawn_at=app.withdrawn_at,
-                    withdrawal_reason=app.withdrawal_reason,
+                    withdrawn_at=getattr(app, "withdrawn_at", None),
+                    withdrawal_reason=getattr(app, "withdrawal_reason", None),
                 )
             )
         return results
@@ -596,6 +655,15 @@ class JobService:
         self, db: AsyncSession, candidate_user_id: UUID, application_id: UUID
     ) -> JobApplicationRead:
         """Retrieve application details with IDOR validation."""
+        def _safe_dict(v: Any) -> dict | None:
+            return v if isinstance(v, dict) else None
+
+        def _safe_list(v: Any) -> list:
+            return v if isinstance(v, list) else []
+
+        def _safe_int(v: Any, default: int = 1) -> int:
+            return v if isinstance(v, int) else default
+
         stmt = (
             select(
                 JobApplication,
@@ -631,19 +699,28 @@ class JobService:
             remote_type=j_remote,
             resume_id=app.resume_id,
             resume_filename=resume_fn,
-            resume_snapshot_sha256=app.resume_snapshot_sha256,
-            status=app.status,
-            candidate_status=app.candidate_status,
-            cover_letter=app.cover_letter,
+            resume_version_applied=_safe_int(getattr(app, "resume_version_applied", 1)),
+            resume_snapshot_sha256=str(getattr(app, "resume_snapshot_sha256", "")),
+            status=str(getattr(app, "status", "submitted")),
+            candidate_status=str(getattr(app, "candidate_status", "submitted")),
+            cover_letter=getattr(app, "cover_letter", None),
+            answers=_safe_dict(getattr(app, "answers", None)),
+            consent_records=_safe_dict(getattr(app, "consent_records", None)),
+            timeline=_safe_list(getattr(app, "timeline", None)),
             applied_at=app.applied_at,
-            withdrawn_at=app.withdrawn_at,
-            withdrawal_reason=app.withdrawal_reason,
+            withdrawn_at=getattr(app, "withdrawn_at", None),
+            withdrawal_reason=getattr(app, "withdrawal_reason", None),
         )
 
     async def withdraw_application(
         self, db: AsyncSession, candidate_user_id: UUID, application_id: UUID, reason: str
     ) -> JobApplicationRead:
         """Withdraw candidate application with reason and audit notification."""
+        if not reason or not reason.strip():
+            raise ValidationException(
+                "A valid reason for withdrawal is mandatory", code="ERR_REASON_REQUIRED"
+            )
+
         stmt = select(JobApplication).where(
             JobApplication.id == application_id,
             JobApplication.candidate_id == candidate_user_id,
@@ -658,10 +735,33 @@ class JobService:
                 "This application has already been withdrawn", code="ALREADY_WITHDRAWN"
             )
 
+        if app.candidate_status in (CandidateFacingStatus.NOT_SELECTED.value, "rejected"):
+            raise ValidationException(
+                "Cannot withdraw an application that has already concluded",
+                code="CANNOT_WITHDRAW_TERMINAL",
+            )
+
+        if app.candidate_status in (CandidateFacingStatus.OFFER_STAGE.value, "offer"):
+            raise ValidationException(
+                "An offer has already been extended for this position. Please contact your hiring recruiter directly.",
+                code="CANNOT_WITHDRAW_OFFER",
+            )
+
+        now = utc_now()
         app.candidate_status = CandidateFacingStatus.WITHDRAWN.value
         app.status = "withdrawn"
-        app.withdrawn_at = utc_now()
+        app.withdrawn_at = now
         app.withdrawal_reason = reason.strip()
+
+        # Update candidate-facing timeline
+        timeline_entry = {
+            "status": CandidateFacingStatus.WITHDRAWN.value,
+            "changed_at": now.isoformat(),
+            "note": f"Candidate withdrew application: {reason.strip()}",
+        }
+        current_timeline = list(getattr(app, "timeline", []) or [])
+        current_timeline.append(timeline_entry)
+        app.timeline = current_timeline
 
         # Add candidate notification
         notif = CandidateNotification(

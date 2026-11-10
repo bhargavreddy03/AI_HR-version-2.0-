@@ -6,6 +6,7 @@ Conforms to Step 4.1 candidate experience and application workflow specification
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -82,10 +83,19 @@ class JobApplyRequest(BaseModel):
         None, description="Optional specific candidate resume ID; defaults to active default resume"
     )
     cover_letter: str | None = Field(None, max_length=5000)
+    answers: dict[str, Any] | None = Field(
+        default_factory=dict, description="Candidate-provided questionnaire answers"
+    )
+    consent_records: dict[str, Any] | None = Field(
+        default_factory=dict, description="Candidate consent acknowledgments"
+    )
+    idempotency_key: str | None = Field(
+        None, max_length=64, description="Client idempotency key for safe retries"
+    )
 
 
 class JobApplicationRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, arbitrary_types_allowed=True)
 
     id: UUID
     job_id: UUID
@@ -98,10 +108,14 @@ class JobApplicationRead(BaseModel):
     remote_type: str | None = None
     resume_id: UUID | None = None
     resume_filename: str | None = None
+    resume_version_applied: Any = None
     resume_snapshot_sha256: str
     status: str
     candidate_status: str
     cover_letter: str | None = None
+    answers: Any = None
+    consent_records: Any = None
+    timeline: Any = Field(default_factory=list)
     applied_at: datetime
     withdrawn_at: datetime | None = None
     withdrawal_reason: str | None = None
@@ -114,8 +128,12 @@ class ApplicationWithdrawRequest(BaseModel):
 
 
 class ApplicationSubmitResponse(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     id: UUID
     job_id: UUID
     candidate_status: str
+    resume_snapshot_sha256: Any = None
+    resume_version_applied: Any = None
     message: str = "Application submitted successfully"
     applied_at: datetime

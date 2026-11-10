@@ -22,8 +22,10 @@ import {
   ExternalLink,
 } from "lucide-react";
 import { candidateApi } from "@/lib/candidateApi";
+import { ApplicationSubmitModal } from "@/components/candidate/ApplicationSubmitModal";
 import type {
   JobPublicSummary,
+  JobDetail,
   JobListResponse,
 } from "@/types/candidate";
 
@@ -54,6 +56,7 @@ export default function CandidateJobsPage() {
 
   // Filter drawer toggle for mobile/desktop
   const [showFilters, setShowFilters] = useState(false);
+  const [applyingJob, setApplyingJob] = useState<JobDetail | null>(null);
 
   const fetchJobs = useCallback(async (currentPage: number = page) => {
     try {
@@ -580,12 +583,42 @@ export default function CandidateJobsPage() {
                     )}
                   </div>
 
-                  <Link
-                    href={`/candidate/jobs/${job.id}`}
-                    className="px-3.5 py-1.5 bg-primary-600 hover:bg-primary-700 text-white text-xs font-semibold rounded-lg shadow-sm transition-colors inline-flex items-center gap-1"
-                  >
-                    View Details
-                  </Link>
+                  <div className="flex items-center gap-2">
+                    <Link
+                      href={`/candidate/jobs/${job.id}`}
+                      className="px-3 py-1.5 border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 text-xs font-semibold rounded-lg shadow-sm transition-colors"
+                    >
+                      Details
+                    </Link>
+
+                    {job.has_applied ? (
+                      <Link
+                        href="/candidate/applications"
+                        className="px-3 py-1.5 bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800 text-xs font-semibold rounded-lg inline-flex items-center gap-1"
+                      >
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        <span>Applied</span>
+                      </Link>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          try {
+                            const detail = await candidateApi.getJob(job.id);
+                            setApplyingJob(detail);
+                          } catch {
+                            setApplyingJob({
+                              ...job,
+                              description: "Role responsibilities and requirements.",
+                            } as JobDetail);
+                          }
+                        }}
+                        className="px-3.5 py-1.5 bg-primary-600 hover:bg-primary-700 text-white text-xs font-semibold rounded-lg shadow-sm transition-colors inline-flex items-center gap-1"
+                      >
+                        <span>Apply</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             );
@@ -623,6 +656,19 @@ export default function CandidateJobsPage() {
             </button>
           </div>
         </div>
+      )}
+
+      {/* Application Submit Stepper Modal */}
+      {applyingJob && (
+        <ApplicationSubmitModal
+          job={applyingJob}
+          onClose={() => setApplyingJob(null)}
+          onSuccess={() => {
+            setJobs((prev) =>
+              prev.map((j) => (j.id === applyingJob.id ? { ...j, has_applied: true } : j))
+            );
+          }}
+        />
       )}
     </div>
   );
