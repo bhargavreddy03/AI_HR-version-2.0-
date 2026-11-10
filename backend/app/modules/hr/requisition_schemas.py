@@ -168,6 +168,9 @@ class JobRequisitionRead(BaseModel):
     hiring_manager_email: str | None = None
     applications_count: int = 0
     published_at: datetime | None = None
+    closed_at: datetime | None = None
+    reopened_at: datetime | None = None
+    change_request_reason: str | None = None
     application_deadline: datetime | None = None
     created_at: datetime
     updated_at: datetime

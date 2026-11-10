@@ -19,6 +19,13 @@ from app.core.security import SecurityContext
 from app.modules.auth.dependencies import (
     require_authenticated_user,
 )
+from app.modules.hr.lifecycle_schemas import (
+    JobLifecycleActionRequest,
+    JobLifecycleHistoryItem,
+    JobLifecyclePermittedActionsResponse,
+    JobLifecycleTransitionResponse,
+)
+from app.modules.hr.lifecycle_service import hr_job_lifecycle_service
 from app.modules.hr.requisition_schemas import (
     CanonicalSkillSuggestion,
     JobRequisitionCreate,
@@ -257,3 +264,70 @@ async def delete_requisition(
     if not deleted:
         raise EntityNotFoundException("JobRequisition", job_id)
     return Response(status_code=204)
+
+
+# ------------------------------------------------------------------------------
+# Job Publication & Lifecycle Endpoints (Step 4.2.4)
+# ------------------------------------------------------------------------------
+
+
+@hr_router.post(
+    "/jobs/{job_id}/lifecycle",
+    response_model=JobLifecycleTransitionResponse,
+    summary="Execute a job requisition lifecycle state transition action",
+)
+async def execute_job_lifecycle_action(
+    job_id: UUID,
+    request: JobLifecycleActionRequest,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> JobLifecycleTransitionResponse:
+    """Execute FSM state transition (submit, approve, request changes, publish, pause, reopen, close, archive)."""
+    return await hr_job_lifecycle_service.execute_transition(
+        db=db,
+        tenant_id=tenant_id,
+        job_id=job_id,
+        user_id=sec.user_id,
+        user_roles=sec.roles,
+        request=request,
+        is_super_admin=sec.is_super_admin,
+    )
+
+
+@hr_router.get(
+    "/jobs/{job_id}/lifecycle/history",
+    response_model=list[JobLifecycleHistoryItem],
+    summary="Retrieve immutable lifecycle audit history for a job requisition",
+)
+async def get_job_lifecycle_history(
+    job_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> list[JobLifecycleHistoryItem]:
+    """Retrieve immutable chronological audit trail of all lifecycle state transitions."""
+    return await hr_job_lifecycle_service.get_history(
+        db=db, tenant_id=tenant_id, job_id=job_id
+    )
+
+
+@hr_router.get(
+    "/jobs/{job_id}/lifecycle/permitted-actions",
+    response_model=JobLifecyclePermittedActionsResponse,
+    summary="Evaluate permitted lifecycle actions for current user and check separation of duties",
+)
+async def get_permitted_lifecycle_actions(
+    job_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> JobLifecyclePermittedActionsResponse:
+    """Evaluate authorized actions for the calling user including separation of duties check."""
+    return await hr_job_lifecycle_service.evaluate_permitted_actions(
+        db=db,
+        tenant_id=tenant_id,
+        job_id=job_id,
+        user_id=sec.user_id,
+        user_roles=sec.roles,
+        is_super_admin=sec.is_super_admin,
+    )

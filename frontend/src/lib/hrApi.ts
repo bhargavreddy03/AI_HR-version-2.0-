@@ -3,6 +3,10 @@ import type {
   CanonicalSkillSuggestion,
   HrDashboardFilterParams,
   HrDashboardOverviewResponse,
+  JobLifecycleActionRequest,
+  JobLifecycleHistoryItem,
+  JobLifecyclePermittedActionsResponse,
+  JobLifecycleTransitionResponse,
   JobRequisition,
   JobRequisitionCreateInput,
   JobRequisitionFilterParams,
@@ -154,6 +158,44 @@ export const hrApi = {
     params.append("limit", String(limit));
     return fetchWithAuth<CanonicalSkillSuggestion[]>(
       `/hr/jobs/skills-autocomplete?${params.toString()}`
+    );
+  },
+
+  /**
+   * Execute a lifecycle state transition action (submit, approve, request changes, publish, pause, reopen, close, archive).
+   */
+  async executeLifecycleAction(
+    jobId: string,
+    request: JobLifecycleActionRequest
+  ): Promise<JobLifecycleTransitionResponse> {
+    return fetchWithAuth<JobLifecycleTransitionResponse>(
+      `/hr/jobs/${jobId}/lifecycle`,
+      {
+        method: "POST",
+        body: JSON.stringify(request),
+      }
+    );
+  },
+
+  /**
+   * Retrieve immutable lifecycle audit history for a job requisition.
+   */
+  async getJobLifecycleHistory(
+    jobId: string
+  ): Promise<JobLifecycleHistoryItem[]> {
+    return fetchWithAuth<JobLifecycleHistoryItem[]>(
+      `/hr/jobs/${jobId}/lifecycle/history`
+    );
+  },
+
+  /**
+   * Evaluate permitted lifecycle actions for the active user on this requisition.
+   */
+  async getPermittedLifecycleActions(
+    jobId: string
+  ): Promise<JobLifecyclePermittedActionsResponse> {
+    return fetchWithAuth<JobLifecyclePermittedActionsResponse>(
+      `/hr/jobs/${jobId}/lifecycle/permitted-actions`
     );
   },
 };

@@ -127,6 +127,9 @@ export interface JobRequisition {
   hiring_manager_email?: string | null;
   applications_count: number;
   published_at?: string | null;
+  closed_at?: string | null;
+  reopened_at?: string | null;
+  change_request_reason?: string | null;
   application_deadline?: string | null;
   created_at: string;
   updated_at: string;
@@ -203,6 +206,42 @@ export interface CanonicalSkillSuggestion {
   canonical_name: string;
   category: string;
   skill_id: string;
+}
+
+export interface JobLifecycleActionRequest {
+  action: string;
+  reason?: string | null;
+  audit_metadata?: Record<string, unknown>;
+}
+
+export interface JobLifecycleHistoryItem {
+  id: string;
+  job_id: string;
+  previous_status: string;
+  new_status: string;
+  action: string;
+  actor_id?: string | null;
+  actor_name?: string | null;
+  actor_email?: string | null;
+  actor_role?: string | null;
+  reason?: string | null;
+  audit_metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface JobLifecyclePermittedActionsResponse {
+  job_id: string;
+  current_status: string;
+  approval_status: string;
+  permitted_actions: string[];
+  can_approve: boolean;
+  separation_of_duties_active: boolean;
+}
+
+export interface JobLifecycleTransitionResponse {
+  job: JobRequisition;
+  transition: JobLifecycleHistoryItem;
+  permitted_next_actions: string[];
 }
 
 export interface JobRequisitionFilterParams {

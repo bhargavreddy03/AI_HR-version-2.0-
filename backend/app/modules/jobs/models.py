@@ -109,6 +109,13 @@ class Job(Base, TenantScopedMixin, TimestampMixin):
     published_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True, default=utc_now
     )
+    closed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    reopened_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    change_request_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     application_deadline: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )
@@ -122,6 +129,12 @@ class Job(Base, TenantScopedMixin, TimestampMixin):
     )
     applications: Mapped[list[JobApplication]] = relationship(
         "JobApplication", back_populates="job", cascade="all, delete-orphan"
+    )
+    lifecycle_history: Mapped[list[JobLifecycleHistory]] = relationship(
+        "JobLifecycleHistory",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        order_by="desc(JobLifecycleHistory.created_at)",
     )
 
 
@@ -184,3 +197,45 @@ class JobApplication(Base, TenantScopedMixin, TimestampMixin):
 
     # Relationships
     job: Mapped[Job] = relationship("Job", back_populates="applications")
+
+
+class JobLifecycleHistory(Base, TenantScopedMixin):
+    """Immutable audit log of all job requisition lifecycle state transitions."""
+
+    __tablename__ = "job_lifecycle_history"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        default=generate_uuid7,
+        index=True,
+    )
+    job_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    previous_status: Mapped[str] = mapped_column(String(50), nullable=False)
+    new_status: Mapped[str] = mapped_column(String(50), nullable=False)
+    action: Mapped[str] = mapped_column(String(50), nullable=False)
+    actor_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    actor_role: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    audit_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=utc_now,
+        index=True,
+    )
+
+    # Relationships
+    job: Mapped[Job] = relationship("Job", back_populates="lifecycle_history")
+    actor: Mapped[User | None] = relationship("User", foreign_keys=[actor_id], lazy="selectin")
+

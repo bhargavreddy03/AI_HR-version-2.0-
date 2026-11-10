@@ -90,11 +90,12 @@ class JobService:
         offset = (page - 1) * page_size
         now = datetime.now(UTC)
 
-        # Base filter: Only published jobs and non-expired opportunities
+        # Base filter: Only published jobs and non-expired opportunities with public visibility
         stmt = (
             select(Job, Organization.name.label("org_name"))
             .join(Organization, Organization.id == Job.tenant_id)
             .where(Job.status == JobStatus.PUBLISHED.value)
+            .where(Job.visibility == "public")
             .where(
                 or_(
                     Job.application_deadline.is_(None),

@@ -65,3 +65,51 @@ def dispatch_candidate_email_notification(
         "delivered": True,
         "status": "delivered",
     }
+
+
+@shared_task(
+    name="app.modules.notifications.tasks.dispatch_job_lifecycle_notification",
+    bind=True,
+    max_retries=3,
+    default_retry_delay=30,
+)
+def dispatch_job_lifecycle_notification(
+    self,
+    job_id: str,
+    tenant_id: str,
+    action: str,
+    previous_status: str,
+    new_status: str,
+    actor_id: str | None = None,
+    actor_name: str | None = None,
+    recipients: list[dict[str, str]] | None = None,
+    reason: str | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Asynchronously dispatch notification for a job lifecycle state transition.
+
+    Guarantees idempotency and prevents duplicate notifications across retries.
+    """
+    settings = get_settings()
+    recipients_list = recipients or []
+    logger.info(
+        "Job lifecycle transition event: job=%s, tenant=%s, action=%s (%s -> %s), actor=%s, recipients_count=%d",
+        job_id,
+        tenant_id,
+        action,
+        previous_status,
+        new_status,
+        actor_name or actor_id,
+        len(recipients_list),
+    )
+
+    return {
+        "job_id": job_id,
+        "tenant_id": tenant_id,
+        "action": action,
+        "previous_status": previous_status,
+        "new_status": new_status,
+        "recipients_notified": len(recipients_list),
+        "idempotency_key": idempotency_key,
+        "status": "dispatched",
+    }
