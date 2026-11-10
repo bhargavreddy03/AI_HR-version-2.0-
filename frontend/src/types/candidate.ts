@@ -133,22 +133,39 @@ export interface ResumeExtractionResponse {
 export interface JobPublicSummary {
   id: string;
   tenant_id: string;
+  organization_name?: string | null;
   title: string;
+  slug?: string;
   department?: string | null;
   location?: string | null;
-  remote_type: "remote" | "hybrid" | "onsite";
-  employment_type: "full_time" | "part_time" | "contract" | "internship";
+  remote_type: "remote" | "hybrid" | "onsite" | string;
+  employment_type: "full_time" | "part_time" | "contract" | "internship" | string;
   experience_level?: string | null;
   salary_min?: number | null;
   salary_max?: number | null;
   salary_currency?: string;
+  skills_required?: string[];
   required_skills: string[];
-  created_at: string;
+  published_at?: string | null;
+  created_at?: string;
+  application_deadline?: string | null;
+  is_saved?: boolean;
+  has_applied?: boolean;
+  is_expired?: boolean;
 }
 
 export interface JobDetail extends JobPublicSummary {
   description: string;
-  preferred_skills: string[];
+  requirements?: string | null;
+  preferred_skills?: string[];
+}
+
+export interface JobListResponse {
+  jobs: JobPublicSummary[];
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
 }
 
 export interface SavedJobItem {

@@ -61,7 +61,14 @@ export default function CandidateDashboardPage() {
       if (savedRes.status === "fulfilled") setSavedJobs(savedRes.value);
       if (resumesRes.status === "fulfilled") setResumes(resumesRes.value);
       if (notifsRes.status === "fulfilled") setNotifications(notifsRes.value);
-      if (jobsRes.status === "fulfilled") setRecommendedJobs(jobsRes.value);
+      if (jobsRes.status === "fulfilled") {
+        const val = jobsRes.value as unknown;
+        if (Array.isArray(val)) {
+          setRecommendedJobs(val);
+        } else if (val && typeof val === "object" && "jobs" in val && Array.isArray((val as { jobs: JobPublicSummary[] }).jobs)) {
+          setRecommendedJobs((val as { jobs: JobPublicSummary[] }).jobs);
+        }
+      }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to load candidate dashboard");
     } finally {

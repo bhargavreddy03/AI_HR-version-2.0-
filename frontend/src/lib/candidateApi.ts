@@ -11,6 +11,7 @@ import type {
   ResumeExtractionResponse,
   JobPublicSummary,
   JobDetail,
+  JobListResponse,
   SavedJobItem,
   CandidateApplicationSummary,
   CandidateApplicationDetail,
@@ -188,24 +189,55 @@ export const candidateApi = {
     }),
 
   // Jobs
-  searchJobs: (params: {
+  searchJobs: (params?: {
     query?: string;
     department?: string;
     location?: string;
     remote_type?: string;
     employment_type?: string;
+    experience_level?: string;
+    skills?: string | string[];
+    min_salary?: number;
+    max_salary?: number;
+    posted_within_days?: number;
+    sort_by?: "recent" | "closing_soon" | "salary_high" | string;
+    page?: number;
+    page_size?: number;
     limit?: number;
     offset?: number;
   }) => {
     const searchParams = new URLSearchParams();
-    if (params.query) searchParams.append("query", params.query);
-    if (params.department) searchParams.append("department", params.department);
-    if (params.location) searchParams.append("location", params.location);
-    if (params.remote_type) searchParams.append("remote_type", params.remote_type);
-    if (params.employment_type) searchParams.append("employment_type", params.employment_type);
-    if (params.limit) searchParams.append("limit", params.limit.toString());
-    if (params.offset) searchParams.append("offset", params.offset.toString());
-    return fetchWithAuth<JobPublicSummary[]>(`/jobs/search?${searchParams.toString()}`);
+    if (params) {
+      if (params.query) searchParams.append("query", params.query);
+      if (params.department) searchParams.append("department", params.department);
+      if (params.location) searchParams.append("location", params.location);
+      if (params.remote_type) searchParams.append("remote_type", params.remote_type);
+      if (params.employment_type) searchParams.append("employment_type", params.employment_type);
+      if (params.experience_level) searchParams.append("experience_level", params.experience_level);
+      if (params.skills) {
+        if (Array.isArray(params.skills)) {
+          params.skills.forEach((s) => searchParams.append("skills", s));
+        } else {
+          searchParams.append("skills", params.skills);
+        }
+      }
+      if (params.min_salary !== undefined && params.min_salary !== null) {
+        searchParams.append("min_salary", params.min_salary.toString());
+      }
+      if (params.max_salary !== undefined && params.max_salary !== null) {
+        searchParams.append("max_salary", params.max_salary.toString());
+      }
+      if (params.posted_within_days !== undefined && params.posted_within_days !== null) {
+        searchParams.append("posted_within_days", params.posted_within_days.toString());
+      }
+      if (params.sort_by) searchParams.append("sort_by", params.sort_by);
+      if (params.page) searchParams.append("page", params.page.toString());
+      if (params.page_size) searchParams.append("page_size", params.page_size.toString());
+      if (params.limit) searchParams.append("limit", params.limit.toString());
+      if (params.offset) searchParams.append("offset", params.offset.toString());
+    }
+    const qs = searchParams.toString();
+    return fetchWithAuth<JobListResponse>(`/jobs/search${qs ? `?${qs}` : ""}`);
   },
   getJob: (id: string) => fetchWithAuth<JobDetail>(`/jobs/${id}`),
   getSavedJobs: () => fetchWithAuth<SavedJobItem[]>("/jobs/saved"),

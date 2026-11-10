@@ -8,14 +8,14 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # -----------------------------------------------------------------------------
 # Job Discovery Schemas
 # -----------------------------------------------------------------------------
 class JobRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
     id: UUID
     tenant_id: UUID
@@ -29,6 +29,7 @@ class JobRead(BaseModel):
     description: str
     requirements: str | None = None
     skills_required: list[str] = Field(default_factory=list)
+    required_skills: list[str] = Field(default_factory=list)
     experience_level: str
     salary_min: int | None = None
     salary_max: int | None = None
@@ -38,6 +39,13 @@ class JobRead(BaseModel):
     application_deadline: datetime | None = None
     is_saved: bool = False
     has_applied: bool = False
+    is_expired: bool = False
+
+    @model_validator(mode="after")
+    def populate_aliases(self) -> JobRead:
+        if not self.required_skills and self.skills_required:
+            self.required_skills = self.skills_required
+        return self
 
 
 class JobListResponse(BaseModel):
@@ -52,9 +60,18 @@ class JobListResponse(BaseModel):
 # Saved Job Schemas
 # -----------------------------------------------------------------------------
 class SavedJobRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: UUID | None = None
     job_id: UUID
     saved_at: datetime
     job: JobRead
+
+    @model_validator(mode="after")
+    def populate_id(self) -> SavedJobRead:
+        if not self.id:
+            self.id = self.job_id
+        return self
 
 
 # -----------------------------------------------------------------------------

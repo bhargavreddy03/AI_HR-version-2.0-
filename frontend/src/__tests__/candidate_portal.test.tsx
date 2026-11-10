@@ -9,11 +9,15 @@ import { DashboardSkeleton } from "@/components/candidate/DashboardSkeleton";
 import CandidateLayout from "@/app/candidate/layout";
 import CandidateDashboardPage from "@/app/candidate/dashboard/page";
 import CandidateResumesPage from "@/app/candidate/resumes/page";
+import CandidateJobsPage from "@/app/candidate/jobs/page";
+import CandidateJobDetailPage from "@/app/candidate/jobs/[id]/page";
+import CandidateSavedJobsPage from "@/app/candidate/saved-jobs/page";
 import { candidateApi } from "@/lib/candidateApi";
 
 // Mock next/navigation
 vi.mock("next/navigation", () => ({
   usePathname: () => "/candidate/dashboard",
+  useParams: () => ({ id: "job-101" }),
   useRouter: () => ({
     push: vi.fn(),
     replace: vi.fn(),
@@ -208,7 +212,13 @@ describe("Candidate Portal Components", () => {
       vi.spyOn(candidateApi, "getSavedJobs").mockResolvedValue([]);
       vi.spyOn(candidateApi, "getResumes").mockResolvedValue([]);
       vi.spyOn(candidateApi, "getNotifications").mockResolvedValue([]);
-      vi.spyOn(candidateApi, "searchJobs").mockResolvedValue([]);
+      vi.spyOn(candidateApi, "searchJobs").mockResolvedValue({
+        jobs: [],
+        total: 0,
+        page: 1,
+        page_size: 20,
+        total_pages: 1,
+      });
 
       render(<CandidateDashboardPage />);
 
@@ -338,6 +348,274 @@ describe("Candidate Portal Components", () => {
       expect(screen.getByText("jane.doe@example.com")).toBeDefined();
       expect(screen.getByRole("button", { name: /Apply to Verified Profile/i })).toBeDefined();
       expect(screen.getByRole("button", { name: /Save Resume Skills/i })).toBeDefined();
+    });
+  });
+
+  describe("CandidateJobsPage", () => {
+    const mockJobsResponse = {
+      jobs: [
+        {
+          id: "job-101",
+          tenant_id: "tenant-1",
+          organization_name: "Acme Corp",
+          title: "Principal Cloud Architect",
+          department: "Engineering",
+          location: "San Francisco, CA",
+          remote_type: "remote",
+          employment_type: "full_time",
+          experience_level: "Senior",
+          salary_min: 180000,
+          salary_max: 220000,
+          salary_currency: "USD",
+          required_skills: ["AWS", "Kubernetes", "Terraform"],
+          published_at: new Date().toISOString(),
+          created_at: new Date().toISOString(),
+          application_deadline: new Date(Date.now() + 864000000).toISOString(),
+          is_saved: false,
+          has_applied: false,
+          is_expired: false,
+        },
+        {
+          id: "job-102",
+          tenant_id: "tenant-2",
+          organization_name: "Nexus AI",
+          title: "Senior Python Backend Engineer",
+          department: "AI Platforms",
+          location: "New York, NY",
+          remote_type: "hybrid",
+          employment_type: "full_time",
+          experience_level: "Senior",
+          salary_min: 160000,
+          salary_max: 200000,
+          salary_currency: "USD",
+          required_skills: ["Python", "FastAPI", "PostgreSQL"],
+          published_at: new Date().toISOString(),
+          created_at: new Date().toISOString(),
+          application_deadline: new Date(Date.now() + 864000000).toISOString(),
+          is_saved: true,
+          has_applied: true,
+          is_expired: false,
+        },
+      ],
+      total: 2,
+      page: 1,
+      page_size: 12,
+      total_pages: 1,
+    };
+
+    it("renders job search input and published opportunity cards", async () => {
+      vi.spyOn(candidateApi, "getSavedJobs").mockResolvedValue([
+        {
+          id: "saved-1",
+          job_id: "job-102",
+          saved_at: new Date().toISOString(),
+          job: mockJobsResponse.jobs[1],
+        },
+      ]);
+      vi.spyOn(candidateApi, "searchJobs").mockResolvedValue(mockJobsResponse);
+
+      render(<CandidateJobsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("Principal Cloud Architect")).toBeDefined();
+        expect(screen.getByText("Senior Python Backend Engineer")).toBeDefined();
+      });
+
+      expect(screen.getByText("Acme Corp")).toBeDefined();
+      expect(screen.getByText("Nexus AI")).toBeDefined();
+      expect(screen.getByText("Applied")).toBeDefined();
+    });
+
+    it("allows toggling save/bookmark on a job", async () => {
+      vi.spyOn(candidateApi, "getSavedJobs").mockResolvedValue([]);
+      vi.spyOn(candidateApi, "searchJobs").mockResolvedValue(mockJobsResponse);
+      const saveSpy = vi.spyOn(candidateApi, "saveJob").mockResolvedValue({
+        id: "saved-101",
+        job_id: "job-101",
+        saved_at: new Date().toISOString(),
+        job: mockJobsResponse.jobs[0],
+      });
+
+      render(<CandidateJobsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("Principal Cloud Architect")).toBeDefined();
+      });
+
+      const saveButtons = screen.getAllByRole("button", { name: /Save job/i });
+      fireEvent.click(saveButtons[0]);
+
+      await waitFor(() => {
+        expect(saveSpy).toHaveBeenCalledWith("job-101");
+      });
+    });
+
+    it("submits search query and triggers filtered reload", async () => {
+      vi.spyOn(candidateApi, "getSavedJobs").mockResolvedValue([]);
+      const searchSpy = vi.spyOn(candidateApi, "searchJobs").mockResolvedValue(mockJobsResponse);
+
+      render(<CandidateJobsPage />);
+
+      const searchInput = screen.getByPlaceholderText(/Search by role title/i);
+      fireEvent.change(searchInput, { target: { value: "Cloud" } });
+
+      const searchBtn = screen.getByRole("button", { name: /^Search$/i });
+      fireEvent.click(searchBtn);
+
+      await waitFor(() => {
+        expect(searchSpy).toHaveBeenCalled();
+      });
+    });
+  });
+
+  describe("CandidateJobDetailPage", () => {
+    const mockDetail = {
+      id: "job-101",
+      tenant_id: "tenant-1",
+      organization_name: "Acme Corp",
+      title: "Principal Cloud Architect",
+      department: "Engineering",
+      location: "San Francisco, CA",
+      remote_type: "remote",
+      employment_type: "full_time",
+      experience_level: "Senior",
+      salary_min: 180000,
+      salary_max: 220000,
+      salary_currency: "USD",
+      required_skills: ["AWS", "Kubernetes", "Terraform"],
+      preferred_skills: ["Golang", "Rust"],
+      description: "We are seeking a Principal Cloud Architect to scale our cloud platforms.",
+      requirements: "10+ years of cloud architecture experience.",
+      published_at: new Date().toISOString(),
+      created_at: new Date().toISOString(),
+      application_deadline: new Date(Date.now() + 864000000).toISOString(),
+      is_saved: false,
+      has_applied: false,
+      is_expired: false,
+    };
+
+    it("renders job requisition details and skills tags", async () => {
+      vi.spyOn(candidateApi, "getJob").mockResolvedValue(mockDetail);
+      vi.spyOn(candidateApi, "getSavedJobs").mockResolvedValue([]);
+
+      render(<CandidateJobDetailPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("Principal Cloud Architect")).toBeDefined();
+        expect(screen.getByText("Acme Corp")).toBeDefined();
+      });
+
+      expect(screen.getByText("We are seeking a Principal Cloud Architect to scale our cloud platforms.")).toBeDefined();
+      expect(screen.getByText("10+ years of cloud architecture experience.")).toBeDefined();
+      expect(screen.getByText("AWS")).toBeDefined();
+      expect(screen.getByText("Kubernetes")).toBeDefined();
+      expect(screen.getByText("Terraform")).toBeDefined();
+      expect(screen.getByText("Golang")).toBeDefined();
+    });
+
+    it("displays position closed banner when job is expired", async () => {
+      vi.spyOn(candidateApi, "getJob").mockResolvedValue({
+        ...mockDetail,
+        is_expired: true,
+      });
+      vi.spyOn(candidateApi, "getSavedJobs").mockResolvedValue([]);
+
+      render(<CandidateJobDetailPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText(/Position Closed:/i)).toBeDefined();
+        expect(screen.getByText("Applications Closed")).toBeDefined();
+      });
+    });
+
+    it("displays applied banner when candidate has already applied", async () => {
+      vi.spyOn(candidateApi, "getJob").mockResolvedValue({
+        ...mockDetail,
+        has_applied: true,
+      });
+      vi.spyOn(candidateApi, "getSavedJobs").mockResolvedValue([]);
+
+      render(<CandidateJobDetailPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText(/You have already submitted an application/i)).toBeDefined();
+        expect(screen.getByText("View Application")).toBeDefined();
+      });
+    });
+  });
+
+  describe("CandidateSavedJobsPage", () => {
+    const mockSavedJobs = [
+      {
+        id: "saved-1",
+        job_id: "job-101",
+        saved_at: new Date().toISOString(),
+        job: {
+          id: "job-101",
+          tenant_id: "tenant-1",
+          organization_name: "Acme Corp",
+          title: "Principal Cloud Architect",
+          department: "Engineering",
+          location: "San Francisco, CA",
+          remote_type: "remote",
+          employment_type: "full_time",
+          required_skills: ["AWS"],
+          is_saved: true,
+          has_applied: false,
+          is_expired: false,
+        },
+      },
+      {
+        id: "saved-2",
+        job_id: "job-102",
+        saved_at: new Date().toISOString(),
+        job: {
+          id: "job-102",
+          tenant_id: "tenant-2",
+          organization_name: "Nexus AI",
+          title: "Senior AI Researcher",
+          department: "Research",
+          location: "New York, NY",
+          remote_type: "onsite",
+          employment_type: "full_time",
+          required_skills: ["PyTorch"],
+          is_saved: true,
+          has_applied: true,
+          is_expired: true,
+        },
+      },
+    ];
+
+    it("renders saved jobs list with expired and applied indicators", async () => {
+      vi.spyOn(candidateApi, "getSavedJobs").mockResolvedValue(mockSavedJobs);
+
+      render(<CandidateSavedJobsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("Principal Cloud Architect")).toBeDefined();
+        expect(screen.getByText("Senior AI Researcher")).toBeDefined();
+      });
+
+      expect(screen.getByText("Applied")).toBeDefined();
+      expect(screen.getByText("Position Closed / Expired")).toBeDefined();
+    });
+
+    it("allows removing a saved job", async () => {
+      vi.spyOn(candidateApi, "getSavedJobs").mockResolvedValue(mockSavedJobs);
+      const unsaveSpy = vi.spyOn(candidateApi, "unsaveJob").mockResolvedValue(undefined);
+
+      render(<CandidateSavedJobsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("Principal Cloud Architect")).toBeDefined();
+      });
+
+      const removeBtns = screen.getAllByRole("button", { name: /Remove saved job/i });
+      fireEvent.click(removeBtns[0]);
+
+      await waitFor(() => {
+        expect(unsaveSpy).toHaveBeenCalledWith("job-101");
+      });
     });
   });
 });

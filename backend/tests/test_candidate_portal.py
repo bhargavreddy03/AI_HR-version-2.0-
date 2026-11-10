@@ -37,6 +37,7 @@ from app.modules.candidates.models import (
     CandidatePreference,
     CandidateResume,
     CandidateResumeStatus,
+    CandidateSavedJob,
 )
 from app.modules.candidates.schemas import (
     CandidatePreferenceUpdate,
@@ -1106,3 +1107,175 @@ async def test_sync_resume_skills_to_profile() -> None:
     resp = await svc.update_extracted_data(mock_db, candidate_id, resume_id, update_payload)
     assert resp.skills_extracted == ["Python", "FastAPI", "Docker"]
     assert "Python" in mock_profile.self_declared_skills
+
+
+@pytest.mark.asyncio
+async def test_job_discovery_advanced_search_and_filters() -> None:
+    """Verify job search filters by keywords, skills, salary range, remote arrangement, and publication cutoff."""
+    mock_db = AsyncMock()
+    org_id = uuid4()
+    job_id = uuid4()
+
+    mock_job = MagicMock(spec=Job)
+    mock_job.id = job_id
+    mock_job.tenant_id = org_id
+    mock_job.title = "Senior Python Backend Engineer"
+    mock_job.slug = "senior-python-backend-engineer"
+    mock_job.department = "Platform Engineering"
+    mock_job.location = "New York, NY"
+    mock_job.remote_type = "remote"
+    mock_job.employment_type = "full_time"
+    mock_job.description = "Lead backend cloud services with <script>alert(1)</script> FastAPI and Redis."
+    mock_job.requirements = "8+ years building distributed systems."
+    mock_job.skills_required = ["Python", "FastAPI", "PostgreSQL", "Redis"]
+    mock_job.experience_level = "senior"
+    mock_job.salary_min = 160000
+    mock_job.salary_max = 210000
+    mock_job.salary_currency = "USD"
+    mock_job.status = JobStatus.PUBLISHED.value
+    mock_job.published_at = datetime.now(UTC)
+    mock_job.application_deadline = None
+
+    count_res = MagicMock()
+    count_res.scalar.return_value = 1
+
+    jobs_res = MagicMock()
+    jobs_res.all.return_value = [(mock_job, "Global Corp")]
+
+    mock_db.execute.side_effect = [count_res, jobs_res]
+
+    res = await job_service.list_jobs(
+        mock_db,
+        query="Python",
+        remote_type="remote",
+        employment_type="full_time",
+        experience_level="senior",
+        skills=["FastAPI", "PostgreSQL"],
+        min_salary=150000,
+        max_salary=250000,
+        posted_within_days=30,
+        sort_by="salary_high",
+        page=1,
+        page_size=10,
+    )
+
+    assert res.total == 1
+    assert len(res.jobs) == 1
+    job = res.jobs[0]
+    assert job.title == "Senior Python Backend Engineer"
+    assert job.organization_name == "Global Corp"
+    assert job.remote_type == "remote"
+    assert job.is_expired is False
+    assert job.has_applied is False
+    # Sanitization check: script tag removed or neutralized
+    assert "<script>" not in job.description
+
+
+@pytest.mark.asyncio
+async def test_job_discovery_sorting_and_pagination() -> None:
+    """Verify sorting options and pagination bounds for job requisitions."""
+    mock_db = AsyncMock()
+    mock_job1 = MagicMock(spec=Job)
+    mock_job1.id = uuid4()
+    mock_job1.tenant_id = uuid4()
+    mock_job1.title = "Frontend Lead"
+    mock_job1.slug = "frontend-lead"
+    mock_job1.department = "Product"
+    mock_job1.location = "Remote"
+    mock_job1.remote_type = "remote"
+    mock_job1.employment_type = "full_time"
+    mock_job1.description = "React architect"
+    mock_job1.requirements = None
+    mock_job1.skills_required = ["React", "TypeScript"]
+    mock_job1.experience_level = "lead"
+    mock_job1.salary_min = 170000
+    mock_job1.salary_max = 220000
+    mock_job1.salary_currency = "USD"
+    mock_job1.status = JobStatus.PUBLISHED.value
+    mock_job1.published_at = datetime.now(UTC)
+    mock_job1.application_deadline = None
+
+    count_res = MagicMock()
+    count_res.scalar.return_value = 25
+
+    jobs_res = MagicMock()
+    jobs_res.all.return_value = [(mock_job1, "Acme Inc")]
+
+    mock_db.execute.side_effect = [count_res, jobs_res]
+
+    # Test closing soon sort order and pagination
+    res = await job_service.list_jobs(
+        mock_db,
+        sort_by="closing_soon",
+        page=2,
+        page_size=10,
+    )
+
+    assert res.total == 25
+    assert res.page == 2
+    assert res.page_size == 10
+    assert res.total_pages == 3
+
+
+@pytest.mark.asyncio
+async def test_saved_jobs_duplicate_prevention_and_applied_status() -> None:
+    """Verify saving duplicate job is prevented, and saved jobs list identifies expired & applied jobs."""
+    candidate_id = uuid4()
+    job_id = uuid4()
+    mock_db = AsyncMock()
+
+    # 1. Existing bookmark check
+    job_exists = MagicMock()
+    job_exists.scalar_one_or_none.return_value = job_id
+
+    already_saved = MagicMock()
+    already_saved.scalar_one_or_none.return_value = MagicMock(spec=CandidateSavedJob)
+
+    mock_db.execute.side_effect = [job_exists, already_saved]
+
+    # Saving again should be a no-op (no duplicate insert)
+    await job_service.save_job(mock_db, candidate_id, job_id)
+    # db.add must NOT be called for duplicate
+    mock_db.add.assert_not_called()
+
+    # 2. Listing saved jobs with applied and expired identification
+    mock_job = MagicMock(spec=Job)
+    mock_job.id = job_id
+    mock_job.tenant_id = uuid4()
+    mock_job.title = "Security Analyst"
+    mock_job.slug = "security-analyst"
+    mock_job.department = "SecOps"
+    mock_job.location = "Austin, TX"
+    mock_job.remote_type = "onsite"
+    mock_job.employment_type = "contract"
+    mock_job.description = "Security engineering"
+    mock_job.requirements = None
+    mock_job.skills_required = ["SOC2", "SIEM"]
+    mock_job.experience_level = "mid"
+    mock_job.salary_min = 120000
+    mock_job.salary_max = 140000
+    mock_job.salary_currency = "USD"
+    # Mark as expired deadline in the past
+    mock_job.status = JobStatus.PUBLISHED.value
+    mock_job.published_at = datetime(2026, 1, 1, tzinfo=UTC)
+    mock_job.application_deadline = datetime(2026, 2, 1, tzinfo=UTC)
+
+    saved_entry = MagicMock(spec=CandidateSavedJob)
+    saved_entry.saved_at = datetime.now(UTC)
+
+    saved_query_res = MagicMock()
+    saved_query_res.all.return_value = [(saved_entry, mock_job, "SecureOrg")]
+
+    # Applied query returns this job_id as applied
+    applied_query_res = MagicMock()
+    applied_query_res.scalars.return_value.all.return_value = [job_id]
+
+    mock_db.execute.side_effect = [saved_query_res, applied_query_res]
+
+    saved_list = await job_service.list_saved_jobs(mock_db, candidate_id)
+    assert len(saved_list) == 1
+    item = saved_list[0]
+    assert item.job.title == "Security Analyst"
+    assert item.job.has_applied is True
+    assert item.job.is_expired is True
+    assert item.job.is_saved is True

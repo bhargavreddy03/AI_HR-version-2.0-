@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import UTC, datetime
+import re
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import delete, desc, func, or_, select
+from sqlalchemy import String, delete, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.base import generate_uuid7, utc_now
@@ -18,6 +19,7 @@ from app.core.errors import (
     EntityNotFoundException,
     ValidationException,
 )
+from app.core.security.ai_security import sanitize_untrusted_text
 from app.modules.candidates.models import (
     CandidateNotification,
     CandidateResume,
@@ -40,6 +42,22 @@ from app.modules.organizations.models import Organization
 
 logger = logging.getLogger(__name__)
 
+DANGEROUS_HTML_REGEX = re.compile(
+    r"<\s*(script|style|iframe|object|embed|applet|meta|link)[^>]*>.*?<\s*/\s*\1\s*>|"
+    r"<\s*(script|style|iframe|object|embed|applet|meta|link)[^>]*>|"
+    r"on\w+\s*=\s*([\"'][^\"']*[\"']|[^\s>]+)|"
+    r"javascript:[^\s\"'>]+",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def sanitize_rich_text(text: str | None) -> str:
+    """Sanitize rich text descriptions, neutralizing script tags, event handlers, and dangerous attributes."""
+    if not text:
+        return ""
+    cleaned = DANGEROUS_HTML_REGEX.sub("", text)
+    return sanitize_untrusted_text(cleaned)
+
 
 class JobService:
     """Domain service managing public job requisitions, candidate search, and applications."""
@@ -57,19 +75,31 @@ class JobService:
         remote_type: str | None = None,
         employment_type: str | None = None,
         experience_level: str | None = None,
+        skills: list[str] | str | None = None,
+        min_salary: int | None = None,
+        max_salary: int | None = None,
+        posted_within_days: int | None = None,
+        sort_by: str = "recent",
         page: int = 1,
         page_size: int = 20,
     ) -> JobListResponse:
-        """Search and filter published jobs with pagination."""
+        """Search and filter published jobs with pagination, sorting, and deadline enforcement."""
         page = max(1, page)
         page_size = min(max(1, page_size), 100)
         offset = (page - 1) * page_size
+        now = datetime.now(UTC)
 
-        # Base filter: Only published jobs
+        # Base filter: Only published jobs and non-expired opportunities
         stmt = (
             select(Job, Organization.name.label("org_name"))
             .join(Organization, Organization.id == Job.tenant_id)
             .where(Job.status == JobStatus.PUBLISHED.value)
+            .where(
+                or_(
+                    Job.application_deadline.is_(None),
+                    Job.application_deadline >= now,
+                )
+            )
         )
 
         if query and query.strip():
@@ -79,6 +109,9 @@ class JobService:
                     Job.title.ilike(clean_q),
                     Job.description.ilike(clean_q),
                     Job.department.ilike(clean_q),
+                    Job.location.ilike(clean_q),
+                    Organization.name.ilike(clean_q),
+                    Job.skills_required.cast(String).ilike(clean_q),
                 )
             )
 
@@ -97,17 +130,63 @@ class JobService:
         if experience_level and experience_level.strip():
             stmt = stmt.where(Job.experience_level == experience_level.strip().lower())
 
+        if skills:
+            skill_list = (
+                [s.strip() for s in skills if s.strip()]
+                if isinstance(skills, list)
+                else [s.strip() for s in skills.split(",") if s.strip()]
+            )
+            for s in skill_list:
+                stmt = stmt.where(Job.skills_required.cast(String).ilike(f"%{s}%"))
+
+        if min_salary is not None and min_salary > 0:
+            stmt = stmt.where(
+                or_(
+                    Job.salary_max >= min_salary,
+                    Job.salary_min >= min_salary,
+                )
+            )
+
+        if max_salary is not None and max_salary > 0:
+            stmt = stmt.where(
+                or_(
+                    Job.salary_min <= max_salary,
+                    Job.salary_max <= max_salary,
+                )
+            )
+
+        if posted_within_days and posted_within_days > 0:
+            cutoff = now - timedelta(days=posted_within_days)
+            stmt = stmt.where(Job.published_at >= cutoff)
+
         # Total count query
         count_stmt = select(func.count()).select_from(stmt.subquery())
         total_res = await db.execute(count_stmt)
         total = total_res.scalar() or 0
 
+        # Sorting logic with tie-breaker
+        if sort_by == "closing_soon":
+            stmt = stmt.order_by(
+                Job.application_deadline.asc().nulls_last(),
+                desc(Job.published_at),
+                desc(Job.id),
+            )
+        elif sort_by == "salary_high":
+            stmt = stmt.order_by(
+                desc(Job.salary_max).nulls_last(),
+                desc(Job.salary_min).nulls_last(),
+                desc(Job.published_at),
+                desc(Job.id),
+            )
+        else:  # default "recent"
+            stmt = stmt.order_by(
+                desc(Job.published_at),
+                desc(Job.created_at),
+                desc(Job.id),
+            )
+
         # Paginated results
-        stmt = (
-            stmt.order_by(desc(Job.published_at), desc(Job.created_at))
-            .offset(offset)
-            .limit(page_size)
-        )
+        stmt = stmt.offset(offset).limit(page_size)
         rows = (await db.execute(stmt)).all()
 
         # Find saved jobs and applied jobs for current candidate
@@ -131,6 +210,9 @@ class JobService:
 
         job_reads: list[JobRead] = []
         for job, org_name in rows:
+            is_expired = (
+                job.application_deadline is not None and job.application_deadline < now
+            ) or job.status != JobStatus.PUBLISHED.value
             job_reads.append(
                 JobRead(
                     id=job.id,
@@ -142,9 +224,12 @@ class JobService:
                     location=job.location,
                     remote_type=job.remote_type,
                     employment_type=job.employment_type,
-                    description=job.description,
-                    requirements=job.requirements,
+                    description=sanitize_rich_text(job.description),
+                    requirements=(
+                        sanitize_rich_text(job.requirements) if job.requirements else None
+                    ),
                     skills_required=job.skills_required,
+                    required_skills=job.skills_required,
                     experience_level=job.experience_level,
                     salary_min=job.salary_min,
                     salary_max=job.salary_max,
@@ -154,6 +239,7 @@ class JobService:
                     application_deadline=job.application_deadline,
                     is_saved=job.id in saved_job_ids,
                     has_applied=job.id in applied_job_ids,
+                    is_expired=is_expired,
                 )
             )
 
@@ -170,7 +256,7 @@ class JobService:
     async def get_job(
         self, db: AsyncSession, job_id: UUID, candidate_user_id: UUID | None = None
     ) -> JobRead:
-        """Retrieve single job details."""
+        """Retrieve single authorized job details with sanitized text and candidate state."""
         stmt = (
             select(Job, Organization.name.label("org_name"))
             .join(Organization, Organization.id == Job.tenant_id)
@@ -181,6 +267,10 @@ class JobService:
             raise EntityNotFoundException("Job requisition", job_id)
 
         job, org_name = row
+        now = datetime.now(UTC)
+        is_expired = (
+            job.application_deadline is not None and job.application_deadline < now
+        ) or job.status != JobStatus.PUBLISHED.value
 
         is_saved = False
         has_applied = False
@@ -211,9 +301,10 @@ class JobService:
             location=job.location,
             remote_type=job.remote_type,
             employment_type=job.employment_type,
-            description=job.description,
-            requirements=job.requirements,
+            description=sanitize_rich_text(job.description),
+            requirements=sanitize_rich_text(job.requirements) if job.requirements else None,
             skills_required=job.skills_required,
+            required_skills=job.skills_required,
             experience_level=job.experience_level,
             salary_min=job.salary_min,
             salary_max=job.salary_max,
@@ -223,13 +314,14 @@ class JobService:
             application_deadline=job.application_deadline,
             is_saved=is_saved,
             has_applied=has_applied,
+            is_expired=is_expired,
         )
 
     # -------------------------------------------------------------------------
     # Saved Jobs
     # -------------------------------------------------------------------------
     async def save_job(self, db: AsyncSession, user_id: UUID, job_id: UUID) -> None:
-        """Save / bookmark a job for later application."""
+        """Save / bookmark a job for later application, preventing duplicates."""
         # Ensure job exists
         job_res = await db.execute(select(Job.id).where(Job.id == job_id))
         if not job_res.scalar_one_or_none():
@@ -262,7 +354,7 @@ class JobService:
         await db.commit()
 
     async def list_saved_jobs(self, db: AsyncSession, user_id: UUID) -> list[SavedJobRead]:
-        """List all jobs saved by candidate."""
+        """List all jobs saved by candidate, identifying applied and expired jobs."""
         stmt = (
             select(CandidateSavedJob, Job, Organization.name.label("org_name"))
             .join(Job, Job.id == CandidateSavedJob.job_id)
@@ -272,8 +364,18 @@ class JobService:
         )
         rows = (await db.execute(stmt)).all()
 
+        applied_res = await db.execute(
+            select(JobApplication.job_id).where(JobApplication.candidate_id == user_id)
+        )
+        applied_job_ids = set(applied_res.scalars().all())
+
+        now = datetime.now(UTC)
         saved_reads: list[SavedJobRead] = []
         for saved_entry, job, org_name in rows:
+            is_expired = (
+                job.application_deadline is not None and job.application_deadline < now
+            ) or job.status != JobStatus.PUBLISHED.value
+            has_applied = job.id in applied_job_ids
             job_read = JobRead(
                 id=job.id,
                 tenant_id=job.tenant_id,
@@ -284,9 +386,12 @@ class JobService:
                 location=job.location,
                 remote_type=job.remote_type,
                 employment_type=job.employment_type,
-                description=job.description,
-                requirements=job.requirements,
+                description=sanitize_rich_text(job.description),
+                requirements=(
+                    sanitize_rich_text(job.requirements) if job.requirements else None
+                ),
                 skills_required=job.skills_required,
+                required_skills=job.skills_required,
                 experience_level=job.experience_level,
                 salary_min=job.salary_min,
                 salary_max=job.salary_max,
@@ -295,10 +400,12 @@ class JobService:
                 published_at=job.published_at,
                 application_deadline=job.application_deadline,
                 is_saved=True,
-                has_applied=False,
+                has_applied=has_applied,
+                is_expired=is_expired,
             )
             saved_reads.append(
                 SavedJobRead(
+                    id=job.id,
                     job_id=job.id,
                     saved_at=saved_entry.saved_at,
                     job=job_read,
