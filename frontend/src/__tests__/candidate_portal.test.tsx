@@ -936,6 +936,7 @@ describe("Candidate Portal Components", () => {
           {
             id: "int-1",
             application_id: "app-101",
+            job_id: "job-101",
             job_title: "Staff Platform Engineer",
             organization_name: "Acme Cloud Corp",
             interview_type: "technical",
@@ -976,6 +977,10 @@ describe("Candidate Portal Components", () => {
       last_name: "Rivera",
       phone_number: "+1 555-0199",
       email_verified: true,
+      is_verified: true,
+      is_active: true,
+      litigation_hold: false,
+      created_at: "2026-11-01T00:00:00Z",
       last_login_at: "2026-11-09T10:00:00Z",
       mfa_enabled: false,
     };
@@ -1006,9 +1011,14 @@ describe("Candidate Portal Components", () => {
     const mockConsentHistory = {
       consents: [
         {
+          consent_id: "c-1",
           consent_type: "terms_of_service",
+          title: "Terms of Service",
+          description: "Candidate terms of service agreement",
           granted: true,
           recorded_at: "2026-11-01T09:00:00Z",
+          granted_at: "2026-11-01T09:00:00Z",
+          source: "web_registration",
           ip_address: "192.168.1.1",
           version: "v2.0",
         },

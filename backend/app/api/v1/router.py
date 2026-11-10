@@ -7,6 +7,7 @@ from app.api.v1.tasks import router as tasks_router
 from app.modules.auth.router import router as auth_router
 from app.modules.candidates.router import candidate_router, resume_router
 from app.modules.documents.router import router as documents_router
+from app.modules.hr.router import hr_router
 from app.modules.jobs.router import job_router
 
 api_v1_router = APIRouter(prefix="/api/v1")
@@ -27,3 +28,6 @@ api_v1_router.include_router(resume_router)
 
 # Mount job discovery & application domain router (Step 4.1)
 api_v1_router.include_router(job_router)
+
+# Mount HR & recruiter portal domain router (Step 4.2)
+api_v1_router.include_router(hr_router)
