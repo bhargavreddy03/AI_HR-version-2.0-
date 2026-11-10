@@ -21,14 +21,19 @@ from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.base import Base, TenantScopedMixin, TimestampMixin, generate_uuid7, utc_now
+from app.modules.auth.models import User
 
 
 class JobStatus(str, enum.Enum):
     """Lifecycle status for a job opening."""
 
     DRAFT = "draft"
+    PENDING_APPROVAL = "pending_approval"
+    APPROVED = "approved"
     PUBLISHED = "published"
+    PAUSED = "paused"
     CLOSED = "closed"
+    ARCHIVED = "archived"
 
 
 class CandidateFacingStatus(str, enum.Enum):
@@ -65,11 +70,36 @@ class Job(Base, TenantScopedMixin, TimestampMixin):
         String(50), nullable=False, default="full_time", index=True
     )  # full_time, part_time, contract, internship
     description: Mapped[str] = mapped_column(Text, nullable=False)
+    responsibilities: Mapped[str | None] = mapped_column(Text, nullable=True)
+    required_qualifications: Mapped[str | None] = mapped_column(Text, nullable=True)
     requirements: Mapped[str | None] = mapped_column(Text, nullable=True)
     skills_required: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    preferred_skills: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     experience_level: Mapped[str] = mapped_column(
         String(50), nullable=False, default="mid"
     )  # entry, mid, senior, lead, executive
+    experience_requirements: Mapped[str | None] = mapped_column(Text, nullable=True)
+    education_requirements: Mapped[str | None] = mapped_column(Text, nullable=True)
+    country: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    vacancies_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    recruiter_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    hiring_manager_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    visibility: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="public", index=True
+    )  # public, internal, unlisted
+    approval_status: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="draft", index=True
+    )  # draft, pending, approved, rejected
     salary_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
     salary_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
     salary_currency: Mapped[str] = mapped_column(String(10), nullable=False, default="USD")
@@ -84,6 +114,12 @@ class Job(Base, TenantScopedMixin, TimestampMixin):
     )
 
     # Relationships
+    recruiter: Mapped[User | None] = relationship(
+        "User", foreign_keys=[recruiter_id], lazy="selectin"
+    )
+    hiring_manager: Mapped[User | None] = relationship(
+        "User", foreign_keys=[hiring_manager_id], lazy="selectin"
+    )
     applications: Mapped[list[JobApplication]] = relationship(
         "JobApplication", back_populates="job", cascade="all, delete-orphan"
     )

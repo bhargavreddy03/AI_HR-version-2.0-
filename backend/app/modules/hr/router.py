@@ -9,18 +9,26 @@ import logging
 from datetime import datetime
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.errors import AuthorizationException
+from app.core.errors import AuthorizationException, EntityNotFoundException
 from app.core.security import SecurityContext
 from app.modules.auth.dependencies import (
     require_authenticated_user,
 )
+from app.modules.hr.requisition_schemas import (
+    CanonicalSkillSuggestion,
+    JobRequisitionCreate,
+    JobRequisitionListResponse,
+    JobRequisitionRead,
+    JobRequisitionUpdate,
+    TeamMemberOption,
+)
 from app.modules.hr.schemas import HrDashboardOverviewResponse
-from app.modules.hr.service import hr_dashboard_service
+from app.modules.hr.service import hr_dashboard_service, hr_requisition_service
 from app.modules.organizations.models import OrganizationMembership
 
 logger = logging.getLogger(__name__)
@@ -105,3 +113,147 @@ async def get_dashboard_overview(
         employment_type=employment_type,
         stage=stage,
     )
+
+
+# ------------------------------------------------------------------------------
+# Job Requisition Endpoints (Step 4.2.3)
+# ------------------------------------------------------------------------------
+
+
+@hr_router.get(
+    "/jobs",
+    response_model=JobRequisitionListResponse,
+    summary="List organization-scoped job requisitions with pagination and filters",
+)
+async def list_requisitions(
+    search: str | None = Query(None, description="Search by title, department, or location"),
+    department: str | None = Query(None, description="Filter by department"),
+    status: str | None = Query(None, description="Filter by status (draft, published, etc.)"),
+    recruiter_id: UUID | None = Query(None, description="Filter by recruiter UUID"),
+    hiring_manager_id: UUID | None = Query(None, description="Filter by hiring manager UUID"),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+    sort_by: str = Query("created_at", description="Field to sort by (created_at, title, department, status)"),
+    sort_order: str = Query("desc", description="Sort order (asc, desc)"),
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> JobRequisitionListResponse:
+    """List job requisitions strictly within the caller's organization boundary."""
+    return await hr_requisition_service.list_requisitions(
+        db=db,
+        tenant_id=tenant_id,
+        search=search,
+        department=department,
+        status=status,
+        recruiter_id=recruiter_id,
+        hiring_manager_id=hiring_manager_id,
+        page=page,
+        page_size=page_size,
+        sort_by=sort_by,
+        sort_order=sort_order,
+    )
+
+
+@hr_router.post(
+    "/jobs",
+    response_model=JobRequisitionRead,
+    status_code=201,
+    summary="Create a new job requisition draft or pending approval",
+)
+async def create_requisition(
+    data: JobRequisitionCreate,
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> JobRequisitionRead:
+    """Create a new job requisition bound strictly to the caller's organization."""
+    return await hr_requisition_service.create_requisition(
+        db=db,
+        tenant_id=tenant_id,
+        data=data,
+    )
+
+
+@hr_router.get(
+    "/jobs/team-members",
+    response_model=list[TeamMemberOption],
+    summary="Retrieve organization members available for recruiter or hiring manager assignment",
+)
+async def list_team_members(
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> list[TeamMemberOption]:
+    """Retrieve active organization members available for assignment."""
+    return await hr_requisition_service.list_team_members(db=db, tenant_id=tenant_id)
+
+
+@hr_router.get(
+    "/jobs/skills-autocomplete",
+    response_model=list[CanonicalSkillSuggestion],
+    summary="Search canonical technical skills taxonomy for requisition autocompletion",
+)
+async def autocomplete_canonical_skills(
+    q: str = Query("", description="Skill keyword search query"),
+    limit: int = Query(15, ge=1, le=50, description="Max suggestions to return"),
+    _: UUID = Depends(resolve_hr_tenant_context),
+) -> list[CanonicalSkillSuggestion]:
+    """Provide verified canonical skill autocomplete suggestions."""
+    return hr_requisition_service.search_canonical_skills(query=q, limit=limit)
+
+
+@hr_router.get(
+    "/jobs/{job_id}",
+    response_model=JobRequisitionRead,
+    summary="Retrieve detailed job requisition information",
+)
+async def get_requisition(
+    job_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> JobRequisitionRead:
+    """Fetch complete requisition record scoped to tenant."""
+    requisition = await hr_requisition_service.get_requisition(
+        db=db, tenant_id=tenant_id, job_id=job_id
+    )
+    if not requisition:
+        raise EntityNotFoundException("JobRequisition", job_id)
+    return requisition
+
+
+@hr_router.put(
+    "/jobs/{job_id}",
+    response_model=JobRequisitionRead,
+    summary="Update an existing job requisition",
+)
+async def update_requisition(
+    job_id: UUID,
+    data: JobRequisitionUpdate,
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> JobRequisitionRead:
+    """Update job requisition details within tenant boundary."""
+    updated = await hr_requisition_service.update_requisition(
+        db=db, tenant_id=tenant_id, job_id=job_id, data=data
+    )
+    if not updated:
+        raise EntityNotFoundException("JobRequisition", job_id)
+    return updated
+
+
+@hr_router.delete(
+    "/jobs/{job_id}",
+    status_code=204,
+    response_class=Response,
+    summary="Delete a draft job requisition without applications",
+)
+async def delete_requisition(
+    job_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> Response:
+    """Safely delete draft job requisition if no candidate applications exist."""
+    deleted = await hr_requisition_service.delete_requisition(
+        db=db, tenant_id=tenant_id, job_id=job_id
+    )
+    if not deleted:
+        raise EntityNotFoundException("JobRequisition", job_id)
+    return Response(status_code=204)

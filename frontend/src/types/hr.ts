@@ -92,3 +92,127 @@ export interface HrDashboardFilterParams {
   employment_type?: string;
   stage?: string;
 }
+
+export interface JobRequisition {
+  id: string;
+  tenant_id: string;
+  title: string;
+  slug: string;
+  department: string;
+  location: string;
+  country?: string | null;
+  remote_type: string;
+  employment_type: string;
+  experience_level: string;
+  description: string;
+  responsibilities?: string | null;
+  required_qualifications?: string | null;
+  requirements?: string | null;
+  skills_required: string[];
+  preferred_skills: string[];
+  experience_requirements?: string | null;
+  education_requirements?: string | null;
+  salary_min?: number | null;
+  salary_max?: number | null;
+  salary_currency: string;
+  vacancies_count: number;
+  status: string;
+  approval_status: string;
+  visibility: string;
+  recruiter_id?: string | null;
+  recruiter_name?: string | null;
+  recruiter_email?: string | null;
+  hiring_manager_id?: string | null;
+  hiring_manager_name?: string | null;
+  hiring_manager_email?: string | null;
+  applications_count: number;
+  published_at?: string | null;
+  application_deadline?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface JobRequisitionCreateInput {
+  title: string;
+  department: string;
+  location: string;
+  country?: string | null;
+  remote_type: string;
+  employment_type: string;
+  experience_level: string;
+  description: string;
+  responsibilities?: string | null;
+  required_qualifications?: string | null;
+  skills_required: string[];
+  preferred_skills: string[];
+  experience_requirements?: string | null;
+  education_requirements?: string | null;
+  salary_min?: number | null;
+  salary_max?: number | null;
+  salary_currency: string;
+  vacancies_count: number;
+  application_deadline?: string | null;
+  recruiter_id?: string | null;
+  hiring_manager_id?: string | null;
+  visibility: string;
+  status: string;
+}
+
+export interface JobRequisitionUpdateInput {
+  title?: string;
+  department?: string;
+  location?: string;
+  country?: string | null;
+  remote_type?: string;
+  employment_type?: string;
+  experience_level?: string;
+  description?: string;
+  responsibilities?: string | null;
+  required_qualifications?: string | null;
+  skills_required?: string[];
+  preferred_skills?: string[];
+  experience_requirements?: string | null;
+  education_requirements?: string | null;
+  salary_min?: number | null;
+  salary_max?: number | null;
+  salary_currency?: string;
+  vacancies_count?: number;
+  application_deadline?: string | null;
+  recruiter_id?: string | null;
+  hiring_manager_id?: string | null;
+  visibility?: string;
+  status?: string;
+}
+
+export interface JobRequisitionListResponse {
+  items: JobRequisition[];
+  total: number;
+  page: number;
+  page_size: number;
+  pages: number;
+}
+
+export interface TeamMemberOption {
+  id: string;
+  name: string;
+  email: string;
+  role: string;
+}
+
+export interface CanonicalSkillSuggestion {
+  canonical_name: string;
+  category: string;
+  skill_id: string;
+}
+
+export interface JobRequisitionFilterParams {
+  search?: string;
+  department?: string;
+  status?: string;
+  recruiter_id?: string;
+  hiring_manager_id?: string;
+  page?: number;
+  page_size?: number;
+  sort_by?: string;
+  sort_order?: string;
+}
