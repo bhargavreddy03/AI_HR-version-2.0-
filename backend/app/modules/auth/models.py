@@ -73,6 +73,11 @@ class CandidateUserProfile(Base, TimestampMixin):
     )
     headline: Mapped[str | None] = mapped_column(String(255), nullable=True)
     bio: Mapped[str | None] = mapped_column(Text, nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    location_city: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    location_country: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    preferred_title: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    work_authorization: Mapped[str | None] = mapped_column(String(100), nullable=True)
     portfolio_urls: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     self_declared_skills: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
 

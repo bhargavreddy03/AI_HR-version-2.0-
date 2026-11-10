@@ -94,6 +94,8 @@ class TenantScopedMixin:
 def import_all_models() -> None:
     """Explicitly import all domain models to ensure registration in Base.metadata."""
     import app.modules.auth.models  # noqa: F401
+    import app.modules.candidates.models  # noqa: F401
     import app.modules.documents.models  # noqa: F401
     import app.modules.embeddings.models  # noqa: F401
+    import app.modules.jobs.models  # noqa: F401
     import app.modules.organizations.models  # noqa: F401
