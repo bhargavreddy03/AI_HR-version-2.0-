@@ -10,12 +10,16 @@ import type {
   BulkRecruiterAssignResponse,
   BulkStageMoveRequest,
   BulkStageMoveResponse,
+  CandidateActivityTimelineResponse,
   CandidateComparisonRequest,
   CandidateComparisonResponse,
   CandidateDetailResponse,
   CanonicalSkillSuggestion,
+  CreateInternalNoteRequest,
+  CreateRecruitmentTaskRequest,
   HrDashboardFilterParams,
   HrDashboardOverviewResponse,
+  InternalNoteResponse,
   JobAssignmentHistoryItem,
   JobAssignmentUpdateRequest,
   JobAssignmentUpdateResponse,
@@ -30,11 +34,16 @@ import type {
   JobRequisitionUpdateInput,
   PipelineBoardResponse,
   PipelineStageConfig,
+  RecruitmentTaskResponse,
   ResumeSignedUrlResponse,
+  ReviewFeedbackResponse,
   StageTransitionRequest,
   StageTransitionResponse,
+  SubmitReviewFeedbackRequest,
   TeamMemberOption,
   TeamWorkloadResponse,
+  UpdateInternalNoteRequest,
+  UpdateRecruitmentTaskRequest,
 } from "@/types/hr";
 
 async function fetchWithAuth<T>(
@@ -443,6 +452,148 @@ export const hrApi = {
   async getMyAssignedVacancies(): Promise<AssignedVacanciesResponse> {
     return fetchWithAuth<AssignedVacanciesResponse>(
       "/hr/assignments/my-vacancies"
+    );
+  },
+
+  // ----------------------------------------------------------------------
+  // Step 4.2.8: Candidate Review, Notes, Scorecards, Tasks & Timeline
+  // ----------------------------------------------------------------------
+
+  /**
+   * Add an internal private note on a candidate.
+   */
+  async addInternalNote(
+    candidateId: string,
+    payload: CreateInternalNoteRequest
+  ): Promise<InternalNoteResponse> {
+    return fetchWithAuth<InternalNoteResponse>(
+      `/hr/candidates/${candidateId}/notes`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }
+    );
+  },
+
+  /**
+   * Retrieve internal notes for a candidate.
+   */
+  async getInternalNotes(
+    candidateId: string,
+    applicationId?: string
+  ): Promise<InternalNoteResponse[]> {
+    const qs = applicationId ? `?application_id=${encodeURIComponent(applicationId)}` : "";
+    return fetchWithAuth<InternalNoteResponse[]>(
+      `/hr/candidates/${candidateId}/notes${qs}`
+    );
+  },
+
+  /**
+   * Update an internal note authored by the user or as org admin.
+   */
+  async updateInternalNote(
+    noteId: string,
+    payload: UpdateInternalNoteRequest
+  ): Promise<InternalNoteResponse> {
+    return fetchWithAuth<InternalNoteResponse>(`/hr/notes/${noteId}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  /**
+   * Delete an internal note authored by the user or as org admin.
+   */
+  async deleteInternalNote(noteId: string): Promise<void> {
+    return fetchWithAuth<void>(`/hr/notes/${noteId}`, {
+      method: "DELETE",
+    });
+  },
+
+  /**
+   * Submit collaborative evaluation review scorecard for an application.
+   */
+  async submitReviewFeedback(
+    applicationId: string,
+    payload: SubmitReviewFeedbackRequest
+  ): Promise<ReviewFeedbackResponse> {
+    return fetchWithAuth<ReviewFeedbackResponse>(
+      `/hr/applications/${applicationId}/reviews`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }
+    );
+  },
+
+  /**
+   * Retrieve all review scorecards submitted for an application.
+   */
+  async getApplicationReviews(
+    applicationId: string
+  ): Promise<ReviewFeedbackResponse[]> {
+    return fetchWithAuth<ReviewFeedbackResponse[]>(
+      `/hr/applications/${applicationId}/reviews`
+    );
+  },
+
+  /**
+   * Create a recruitment follow-up task.
+   */
+  async createRecruitmentTask(
+    candidateId: string,
+    payload: CreateRecruitmentTaskRequest
+  ): Promise<RecruitmentTaskResponse> {
+    return fetchWithAuth<RecruitmentTaskResponse>(
+      `/hr/candidates/${candidateId}/tasks`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }
+    );
+  },
+
+  /**
+   * Retrieve recruitment follow-up tasks across candidates/applications.
+   */
+  async listRecruitmentTasks(params?: {
+    candidate_id?: string;
+    application_id?: string;
+    assignee_id?: string;
+    is_completed?: boolean;
+  }): Promise<RecruitmentTaskResponse[]> {
+    const searchParams = new URLSearchParams();
+    if (params?.candidate_id) searchParams.append("candidate_id", params.candidate_id);
+    if (params?.application_id) searchParams.append("application_id", params.application_id);
+    if (params?.assignee_id) searchParams.append("assignee_id", params.assignee_id);
+    if (params?.is_completed !== undefined) searchParams.append("is_completed", String(params.is_completed));
+    const qs = searchParams.toString() ? `?${searchParams.toString()}` : "";
+    return fetchWithAuth<RecruitmentTaskResponse[]>(`/hr/tasks${qs}`);
+  },
+
+  /**
+   * Update or mark completed a recruitment task.
+   */
+  async updateRecruitmentTask(
+    taskId: string,
+    payload: UpdateRecruitmentTaskRequest
+  ): Promise<RecruitmentTaskResponse> {
+    return fetchWithAuth<RecruitmentTaskResponse>(`/hr/tasks/${taskId}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  /**
+   * Retrieve unified activity timeline separating internal events from candidate events.
+   */
+  async getCandidateTimeline(
+    candidateId: string,
+    applicationId?: string
+  ): Promise<CandidateActivityTimelineResponse> {
+    const qs = applicationId ? `?application_id=${encodeURIComponent(applicationId)}` : "";
+    return fetchWithAuth<CandidateActivityTimelineResponse>(
+      `/hr/candidates/${candidateId}/timeline${qs}`
     );
   },
 };

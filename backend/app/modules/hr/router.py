@@ -64,6 +64,18 @@ from app.modules.hr.requisition_schemas import (
     JobRequisitionUpdate,
     TeamMemberOption,
 )
+from app.modules.hr.review_schemas import (
+    CandidateActivityTimelineResponse,
+    CreateInternalNoteRequest,
+    CreateRecruitmentTaskRequest,
+    InternalNoteResponse,
+    RecruitmentTaskResponse,
+    ReviewFeedbackResponse,
+    SubmitReviewFeedbackRequest,
+    UpdateInternalNoteRequest,
+    UpdateRecruitmentTaskRequest,
+)
+from app.modules.hr.review_service import hr_review_service
 from app.modules.hr.schemas import HrDashboardOverviewResponse
 from app.modules.hr.service import hr_dashboard_service, hr_requisition_service
 from app.modules.organizations.models import OrganizationMembership
@@ -758,6 +770,250 @@ async def get_my_vacancies(
     return await hr_assignment_service.get_assigned_vacancies(
         db=db, tenant_id=tenant_id, user_id=sec.user_id
     )
+
+
+# ----------------------------------------------------------------------
+# Candidate Review & Internal Collaboration Endpoints (Step 4.2.8)
+# ----------------------------------------------------------------------
+
+
+@hr_router.post(
+    "/candidates/{candidate_id}/notes",
+    response_model=InternalNoteResponse,
+    summary="Add an internal note to a candidate profile or application",
+)
+async def add_internal_note(
+    candidate_id: UUID,
+    request: CreateInternalNoteRequest,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> InternalNoteResponse:
+    """Record private recruiter or hiring manager note; confidential notes are restricted."""
+    author_name = getattr(sec, "user_name", "Recruiter")
+    author_role = sec.roles[0] if sec.roles else "recruiter"
+    return await hr_review_service.add_internal_note(
+        db=db,
+        tenant_id=tenant_id,
+        candidate_id=candidate_id,
+        author_id=sec.user_id,
+        author_name=author_name,
+        author_role=author_role,
+        request=request,
+    )
+
+
+@hr_router.get(
+    "/candidates/{candidate_id}/notes",
+    response_model=list[InternalNoteResponse],
+    summary="Retrieve internal notes for candidate respecting confidentiality permissions",
+)
+async def get_internal_notes(
+    candidate_id: UUID,
+    application_id: UUID | None = Query(None, description="Optional application filter"),
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> list[InternalNoteResponse]:
+    """Retrieve private notes. Confidential notes are only visible to author and org admins."""
+    is_admin = bool(
+        sec.is_super_admin
+        or set(sec.roles).intersection({"admin", "org_admin", "platform_super_admin"})
+    )
+    return await hr_review_service.get_internal_notes(
+        db=db,
+        tenant_id=tenant_id,
+        candidate_id=candidate_id,
+        actor_id=sec.user_id,
+        is_admin=is_admin,
+        application_id=application_id,
+    )
+
+
+@hr_router.put(
+    "/notes/{note_id}",
+    response_model=InternalNoteResponse,
+    summary="Update an existing internal note (restricted to author or org admin)",
+)
+async def update_internal_note(
+    note_id: UUID,
+    request: UpdateInternalNoteRequest,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> InternalNoteResponse:
+    """Update private note content or confidentiality flags."""
+    is_admin = bool(
+        sec.is_super_admin
+        or set(sec.roles).intersection({"admin", "org_admin", "platform_super_admin"})
+    )
+    return await hr_review_service.update_internal_note(
+        db=db,
+        tenant_id=tenant_id,
+        note_id=note_id,
+        actor_id=sec.user_id,
+        is_admin=is_admin,
+        request=request,
+    )
+
+
+@hr_router.delete(
+    "/notes/{note_id}",
+    summary="Delete an internal note (restricted to author or org admin)",
+)
+async def delete_internal_note(
+    note_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> dict[str, str]:
+    """Delete private note."""
+    is_admin = bool(
+        sec.is_super_admin
+        or set(sec.roles).intersection({"admin", "org_admin", "platform_super_admin"})
+    )
+    await hr_review_service.delete_internal_note(
+        db=db,
+        tenant_id=tenant_id,
+        note_id=note_id,
+        actor_id=sec.user_id,
+        is_admin=is_admin,
+    )
+    return {"message": "Internal note deleted successfully."}
+
+
+@hr_router.post(
+    "/applications/{application_id}/reviews",
+    response_model=ReviewFeedbackResponse,
+    summary="Submit or update candidate evaluation scorecard feedback",
+)
+async def submit_review_feedback(
+    application_id: UUID,
+    request: SubmitReviewFeedbackRequest,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> ReviewFeedbackResponse:
+    """Submit structured rating and recommendation review from recruiter or hiring manager."""
+    reviewer_name = getattr(sec, "user_name", "Reviewer")
+    reviewer_role = sec.roles[0] if sec.roles else "recruiter"
+    return await hr_review_service.submit_review_feedback(
+        db=db,
+        tenant_id=tenant_id,
+        application_id=application_id,
+        reviewer_id=sec.user_id,
+        reviewer_name=reviewer_name,
+        reviewer_role=reviewer_role,
+        request=request,
+    )
+
+
+@hr_router.get(
+    "/applications/{application_id}/reviews",
+    response_model=list[ReviewFeedbackResponse],
+    summary="Retrieve all review evaluation scorecards for an application",
+)
+async def get_application_reviews(
+    application_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> list[ReviewFeedbackResponse]:
+    """Retrieve evaluation scorecards."""
+    return await hr_review_service.get_application_reviews(
+        db=db, tenant_id=tenant_id, application_id=application_id
+    )
+
+
+@hr_router.post(
+    "/candidates/{candidate_id}/tasks",
+    response_model=RecruitmentTaskResponse,
+    summary="Create a recruitment follow-up task for candidate or application",
+)
+async def create_recruitment_task(
+    candidate_id: UUID,
+    request: CreateRecruitmentTaskRequest,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> RecruitmentTaskResponse:
+    """Create follow-up task with optional due date and assignee."""
+    creator_name = getattr(sec, "user_name", "Recruiter")
+    return await hr_review_service.create_task(
+        db=db,
+        tenant_id=tenant_id,
+        candidate_id=candidate_id,
+        creator_id=sec.user_id,
+        creator_name=creator_name,
+        request=request,
+    )
+
+
+@hr_router.get(
+    "/tasks",
+    response_model=list[RecruitmentTaskResponse],
+    summary="Retrieve recruitment follow-up tasks with optional filters",
+)
+async def list_recruitment_tasks(
+    candidate_id: UUID | None = Query(None, description="Filter by candidate UUID"),
+    application_id: UUID | None = Query(None, description="Filter by application UUID"),
+    assignee_id: UUID | None = Query(None, description="Filter by assignee UUID"),
+    is_completed: bool | None = Query(None, description="Filter by completion status"),
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> list[RecruitmentTaskResponse]:
+    """Retrieve recruitment tasks."""
+    return await hr_review_service.get_tasks(
+        db=db,
+        tenant_id=tenant_id,
+        candidate_id=candidate_id,
+        application_id=application_id,
+        assignee_id=assignee_id,
+        is_completed=is_completed,
+    )
+
+
+@hr_router.patch(
+    "/tasks/{task_id}",
+    response_model=RecruitmentTaskResponse,
+    summary="Update or mark completed a recruitment follow-up task",
+)
+async def update_recruitment_task(
+    task_id: UUID,
+    request: UpdateRecruitmentTaskRequest,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> RecruitmentTaskResponse:
+    """Update task completion or properties."""
+    return await hr_review_service.update_task(
+        db=db,
+        tenant_id=tenant_id,
+        task_id=task_id,
+        actor_id=sec.user_id,
+        request=request,
+    )
+
+
+@hr_router.get(
+    "/candidates/{candidate_id}/timeline",
+    response_model=CandidateActivityTimelineResponse,
+    summary="Retrieve unified candidate activity timeline separating internal events",
+)
+async def get_candidate_timeline(
+    candidate_id: UUID,
+    application_id: UUID | None = Query(None, description="Optional application filter"),
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> CandidateActivityTimelineResponse:
+    """Retrieve unified timeline. Internal HR actions are included for authorized recruiters."""
+    return await hr_review_service.get_candidate_timeline(
+        db=db,
+        tenant_id=tenant_id,
+        candidate_id=candidate_id,
+        application_id=application_id,
+        is_internal_viewer=True,
+    )
+
 
 
 

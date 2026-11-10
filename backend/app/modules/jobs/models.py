@@ -10,6 +10,7 @@ from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import (
+    Boolean,
     ForeignKey,
     Integer,
     String,
@@ -211,6 +212,24 @@ class JobApplication(Base, TenantScopedMixin, TimestampMixin):
         cascade="all, delete-orphan",
         order_by="desc(ApplicationStageHistory.created_at)",
     )
+    notes: Mapped[list[CandidateInternalNote]] = relationship(
+        "CandidateInternalNote",
+        back_populates="application",
+        cascade="all, delete-orphan",
+        order_by="desc(CandidateInternalNote.created_at)",
+    )
+    review_feedback: Mapped[list[CandidateReviewFeedback]] = relationship(
+        "CandidateReviewFeedback",
+        back_populates="application",
+        cascade="all, delete-orphan",
+        order_by="desc(CandidateReviewFeedback.created_at)",
+    )
+    tasks: Mapped[list[CandidateRecruitmentTask]] = relationship(
+        "CandidateRecruitmentTask",
+        back_populates="application",
+        cascade="all, delete-orphan",
+        order_by="desc(CandidateRecruitmentTask.created_at)",
+    )
 
 
 class JobLifecycleHistory(Base, TenantScopedMixin):
@@ -343,6 +362,151 @@ class JobAssignmentHistory(Base, TenantScopedMixin):
     actor: Mapped[User | None] = relationship("User", foreign_keys=[actor_id], lazy="selectin")
     previous_user: Mapped[User | None] = relationship("User", foreign_keys=[previous_user_id], lazy="selectin")
     new_user: Mapped[User | None] = relationship("User", foreign_keys=[new_user_id], lazy="selectin")
+
+
+class CandidateInternalNote(Base, TenantScopedMixin, TimestampMixin):
+    """Internal recruiter and hiring manager notes strictly private to organization."""
+
+    __tablename__ = "candidate_internal_notes"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        default=generate_uuid7,
+        index=True,
+    )
+    candidate_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    application_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("job_applications.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    author_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    author_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    author_role: Mapped[str] = mapped_column(String(50), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="general", server_default="general"
+    )
+    is_confidential: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Relationships
+    application: Mapped[JobApplication | None] = relationship(
+        "JobApplication", back_populates="notes"
+    )
+    candidate: Mapped[User] = relationship("User", foreign_keys=[candidate_id], lazy="selectin")
+    author: Mapped[User | None] = relationship("User", foreign_keys=[author_id], lazy="selectin")
+
+
+class CandidateReviewFeedback(Base, TenantScopedMixin, TimestampMixin):
+    """Structured collaborative evaluation feedback / scorecards from hiring team."""
+
+    __tablename__ = "candidate_review_feedback"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        default=generate_uuid7,
+        index=True,
+    )
+    application_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("job_applications.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    reviewer_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    reviewer_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    reviewer_role: Mapped[str] = mapped_column(String(50), nullable=False)
+    recommendation: Mapped[str] = mapped_column(String(50), nullable=False)  # strong_yes, yes, neutral, no, strong_no
+    technical_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    communication_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cultural_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    overall_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    pros: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True, default=list)
+    cons: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True, default=list)
+
+    # Relationships
+    application: Mapped[JobApplication] = relationship(
+        "JobApplication", back_populates="review_feedback"
+    )
+    reviewer: Mapped[User] = relationship("User", foreign_keys=[reviewer_id], lazy="selectin")
+
+
+class CandidateRecruitmentTask(Base, TenantScopedMixin, TimestampMixin):
+    """Internal recruitment action items and follow-up tasks linked to candidate applications."""
+
+    __tablename__ = "candidate_recruitment_tasks"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        default=generate_uuid7,
+        index=True,
+    )
+    candidate_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    application_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("job_applications.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    creator_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    creator_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    assignee_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    assignee_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    task_type: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="general", server_default="general"
+    )
+    due_date: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    is_completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    completed_by_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    # Relationships
+    application: Mapped[JobApplication | None] = relationship(
+        "JobApplication", back_populates="tasks"
+    )
+    candidate: Mapped[User] = relationship("User", foreign_keys=[candidate_id], lazy="selectin")
+    creator: Mapped[User | None] = relationship("User", foreign_keys=[creator_id], lazy="selectin")
+    assignee: Mapped[User | None] = relationship("User", foreign_keys=[assignee_id], lazy="selectin")
+
 
 
 

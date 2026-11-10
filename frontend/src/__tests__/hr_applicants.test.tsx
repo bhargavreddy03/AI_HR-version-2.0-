@@ -452,14 +452,13 @@ describe("HR Applicant and Candidate Management (Frontend)", () => {
     expect(screen.getByText("B.S. Computer Science in Computer Science")).toBeDefined();
     expect(screen.getByText("University of Texas at Austin")).toBeDefined();
 
-    // Timeline separation
-    expect(screen.getByText("Internal HR Activity & Notes")).toBeDefined();
-    expect(screen.getByText("Moved candidate to technical screening stage")).toBeDefined();
-
-    expect(screen.getByText("Candidate-Facing Journey")).toBeDefined();
-    expect(screen.getByText("Application received")).toBeDefined();
+    // Timeline & collaboration tabs
+    expect(screen.getByTestId("tab-timeline")).toBeDefined();
+    expect(screen.getByTestId("tab-notes")).toBeDefined();
+    expect(screen.getByTestId("tab-scorecards")).toBeDefined();
+    expect(screen.getByTestId("tab-tasks")).toBeDefined();
 
     // Organization application history
-    expect(screen.getByText("Organization Application History")).toBeDefined();
+    expect(screen.getByText("Organization History")).toBeDefined();
   });
 });

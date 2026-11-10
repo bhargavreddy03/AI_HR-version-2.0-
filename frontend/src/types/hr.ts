@@ -689,5 +689,121 @@ export interface AssignedVacanciesResponse {
   total: number;
 }
 
+// ----------------------------------------------------------------------
+// Step 4.2.8: Candidate Review, Notes, Scorecards, Tasks & Timeline
+// ----------------------------------------------------------------------
+
+export interface InternalNoteResponse {
+  id: string;
+  candidate_id: string;
+  application_id?: string | null;
+  author_id?: string | null;
+  author_name: string;
+  author_role: string;
+  content: string;
+  category: "general" | "screening" | "interview_feedback" | "compensation" | "reference_check" | string;
+  is_confidential: boolean;
+  can_edit: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateInternalNoteRequest {
+  application_id?: string | null;
+  content: string;
+  category?: string;
+  is_confidential?: boolean;
+}
+
+export interface UpdateInternalNoteRequest {
+  content: string;
+  category?: string;
+  is_confidential?: boolean;
+}
+
+export interface ReviewFeedbackResponse {
+  id: string;
+  application_id: string;
+  reviewer_id: string;
+  reviewer_name: string;
+  reviewer_role: string;
+  recommendation: "strong_yes" | "yes" | "neutral" | "no" | "strong_no" | string;
+  technical_rating?: number | null;
+  communication_rating?: number | null;
+  cultural_rating?: number | null;
+  overall_rating?: number | null;
+  summary: string;
+  pros: string[];
+  cons: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SubmitReviewFeedbackRequest {
+  recommendation: "strong_yes" | "yes" | "neutral" | "no" | "strong_no" | string;
+  technical_rating?: number;
+  communication_rating?: number;
+  cultural_rating?: number;
+  overall_rating?: number;
+  summary: string;
+  pros?: string[];
+  cons?: string[];
+}
+
+export interface RecruitmentTaskResponse {
+  id: string;
+  candidate_id: string;
+  application_id?: string | null;
+  creator_id?: string | null;
+  creator_name: string;
+  assignee_id?: string | null;
+  assignee_name?: string | null;
+  title: string;
+  description?: string | null;
+  task_type: "resume_review" | "schedule_interview" | "phone_screen" | "reference_check" | "send_offer" | "general" | string;
+  due_date?: string | null;
+  is_completed: boolean;
+  completed_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateRecruitmentTaskRequest {
+  application_id?: string | null;
+  title: string;
+  description?: string;
+  task_type?: string;
+  assignee_id?: string | null;
+  due_date?: string | null;
+}
+
+export interface UpdateRecruitmentTaskRequest {
+  is_completed?: boolean;
+  title?: string;
+  description?: string;
+  assignee_id?: string | null;
+  due_date?: string | null;
+}
+
+export interface CandidateTimelineItem {
+  id: string;
+  event_type: string;
+  title: string;
+  description?: string | null;
+  actor_name?: string | null;
+  actor_role?: string | null;
+  is_internal: boolean;
+  timestamp: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CandidateActivityTimelineResponse {
+  candidate_id: string;
+  application_id?: string | null;
+  events: CandidateTimelineItem[];
+  total_events: number;
+}
+
+
 
 
