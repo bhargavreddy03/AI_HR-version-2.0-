@@ -1,5 +1,12 @@
 import { getApiBaseUrl } from "./api";
 import type {
+  ApplicantFilterParams,
+  ApplicantListResponse,
+  BulkRecruiterAssignRequest,
+  BulkRecruiterAssignResponse,
+  CandidateComparisonRequest,
+  CandidateComparisonResponse,
+  CandidateDetailResponse,
   CanonicalSkillSuggestion,
   HrDashboardFilterParams,
   HrDashboardOverviewResponse,
@@ -12,6 +19,7 @@ import type {
   JobRequisitionFilterParams,
   JobRequisitionListResponse,
   JobRequisitionUpdateInput,
+  ResumeSignedUrlResponse,
   TeamMemberOption,
 } from "@/types/hr";
 
@@ -196,6 +204,90 @@ export const hrApi = {
   ): Promise<JobLifecyclePermittedActionsResponse> {
     return fetchWithAuth<JobLifecyclePermittedActionsResponse>(
       `/hr/jobs/${jobId}/lifecycle/permitted-actions`
+    );
+  },
+
+  /**
+   * List applicants with server-side filtering, search, and pagination.
+   */
+  async listApplicants(
+    params: ApplicantFilterParams = {}
+  ): Promise<ApplicantListResponse> {
+    const sp = new URLSearchParams();
+    if (params.search) sp.append("search", params.search);
+    if (params.job_id) sp.append("job_id", params.job_id);
+    if (params.department) sp.append("department", params.department);
+    if (params.status) sp.append("status", params.status);
+    if (params.recruiter_id) sp.append("recruiter_id", params.recruiter_id);
+    if (params.location) sp.append("location", params.location);
+    if (params.skills) sp.append("skills", params.skills);
+    if (params.min_experience_years !== undefined)
+      sp.append("min_experience_years", params.min_experience_years.toString());
+    if (params.max_experience_years !== undefined)
+      sp.append("max_experience_years", params.max_experience_years.toString());
+    if (params.applied_after) sp.append("applied_after", params.applied_after);
+    if (params.applied_before) sp.append("applied_before", params.applied_before);
+    if (params.page) sp.append("page", params.page.toString());
+    if (params.page_size) sp.append("page_size", params.page_size.toString());
+    if (params.sort_by) sp.append("sort_by", params.sort_by);
+    if (params.sort_order) sp.append("sort_order", params.sort_order);
+
+    const qs = sp.toString() ? `?${sp.toString()}` : "";
+    return fetchWithAuth<ApplicantListResponse>(`/hr/applicants${qs}`);
+  },
+
+  /**
+   * Retrieve complete candidate profile scoped strictly to organization context.
+   */
+  async getCandidateDetails(
+    candidateId: string,
+    applicationId?: string
+  ): Promise<CandidateDetailResponse> {
+    const qs = applicationId ? `?application_id=${applicationId}` : "";
+    return fetchWithAuth<CandidateDetailResponse>(
+      `/hr/candidates/${candidateId}${qs}`
+    );
+  },
+
+  /**
+   * Generate short-lived presigned URL for secure resume download with audit logging.
+   */
+  async getApplicationResumeUrl(
+    applicationId: string
+  ): Promise<ResumeSignedUrlResponse> {
+    return fetchWithAuth<ResumeSignedUrlResponse>(
+      `/hr/applications/${applicationId}/resume`
+    );
+  },
+
+  /**
+   * Prepare side-by-side comparative matrix for selected candidates.
+   */
+  async compareCandidates(
+    applicationIds: string[]
+  ): Promise<CandidateComparisonResponse> {
+    return fetchWithAuth<CandidateComparisonResponse>("/hr/candidates/compare", {
+      method: "POST",
+      body: JSON.stringify({ application_ids: applicationIds }),
+    });
+  },
+
+  /**
+   * Bulk assign recruiter to multiple selected applications.
+   */
+  async bulkAssignRecruiter(
+    applicationIds: string[],
+    recruiterId: string
+  ): Promise<BulkRecruiterAssignResponse> {
+    return fetchWithAuth<BulkRecruiterAssignResponse>(
+      "/hr/applicants/bulk-assign",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          application_ids: applicationIds,
+          recruiter_id: recruiterId,
+        }),
+      }
     );
   },
 };

@@ -58,7 +58,9 @@ const mockJob: JobRequisition = {
 const mockPermittedActions: JobLifecyclePermittedActionsResponse = {
   job_id: "11111111-2222-3333-4444-555555555555",
   current_status: "pending_approval",
+  approval_status: "pending_approval",
   permitted_actions: ["approve", "request_changes"],
+  can_approve: true,
   user_role: "hiring_manager",
   separation_of_duties_active: false,
 };
@@ -75,6 +77,7 @@ const mockHistory: JobLifecycleHistoryItem[] = [
     actor_email: "sarah@acme.com",
     actor_role: "recruiter",
     reason: "Submitted for engineering leadership sign-off",
+    audit_metadata: {},
     created_at: "2026-11-02T11:00:00Z",
   },
 ];
@@ -113,7 +116,9 @@ describe("HR Job Publishing and Lifecycle Management (Frontend)", () => {
     vi.spyOn(hrApi, "getPermittedLifecycleActions").mockResolvedValue({
       job_id: mockJob.id,
       current_status: "pending_approval",
+      approval_status: "pending_approval",
       permitted_actions: ["request_changes"], // approve excluded due to separation of duties
+      can_approve: false,
       user_role: "recruiter",
       separation_of_duties_active: true,
     });
@@ -133,7 +138,7 @@ describe("HR Job Publishing and Lifecycle Management (Frontend)", () => {
   it("handles approve action directly", async () => {
     const executeSpy = vi.spyOn(hrApi, "executeLifecycleAction").mockResolvedValue({
       job: { ...mockJob, status: "approved", approval_status: "approved" },
-      history_entry: {
+      transition: {
         id: "hist-2",
         job_id: mockJob.id,
         previous_status: "pending_approval",
@@ -142,11 +147,10 @@ describe("HR Job Publishing and Lifecycle Management (Frontend)", () => {
         actor_id: "hm-1",
         actor_name: "Alex Vance",
         actor_role: "hiring_manager",
+        audit_metadata: {},
         created_at: "2026-11-03T09:00:00Z",
       },
-      action: "approve",
-      previous_status: "pending_approval",
-      new_status: "approved",
+      permitted_next_actions: ["publish", "return_to_draft"],
     });
 
     render(<JobDetailPage />);
@@ -173,7 +177,7 @@ describe("HR Job Publishing and Lifecycle Management (Frontend)", () => {
         approval_status: "draft",
         change_request_reason: "Please update the required qualifications to include Kubernetes.",
       },
-      history_entry: {
+      transition: {
         id: "hist-2",
         job_id: mockJob.id,
         previous_status: "pending_approval",
@@ -183,11 +187,10 @@ describe("HR Job Publishing and Lifecycle Management (Frontend)", () => {
         actor_name: "Alex Vance",
         actor_role: "hiring_manager",
         reason: "Please update the required qualifications to include Kubernetes.",
+        audit_metadata: {},
         created_at: "2026-11-03T09:00:00Z",
       },
-      action: "request_changes",
-      previous_status: "pending_approval",
-      new_status: "draft",
+      permitted_next_actions: ["submit_for_approval"],
     });
 
     render(<JobDetailPage />);
@@ -228,14 +231,16 @@ describe("HR Job Publishing and Lifecycle Management (Frontend)", () => {
     vi.spyOn(hrApi, "getPermittedLifecycleActions").mockResolvedValue({
       job_id: mockJob.id,
       current_status: "approved",
+      approval_status: "approved",
       permitted_actions: ["publish", "return_to_draft"],
+      can_approve: true,
       user_role: "recruiter",
       separation_of_duties_active: false,
     });
 
     const executeSpy = vi.spyOn(hrApi, "executeLifecycleAction").mockResolvedValue({
       job: { ...mockJob, status: "published", approval_status: "approved", published_at: "2026-11-04T10:00:00Z" },
-      history_entry: {
+      transition: {
         id: "hist-3",
         job_id: mockJob.id,
         previous_status: "approved",
@@ -244,11 +249,10 @@ describe("HR Job Publishing and Lifecycle Management (Frontend)", () => {
         actor_id: "rec-1",
         actor_name: "Sarah Jenkins",
         actor_role: "recruiter",
+        audit_metadata: {},
         created_at: "2026-11-04T10:00:00Z",
       },
-      action: "publish",
-      previous_status: "approved",
-      new_status: "published",
+      permitted_next_actions: ["pause", "close"],
     });
 
     render(<JobDetailPage />);

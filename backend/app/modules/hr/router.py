@@ -19,6 +19,16 @@ from app.core.security import SecurityContext
 from app.modules.auth.dependencies import (
     require_authenticated_user,
 )
+from app.modules.hr.applicant_schemas import (
+    ApplicantListResponse,
+    BulkRecruiterAssignRequest,
+    BulkRecruiterAssignResponse,
+    CandidateComparisonRequest,
+    CandidateComparisonResponse,
+    CandidateDetailResponse,
+    ResumeSignedUrlResponse,
+)
+from app.modules.hr.applicant_service import hr_applicant_service
 from app.modules.hr.lifecycle_schemas import (
     JobLifecycleActionRequest,
     JobLifecycleHistoryItem,
@@ -331,3 +341,134 @@ async def get_permitted_lifecycle_actions(
         user_roles=sec.roles,
         is_super_admin=sec.is_super_admin,
     )
+
+
+# ----------------------------------------------------------------------
+# Applicant & Candidate Management Endpoints (Step 4.2.5)
+# ----------------------------------------------------------------------
+
+
+@hr_router.get(
+    "/applicants",
+    response_model=ApplicantListResponse,
+    summary="List organization-authorized applicants with filters, search, and pagination",
+)
+async def list_applicants(
+    search: str | None = Query(None, description="Search candidate name, email, or job title"),
+    job_id: UUID | None = Query(None, description="Filter by specific job requisition"),
+    department: str | None = Query(None, description="Filter by department"),
+    status: str | None = Query(None, description="Filter by internal status or comma-separated list"),
+    recruiter_id: UUID | None = Query(None, description="Filter by assigned recruiter"),
+    location: str | None = Query(None, description="Filter by candidate or job location"),
+    skills: str | None = Query(None, description="Filter by comma-separated skills"),
+    min_experience_years: float | None = Query(None, ge=0.0, description="Minimum years of experience"),
+    max_experience_years: float | None = Query(None, ge=0.0, description="Maximum years of experience"),
+    applied_after: datetime | None = Query(None, description="Applied after timestamp"),
+    applied_before: datetime | None = Query(None, description="Applied before timestamp"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    sort_by: str = Query("applied_at", description="Field to sort by: applied_at, candidate_name, job_title, status"),
+    sort_order: str = Query("desc", description="Sort order: asc or desc"),
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> ApplicantListResponse:
+    """List applicants for the authorized organization with search, filtering, and pagination."""
+    return await hr_applicant_service.list_applicants(
+        db=db,
+        tenant_id=tenant_id,
+        search=search,
+        job_id=job_id,
+        department=department,
+        status=status,
+        recruiter_id=recruiter_id,
+        location=location,
+        skills=skills,
+        min_experience_years=min_experience_years,
+        max_experience_years=max_experience_years,
+        applied_after=applied_after,
+        applied_before=applied_before,
+        page=page,
+        page_size=page_size,
+        sort_by=sort_by,
+        sort_order=sort_order,
+    )
+
+
+@hr_router.get(
+    "/candidates/{candidate_id}",
+    response_model=CandidateDetailResponse,
+    summary="Retrieve complete candidate profile scoped strictly to organization context",
+)
+async def get_candidate_details(
+    candidate_id: UUID,
+    application_id: UUID | None = Query(None, description="Optional application context ID"),
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> CandidateDetailResponse:
+    """Retrieve candidate profile, portfolio, submitted resume, and tenant-scoped application history."""
+    return await hr_applicant_service.get_candidate_details(
+        db=db,
+        tenant_id=tenant_id,
+        candidate_id=candidate_id,
+        application_id=application_id,
+    )
+
+
+@hr_router.get(
+    "/applications/{application_id}/resume",
+    response_model=ResumeSignedUrlResponse,
+    summary="Generate time-limited presigned download URL for submitted resume with audit logging",
+)
+async def get_application_resume_url(
+    application_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> ResumeSignedUrlResponse:
+    """Generate secure short-lived presigned download URL and record audit history."""
+    return await hr_applicant_service.get_resume_signed_url(
+        db=db,
+        tenant_id=tenant_id,
+        application_id=application_id,
+        actor_user_id=sec.user_id,
+    )
+
+
+@hr_router.post(
+    "/candidates/compare",
+    response_model=CandidateComparisonResponse,
+    summary="Generate side-by-side comparison matrix for 2 to 4 candidates",
+)
+async def compare_candidates(
+    request: CandidateComparisonRequest,
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> CandidateComparisonResponse:
+    """Prepare and return side-by-side comparative evaluation matrix for selected candidates."""
+    return await hr_applicant_service.compare_candidates(
+        db=db,
+        tenant_id=tenant_id,
+        application_ids=request.application_ids,
+    )
+
+
+@hr_router.post(
+    "/applicants/bulk-assign",
+    response_model=BulkRecruiterAssignResponse,
+    summary="Bulk-assign lead recruiter to selected organization applications",
+)
+async def bulk_assign_recruiter(
+    request: BulkRecruiterAssignRequest,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> BulkRecruiterAssignResponse:
+    """Perform bulk recruiter assignment for safe authorized workflow management."""
+    return await hr_applicant_service.bulk_assign_recruiter(
+        db=db,
+        tenant_id=tenant_id,
+        application_ids=request.application_ids,
+        recruiter_id=request.recruiter_id,
+        actor_id=sec.user_id,
+    )
+
