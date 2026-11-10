@@ -8,6 +8,7 @@ import {
   Briefcase,
   Users,
   Kanban,
+  UserCheck,
   Settings,
   X,
   ExternalLink,
@@ -41,6 +42,11 @@ const navItems = [
     name: "Pipeline Board",
     href: "/hr/pipeline",
     icon: Kanban,
+  },
+  {
+    name: "Team & Assignments",
+    href: "/hr/assignments",
+    icon: UserCheck,
   },
   {
     name: "Organization Settings",

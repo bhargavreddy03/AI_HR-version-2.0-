@@ -3,6 +3,9 @@ import type {
   ApplicantFilterParams,
   ApplicantListResponse,
   ApplicationStageHistoryItem,
+  AssignedVacanciesResponse,
+  AssignHiringManagerRequest,
+  AssignRecruiterRequest,
   BulkRecruiterAssignRequest,
   BulkRecruiterAssignResponse,
   BulkStageMoveRequest,
@@ -13,6 +16,9 @@ import type {
   CanonicalSkillSuggestion,
   HrDashboardFilterParams,
   HrDashboardOverviewResponse,
+  JobAssignmentHistoryItem,
+  JobAssignmentUpdateRequest,
+  JobAssignmentUpdateResponse,
   JobLifecycleActionRequest,
   JobLifecycleHistoryItem,
   JobLifecyclePermittedActionsResponse,
@@ -28,6 +34,7 @@ import type {
   StageTransitionRequest,
   StageTransitionResponse,
   TeamMemberOption,
+  TeamWorkloadResponse,
 } from "@/types/hr";
 
 async function fetchWithAuth<T>(
@@ -361,6 +368,81 @@ export const hrApi = {
   ): Promise<ApplicationStageHistoryItem[]> {
     return fetchWithAuth<ApplicationStageHistoryItem[]>(
       `/hr/applications/${applicationId}/stage/history`
+    );
+  },
+
+  /**
+   * Assign, change, or remove lead recruiter for a job vacancy.
+   */
+  async assignRecruiter(
+    jobId: string,
+    payload: AssignRecruiterRequest
+  ): Promise<JobAssignmentUpdateResponse> {
+    return fetchWithAuth<JobAssignmentUpdateResponse>(
+      `/hr/jobs/${jobId}/assign-recruiter`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }
+    );
+  },
+
+  /**
+   * Assign, change, or remove hiring manager for a job vacancy.
+   */
+  async assignHiringManager(
+    jobId: string,
+    payload: AssignHiringManagerRequest
+  ): Promise<JobAssignmentUpdateResponse> {
+    return fetchWithAuth<JobAssignmentUpdateResponse>(
+      `/hr/jobs/${jobId}/assign-hiring-manager`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }
+    );
+  },
+
+  /**
+   * Combined update for job recruiter and hiring manager assignments.
+   */
+  async updateJobAssignments(
+    jobId: string,
+    payload: JobAssignmentUpdateRequest
+  ): Promise<JobAssignmentUpdateResponse> {
+    return fetchWithAuth<JobAssignmentUpdateResponse>(
+      `/hr/jobs/${jobId}/assignments`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }
+    );
+  },
+
+  /**
+   * Retrieve immutable chronological assignment history for a job vacancy.
+   */
+  async getJobAssignmentHistory(
+    jobId: string
+  ): Promise<JobAssignmentHistoryItem[]> {
+    return fetchWithAuth<JobAssignmentHistoryItem[]>(
+      `/hr/jobs/${jobId}/assignments/history`
+    );
+  },
+
+  /**
+   * Retrieve live recruitment workload metrics across recruiters and hiring managers.
+   */
+  async getTeamWorkload(): Promise<TeamWorkloadResponse> {
+    return fetchWithAuth<TeamWorkloadResponse>("/hr/assignments/workload");
+  },
+
+  /**
+   * Retrieve job vacancies assigned to the authenticated user.
+   */
+  async getMyAssignedVacancies(): Promise<AssignedVacanciesResponse> {
+    return fetchWithAuth<AssignedVacanciesResponse>(
+      "/hr/assignments/my-vacancies"
     );
   },
 };

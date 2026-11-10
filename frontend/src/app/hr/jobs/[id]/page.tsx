@@ -30,6 +30,7 @@ import {
   ShieldAlert,
   History,
   FileText,
+  ExternalLink,
 } from "lucide-react";
 import { hrApi } from "@/lib/hrApi";
 import type {
@@ -761,9 +762,18 @@ export default function JobDetailPage() {
         <div className="space-y-6">
           {/* Internal Assignments Card */}
           <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-5 shadow-sm space-y-4">
-            <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 pb-2 border-b border-slate-100 dark:border-slate-800">
-              Recruitment Team Assignments
-            </h3>
+            <div className="flex items-center justify-between pb-2 border-b border-slate-100 dark:border-slate-800">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                Recruitment Team Assignments
+              </h3>
+              <Link
+                href="/hr/assignments"
+                className="text-xs font-medium text-indigo-600 hover:text-indigo-700 flex items-center gap-1"
+              >
+                Manage
+                <ExternalLink className="w-3 h-3" />
+              </Link>
+            </div>
 
             {/* Lead Recruiter */}
             <div className="flex items-start gap-3">

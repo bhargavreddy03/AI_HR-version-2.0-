@@ -25,7 +25,7 @@ const mockStages: PipelineStageConfig[] = [
   { id: "withdrawn", label: "Withdrawn", order: 11, is_terminal: true },
 ];
 
-const mockJobs: JobRequisition[] = [
+const mockJobs = [
   {
     id: "job-1111",
     tenant_id: "org-1",
@@ -33,12 +33,12 @@ const mockJobs: JobRequisition[] = [
     department: "Engineering",
     description: "Build robust distributed backend systems.",
     employment_type: "full_time",
-    work_arrangement: "remote",
+    remote_type: "remote",
     status: "published",
     created_at: "2026-11-01T00:00:00Z",
     updated_at: "2026-11-01T00:00:00Z",
   },
-];
+] as unknown as JobRequisition[];
 
 const mockTeam: TeamMemberOption[] = [
   {

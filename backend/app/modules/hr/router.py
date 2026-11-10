@@ -29,6 +29,16 @@ from app.modules.hr.applicant_schemas import (
     ResumeSignedUrlResponse,
 )
 from app.modules.hr.applicant_service import hr_applicant_service
+from app.modules.hr.assignment_schemas import (
+    AssignedVacanciesResponse,
+    AssignHiringManagerRequest,
+    AssignRecruiterRequest,
+    JobAssignmentHistoryItem,
+    JobAssignmentUpdateRequest,
+    JobAssignmentUpdateResponse,
+    TeamWorkloadResponse,
+)
+from app.modules.hr.assignment_service import hr_assignment_service
 from app.modules.hr.lifecycle_schemas import (
     JobLifecycleActionRequest,
     JobLifecycleHistoryItem,
@@ -594,5 +604,160 @@ async def get_application_stage_history(
         tenant_id=tenant_id,
         application_id=application_id,
     )
+
+
+# ----------------------------------------------------------------------
+# Recruiter & Hiring Manager Assignment Endpoints (Step 4.2.7)
+# ----------------------------------------------------------------------
+
+
+@hr_router.post(
+    "/jobs/{job_id}/assign-recruiter",
+    response_model=JobAssignmentUpdateResponse,
+    summary="Assign, change, or remove lead recruiter for a job vacancy",
+)
+async def assign_recruiter(
+    job_id: UUID,
+    request: AssignRecruiterRequest,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> JobAssignmentUpdateResponse:
+    """Validate organization membership, update lead recruiter, record history, and notify parties."""
+    return await hr_assignment_service.assign_recruiter(
+        db=db,
+        tenant_id=tenant_id,
+        job_id=job_id,
+        recruiter_id=request.recruiter_id,
+        actor_id=sec.user_id,
+        actor_roles=sec.roles,
+        is_super_admin=sec.is_super_admin,
+        reason=request.reason,
+    )
+
+
+@hr_router.post(
+    "/jobs/{job_id}/assign-hiring-manager",
+    response_model=JobAssignmentUpdateResponse,
+    summary="Assign, change, or remove hiring manager for a job vacancy",
+)
+async def assign_hiring_manager(
+    job_id: UUID,
+    request: AssignHiringManagerRequest,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> JobAssignmentUpdateResponse:
+    """Validate organization membership, update hiring manager, record history, and notify parties."""
+    return await hr_assignment_service.assign_hiring_manager(
+        db=db,
+        tenant_id=tenant_id,
+        job_id=job_id,
+        hiring_manager_id=request.hiring_manager_id,
+        actor_id=sec.user_id,
+        actor_roles=sec.roles,
+        is_super_admin=sec.is_super_admin,
+        reason=request.reason,
+    )
+
+
+@hr_router.post(
+    "/jobs/{job_id}/assignments",
+    response_model=JobAssignmentUpdateResponse,
+    summary="Update both recruiter and hiring manager assignments for a job",
+)
+async def update_job_assignments(
+    job_id: UUID,
+    request: JobAssignmentUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> JobAssignmentUpdateResponse:
+    """Combined update endpoint for job recruiter and hiring manager assignments."""
+    resp = None
+    if request.update_recruiter:
+        resp = await hr_assignment_service.assign_recruiter(
+            db=db,
+            tenant_id=tenant_id,
+            job_id=job_id,
+            recruiter_id=request.recruiter_id,
+            actor_id=sec.user_id,
+            actor_roles=sec.roles,
+            is_super_admin=sec.is_super_admin,
+            reason=request.reason,
+        )
+
+    if request.update_hiring_manager:
+        resp = await hr_assignment_service.assign_hiring_manager(
+            db=db,
+            tenant_id=tenant_id,
+            job_id=job_id,
+            hiring_manager_id=request.hiring_manager_id,
+            actor_id=sec.user_id,
+            actor_roles=sec.roles,
+            is_super_admin=sec.is_super_admin,
+            reason=request.reason,
+        )
+
+    if resp:
+        return resp
+
+    job = await hr_requisition_service.get_requisition(db=db, tenant_id=tenant_id, job_id=job_id)
+    return JobAssignmentUpdateResponse(
+        job_id=job.id,
+        job_title=job.title,
+        recruiter_id=job.recruiter_id,
+        recruiter_name=job.recruiter.name if job.recruiter else None,
+        hiring_manager_id=job.hiring_manager_id,
+        hiring_manager_name=job.hiring_manager.name if job.hiring_manager else None,
+        updated_at=job.updated_at,
+        message="No assignment changes requested.",
+    )
+
+
+@hr_router.get(
+    "/jobs/{job_id}/assignments/history",
+    response_model=list[JobAssignmentHistoryItem],
+    summary="Retrieve immutable chronological assignment history for a job vacancy",
+)
+async def get_job_assignment_history(
+    job_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> list[JobAssignmentHistoryItem]:
+    """Retrieve audit history showing actor, target user, job, previous/new assignments, and timestamps."""
+    return await hr_assignment_service.get_job_assignment_history(
+        db=db, tenant_id=tenant_id, job_id=job_id
+    )
+
+
+@hr_router.get(
+    "/assignments/workload",
+    response_model=TeamWorkloadResponse,
+    summary="Retrieve real-time recruitment workload metrics across team recruiters and hiring managers",
+)
+async def get_team_workload(
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> TeamWorkloadResponse:
+    """Retrieve actual database workload counts (assigned jobs, active apps, pending reviews, capacity status)."""
+    return await hr_assignment_service.get_team_workload(db=db, tenant_id=tenant_id)
+
+
+@hr_router.get(
+    "/assignments/my-vacancies",
+    response_model=AssignedVacanciesResponse,
+    summary="Retrieve job vacancies assigned to the authenticated recruiter or hiring manager",
+)
+async def get_my_vacancies(
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> AssignedVacanciesResponse:
+    """Retrieve vacancies assigned to requesting user with active application metrics."""
+    return await hr_assignment_service.get_assigned_vacancies(
+        db=db, tenant_id=tenant_id, user_id=sec.user_id
+    )
+
 
 

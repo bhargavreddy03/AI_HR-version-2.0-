@@ -591,4 +591,103 @@ export interface ApplicationStageHistoryItem {
   created_at: string;
 }
 
+// ----------------------------------------------------------------------
+// Recruiter and Hiring Manager Assignment Types (Step 4.2.7)
+// ----------------------------------------------------------------------
+
+export interface AssignRecruiterRequest {
+  recruiter_id?: string | null;
+  reason?: string | null;
+}
+
+export interface AssignHiringManagerRequest {
+  hiring_manager_id?: string | null;
+  reason?: string | null;
+}
+
+export interface JobAssignmentUpdateRequest {
+  recruiter_id?: string | null;
+  hiring_manager_id?: string | null;
+  update_recruiter: boolean;
+  update_hiring_manager: boolean;
+  reason?: string | null;
+}
+
+export interface JobAssignmentUpdateResponse {
+  job_id: string;
+  job_title: string;
+  recruiter_id?: string | null;
+  recruiter_name?: string | null;
+  hiring_manager_id?: string | null;
+  hiring_manager_name?: string | null;
+  updated_at: string;
+  message: string;
+}
+
+export interface JobAssignmentHistoryItem {
+  id: string;
+  job_id: string;
+  assignment_type: string; // "recruiter" | "hiring_manager"
+  actor_id?: string | null;
+  actor_name?: string | null;
+  previous_user_id?: string | null;
+  previous_user_name?: string | null;
+  new_user_id?: string | null;
+  new_user_name?: string | null;
+  reason?: string | null;
+  created_at: string;
+}
+
+export interface UserWorkloadItem {
+  user_id: string;
+  name: string;
+  email: string;
+  role: string;
+  department_id?: string | null;
+  assigned_jobs_count: number;
+  active_jobs_count: number;
+  total_applications_count: number;
+  pending_reviews_count: number;
+  active_interviews_count: number;
+  workload_status: "low" | "balanced" | "high" | "critical";
+}
+
+export interface TeamWorkloadSummary {
+  total_team_members: number;
+  total_assigned_jobs: number;
+  total_unassigned_jobs: number;
+  total_active_applications: number;
+}
+
+export interface TeamWorkloadResponse {
+  tenant_id: string;
+  recruiters: UserWorkloadItem[];
+  hiring_managers: UserWorkloadItem[];
+  summary: TeamWorkloadSummary;
+}
+
+export interface AssignedVacancyItem {
+  id: string;
+  title: string;
+  department: string;
+  status: string;
+  work_arrangement: string;
+  vacancies: number;
+  active_applications_count: number;
+  pending_reviews_count: number;
+  scheduled_interviews_count: number;
+  recruiter_id?: string | null;
+  recruiter_name?: string | null;
+  hiring_manager_id?: string | null;
+  hiring_manager_name?: string | null;
+  created_at: string;
+}
+
+export interface AssignedVacanciesResponse {
+  tenant_id: string;
+  vacancies: AssignedVacancyItem[];
+  total: number;
+}
+
+
 

@@ -136,6 +136,12 @@ class Job(Base, TenantScopedMixin, TimestampMixin):
         cascade="all, delete-orphan",
         order_by="desc(JobLifecycleHistory.created_at)",
     )
+    assignment_history: Mapped[list[JobAssignmentHistory]] = relationship(
+        "JobAssignmentHistory",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        order_by="desc(JobAssignmentHistory.created_at)",
+    )
 
 
 class JobApplication(Base, TenantScopedMixin, TimestampMixin):
@@ -286,5 +292,57 @@ class ApplicationStageHistory(Base, TenantScopedMixin):
     # Relationships
     application: Mapped[JobApplication] = relationship("JobApplication", back_populates="stage_history")
     actor: Mapped[User | None] = relationship("User", foreign_keys=[actor_id], lazy="selectin")
+
+
+class JobAssignmentHistory(Base, TenantScopedMixin):
+    """Immutable audit trail of recruiter and hiring manager job assignments."""
+
+    __tablename__ = "job_assignment_history"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        default=generate_uuid7,
+        index=True,
+    )
+    job_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    assignment_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)  # recruiter, hiring_manager
+    actor_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    actor_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    previous_user_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    previous_user_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    new_user_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    new_user_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=utc_now,
+        index=True,
+    )
+
+    # Relationships
+    job: Mapped[Job] = relationship("Job", back_populates="assignment_history")
+    actor: Mapped[User | None] = relationship("User", foreign_keys=[actor_id], lazy="selectin")
+    previous_user: Mapped[User | None] = relationship("User", foreign_keys=[previous_user_id], lazy="selectin")
+    new_user: Mapped[User | None] = relationship("User", foreign_keys=[new_user_id], lazy="selectin")
+
 
 
