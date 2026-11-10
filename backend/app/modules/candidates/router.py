@@ -11,14 +11,13 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, Response, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import Settings, get_settings
+from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.security import SecurityContext
 from app.modules.auth.dependencies import require_authenticated_user
 from app.modules.candidates.schemas import (
     CandidateAccountRead,
     CandidateAccountUpdate,
-    CandidateInterviewRead,
     CandidateInterviewsResponse,
     CandidateNotificationsResponse,
     CandidatePreferenceRead,
@@ -30,7 +29,6 @@ from app.modules.candidates.schemas import (
     CandidateSkillsUpdate,
     CertificationCreate,
     CertificationRead,
-    ConsentHistoryItem,
     ConsentHistoryResponse,
     CorrectionRequestCreate,
     CorrectionRequestResponse,

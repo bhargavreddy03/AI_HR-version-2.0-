@@ -37,7 +37,6 @@ from app.modules.auth.models import CandidateUserProfile, User
 from app.modules.candidates.models import (
     CandidateNotification,
     CandidatePreference,
-    CandidatePrivacyRequest,
     CandidateResume,
     CandidateResumeStatus,
     CandidateSavedJob,
@@ -59,7 +58,6 @@ from app.modules.candidates.schemas import (
     ProjectCreate,
     ResumeExtractedDataUpdate,
 )
-from app.modules.notifications.tasks import dispatch_candidate_email_notification
 from app.modules.candidates.service import CandidateService, candidate_service
 from app.modules.documents.extractor import PDFExtractionResult, PDFExtractorService
 from app.modules.documents.storage import StorageService
@@ -70,6 +68,7 @@ from app.modules.jobs.models import (
     JobStatus,
 )
 from app.modules.jobs.service import job_service
+from app.modules.notifications.tasks import dispatch_candidate_email_notification
 from app.modules.screening.skills.registry import skill_registry
 
 SAMPLE_CANDIDATE_PDF = b"""%PDF-1.4
@@ -1552,7 +1551,6 @@ async def test_saved_jobs_duplicate_prevention_and_applied_status() -> None:
 @pytest.mark.asyncio
 async def test_notification_ownership_and_idor_protection() -> None:
     """Verify that candidate B cannot mark as read or mutate notifications owned by candidate A."""
-    candidate_a = uuid4()
     candidate_b = uuid4()
     notif_id = uuid4()
     mock_db = AsyncMock()

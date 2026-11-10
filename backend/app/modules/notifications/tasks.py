@@ -7,10 +7,8 @@ from typing import Any
 from uuid import UUID
 
 from celery import shared_task
-from sqlalchemy import select, update
 
 from app.core.config import get_settings
-from app.modules.candidates.models import CandidateNotification
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +44,7 @@ def dispatch_candidate_email_notification(
         logger.info(
             "Email notification task invoked for notification %s (%s), but external email infrastructure "
             "is not configured in environment '%s'. In-app notification preserved.",
-            notification_id,
+            notif_uuid,
             subject,
             settings.ENVIRONMENT,
         )

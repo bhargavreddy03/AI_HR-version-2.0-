@@ -10,7 +10,8 @@ from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from app.modules.candidates.parser import ExtractedProfileData, ExtractedSectionItem
+
+from app.modules.candidates.parser import ExtractedProfileData
 
 
 # -----------------------------------------------------------------------------

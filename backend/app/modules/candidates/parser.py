@@ -17,7 +17,7 @@ import defusedxml.ElementTree as ET
 from pydantic import BaseModel, Field
 
 from app.core.errors import AppException
-from app.modules.screening.skills.matcher import ExactMatcher, exact_matcher
+from app.modules.screening.skills.matcher import ExactMatcher
 
 logger = logging.getLogger(__name__)
 

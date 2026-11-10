@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 from fastapi import UploadFile
@@ -15,7 +16,7 @@ from sqlalchemy import desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.base import generate_uuid7, utc_now
-from app.core.config import Settings, get_settings
+from app.core.config import Settings
 from app.core.errors import (
     AuthenticationException,
     EntityNotFoundException,
@@ -51,9 +52,6 @@ from app.modules.candidates.parser import (
     docx_extractor_service,
     parse_resume_text,
 )
-from app.modules.jobs.models import Job, JobApplication
-from app.modules.organizations.models import Organization
-from app.modules.notifications.tasks import dispatch_candidate_email_notification
 from app.modules.candidates.schemas import (
     CandidateAccountRead,
     CandidateAccountUpdate,
@@ -97,6 +95,9 @@ from app.modules.candidates.schemas import (
 )
 from app.modules.documents.extractor import PDFExtractorService, pdf_extractor_service
 from app.modules.documents.storage import StorageService, storage_service
+from app.modules.jobs.models import Job, JobApplication
+from app.modules.notifications.tasks import dispatch_candidate_email_notification
+from app.modules.organizations.models import Organization
 from app.modules.screening.skills.matcher import ExactMatcher, exact_matcher
 from app.modules.screening.skills.registry import SkillRegistry, skill_registry
 
@@ -839,12 +840,12 @@ class CandidateService:
         retained_ids = {
             r[0]
             for r in app_rows
-            if isinstance(r, (tuple, list)) and len(r) > 0 and r[0] is not None
+            if isinstance(r, tuple | list) and len(r) > 0 and r[0] is not None
         }
         retained_shas = {
             r[1]
             for r in app_rows
-            if isinstance(r, (tuple, list)) and len(r) > 1 and r[1] is not None
+            if isinstance(r, tuple | list) and len(r) > 1 and r[1] is not None
         }
 
         output: list[CandidateResumeRead] = []
@@ -1015,7 +1016,7 @@ class CandidateService:
             )
         )
         raw_count = app_res.scalar()
-        app_count = int(raw_count) if isinstance(raw_count, (int, float)) else 0
+        app_count = int(raw_count) if isinstance(raw_count, int | float) else 0
         if app_count > 0:
             raise ValidationException(
                 f"Cannot delete resume '{resume.filename}' (version {resume.version_number}): "
@@ -1486,8 +1487,8 @@ class CandidateService:
             select(CandidateLanguage).where(CandidateLanguage.user_id == user_id)
         )
         languages = [
-            {"id": str(l.id), "language": l.language, "proficiency": l.proficiency}
-            for l in lang_res.scalars().all()
+            {"id": str(item.id), "language": item.language, "proficiency": item.proficiency}
+            for item in lang_res.scalars().all()
         ]
 
         # Resumes (Metadata & Cryptographic SHA-256 Hashes)
