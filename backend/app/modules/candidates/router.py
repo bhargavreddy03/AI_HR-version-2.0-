@@ -467,11 +467,17 @@ async def mark_all_notifications_read(
     "/upload",
     response_model=ResumeUploadResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Upload and ingest candidate resume PDF",
+    summary="Upload and ingest candidate resume PDF or DOCX",
+)
+@resume_router.post(
+    "/me/upload",
+    response_model=ResumeUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload and ingest candidate resume PDF or DOCX (/me alias)",
 )
 async def upload_resume(
     response: Response,
-    file: UploadFile = File(..., description="Resume PDF document binary payload"),
+    file: UploadFile = File(..., description="Resume PDF or DOCX document binary payload"),
     db: AsyncSession = Depends(get_db),
     sec: SecurityContext = Depends(require_authenticated_user),
 ) -> ResumeUploadResponse:
@@ -486,6 +492,11 @@ async def upload_resume(
     response_model=list[CandidateResumeRead],
     summary="List all candidate resumes with versions",
 )
+@resume_router.get(
+    "/me",
+    response_model=list[CandidateResumeRead],
+    summary="List all candidate resumes with versions (/me alias)",
+)
 async def list_resumes(
     db: AsyncSession = Depends(get_db),
     sec: SecurityContext = Depends(require_authenticated_user),
@@ -497,6 +508,11 @@ async def list_resumes(
     "/{resume_id}",
     response_model=CandidateResumeRead,
     summary="Retrieve candidate resume metadata",
+)
+@resume_router.get(
+    "/me/{resume_id}",
+    response_model=CandidateResumeRead,
+    summary="Retrieve candidate resume metadata (/me alias)",
 )
 async def get_resume(
     resume_id: UUID,
@@ -511,6 +527,11 @@ async def get_resume(
     response_model=CandidateResumeRead,
     summary="Retrieve candidate resume lifecycle status",
 )
+@resume_router.get(
+    "/me/{resume_id}/status",
+    response_model=CandidateResumeRead,
+    summary="Retrieve candidate resume lifecycle status (/me alias)",
+)
 async def get_resume_status(
     resume_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -522,7 +543,12 @@ async def get_resume_status(
 @resume_router.get(
     "/{resume_id}/extraction",
     response_model=ResumeExtractionResponse,
-    summary="Retrieve extracted text and skills preview",
+    summary="Retrieve extracted text, skills, and structured profile fields preview",
+)
+@resume_router.get(
+    "/me/{resume_id}/extraction",
+    response_model=ResumeExtractionResponse,
+    summary="Retrieve extracted text, skills, and structured profile fields preview (/me alias)",
 )
 async def get_resume_extraction(
     resume_id: UUID,
@@ -537,6 +563,16 @@ async def get_resume_extraction(
     response_model=ResumeExtractionResponse,
     summary="Candidate corrections to extracted skills and text",
 )
+@resume_router.put(
+    "/{resume_id}/skills",
+    response_model=ResumeExtractionResponse,
+    summary="Candidate corrections to extracted skills (PUT alias)",
+)
+@resume_router.put(
+    "/me/{resume_id}/skills",
+    response_model=ResumeExtractionResponse,
+    summary="Candidate corrections to extracted skills (/me alias)",
+)
 async def update_extracted_data(
     resume_id: UUID,
     payload: ResumeExtractedDataUpdate,
@@ -547,9 +583,33 @@ async def update_extracted_data(
 
 
 @resume_router.post(
+    "/{resume_id}/sync-profile",
+    response_model=CandidateSkillsResponse,
+    summary="Apply reviewed resume skills to candidate verified profile",
+)
+async def sync_resume_skills_to_profile(
+    resume_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+) -> CandidateSkillsResponse:
+    resume = await candidate_service.get_resume(db, sec.user_id, resume_id)
+    return await candidate_service.update_skills(db, sec.user_id, resume.skills_extracted)
+
+
+@resume_router.post(
     "/{resume_id}/set-default",
     response_model=CandidateResumeRead,
     summary="Designate active default resume for job applications",
+)
+@resume_router.put(
+    "/{resume_id}/set-default",
+    response_model=CandidateResumeRead,
+    summary="Designate active default resume for job applications (PUT alias)",
+)
+@resume_router.put(
+    "/me/{resume_id}/set-default",
+    response_model=CandidateResumeRead,
+    summary="Designate active default resume for job applications (/me alias)",
 )
 async def set_default_resume(
     resume_id: UUID,
@@ -564,6 +624,16 @@ async def set_default_resume(
     response_model=ResumeDownloadUrlResponse,
     summary="Generate time-limited presigned S3 download URL",
 )
+@resume_router.get(
+    "/{resume_id}/download",
+    response_model=ResumeDownloadUrlResponse,
+    summary="Generate time-limited presigned S3 download URL (alias)",
+)
+@resume_router.get(
+    "/me/{resume_id}/download",
+    response_model=ResumeDownloadUrlResponse,
+    summary="Generate time-limited presigned S3 download URL (/me alias)",
+)
 async def get_resume_download_url(
     resume_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -577,6 +647,12 @@ async def get_resume_download_url(
     status_code=status.HTTP_204_NO_CONTENT,
     response_class=Response,
     summary="Delete candidate resume and remove object from storage",
+)
+@resume_router.delete(
+    "/me/{resume_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    summary="Delete candidate resume and remove object from storage (/me alias)",
 )
 async def delete_resume(
     resume_id: UUID,

@@ -21,9 +21,11 @@ from app.core.errors import (
 )
 from app.core.security.file_security import (
     MAX_FILE_SIZE_BYTES,
+    check_dangerous_executables,
     generate_secure_storage_name,
     get_malware_scanner,
     sanitize_filename,
+    validate_docx_content,
     validate_file_size,
     validate_pdf_content,
 )
@@ -39,6 +41,12 @@ from app.modules.candidates.models import (
     CandidateResume,
     CandidateResumeStatus,
 )
+from app.modules.candidates.parser import (
+    DocxExtractorService,
+    docx_extractor_service,
+    parse_resume_text,
+)
+from app.modules.jobs.models import JobApplication
 from app.modules.candidates.schemas import (
     CandidateNotificationRead,
     CandidateNotificationsResponse,
@@ -82,11 +90,13 @@ class CandidateService:
         extractor: PDFExtractorService | None = None,
         matcher: ExactMatcher | None = None,
         registry: SkillRegistry | None = None,
+        docx_extractor: DocxExtractorService | None = None,
     ) -> None:
         self._storage = storage or storage_service
         self._extractor = extractor or pdf_extractor_service
         self._matcher = matcher or exact_matcher
         self._registry = registry or skill_registry
+        self._docx_extractor = docx_extractor or docx_extractor_service
 
     # -------------------------------------------------------------------------
     # Profile & Personal Information
@@ -624,13 +634,14 @@ class CandidateService:
     async def upload_resume(
         self, db: AsyncSession, user_id: UUID, file: UploadFile
     ) -> ResumeUploadResponse:
-        """Process candidate resume upload, compute SHA-256, store in S3, and extract text/skills."""
+        """Process candidate resume upload (PDF/DOCX), enforce security bounds, compute SHA-256, store in S3, and extract text/skills."""
         raw_filename = file.filename or "resume.pdf"
         clean_filename = sanitize_filename(raw_filename)
+        ext = clean_filename.rsplit(".", 1)[-1].lower() if "." in clean_filename else ""
 
-        if not clean_filename.lower().endswith(".pdf"):
+        if ext not in ("pdf", "docx"):
             raise ValidationException(
-                "Only PDF document uploads are supported (.pdf)",
+                f"Unsupported document format '{ext}'. Only PDF (.pdf) and Word (.docx) resumes are supported.",
                 code="ERR_UNSUPPORTED_DOCUMENT_TYPE",
             )
 
@@ -639,7 +650,14 @@ class CandidateService:
 
         # File security checks
         validate_file_size(file_bytes, max_size_bytes=MAX_FILE_SIZE_BYTES)
-        validate_pdf_content(file_bytes)
+        check_dangerous_executables(file_bytes[:1024])
+
+        mime_type = "application/pdf" if ext == "pdf" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+        if ext == "pdf":
+            validate_pdf_content(file_bytes)
+        elif ext == "docx":
+            validate_docx_content(file_bytes)
 
         # Malware scan
         scanner = get_malware_scanner()
@@ -649,6 +667,7 @@ class CandidateService:
                 f"Document failed security scan: {scan_res.threat_name}",
                 code="ERR_MALWARE_DETECTED",
             )
+        malware_status = "passed" if scan_res.scanned else "passed_development_mode"
 
         content_sha256 = hashlib.sha256(file_bytes).hexdigest()
 
@@ -661,16 +680,25 @@ class CandidateService:
         )
         existing = dup_res.scalar_one_or_none()
         if existing:
+            raw_mime = getattr(existing, "mime_type", "application/pdf")
+            resolved_mime = raw_mime if isinstance(raw_mime, str) else "application/pdf"
+            raw_skills = getattr(existing, "skills_extracted", [])
+            resolved_skills = raw_skills if isinstance(raw_skills, list) else []
             return ResumeUploadResponse(
                 id=existing.id,
                 filename=existing.filename,
                 file_size_bytes=existing.file_size_bytes,
                 content_sha256=existing.content_sha256,
+                mime_type=resolved_mime,
                 status=existing.status,
                 version_number=existing.version_number,
                 is_default=existing.is_default,
                 is_duplicate=True,
                 message="Duplicate resume detected. Using existing uploaded version.",
+                skills_extracted=resolved_skills,
+                ocr_applied=False,
+                ocr_provider="null_ocr_unconfigured",
+                malware_scan_status=malware_status,
             )
 
         # Determine version number
@@ -683,36 +711,50 @@ class CandidateService:
 
         # Generate storage key
         now = datetime.now(UTC)
-        random_name = generate_secure_storage_name("pdf")
+        random_name = generate_secure_storage_name(ext)
         storage_key = f"candidates/{user_id}/resumes/{now.year}/{now.month:02d}/{random_name}"
 
         # Upload to StorageService
         self._storage.upload_document_bytes(
             file_bytes=file_bytes,
             storage_key=storage_key,
-            mime_type="application/pdf",
+            mime_type=mime_type,
             expected_sha256=content_sha256,
         )
 
-        # Extract text and skills synchronously using Step 3.10 Extractor and Matcher
+        # Extract text and skills synchronously
         extracted_text: str | None = None
         extracted_skills: list[str] = []
         resume_status = CandidateResumeStatus.COMPLETED.value
         error_msg: str | None = None
 
-        try:
-            extraction = self._extractor.extract_from_bytes(file_bytes, filename=clean_filename)
-            extracted_text = extraction.raw_text
-            if extracted_text and len(extracted_text.strip()) > 0:
-                match_res = self._matcher.extract(extracted_text)
-                extracted_skills = [m.canonical_name for m in match_res.extracted_skills]
-            else:
+        if ext == "pdf":
+            try:
+                extraction = self._extractor.extract_from_bytes(file_bytes)
+                extracted_text = extraction.raw_text
+                if extracted_text and len(extracted_text.strip()) > 0:
+                    parsed_data = parse_resume_text(extracted_text, self._matcher)
+                    extracted_skills = parsed_data.skills
+                else:
+                    resume_status = CandidateResumeStatus.FAILED.value
+                    error_msg = "No readable text found in PDF (scanned or image-only document; OCR is currently unconfigured)"
+            except Exception as exc:
+                logger.warning("Failed to extract resume text synchronously: %s", exc)
                 resume_status = CandidateResumeStatus.FAILED.value
-                error_msg = "No readable text found in document (scanned PDF or image-only)"
-        except Exception as exc:
-            logger.warning("Failed to extract resume text synchronously: %s", exc)
-            resume_status = CandidateResumeStatus.FAILED.value
-            error_msg = str(exc)
+                error_msg = str(exc)
+        elif ext == "docx":
+            try:
+                extracted_text = self._docx_extractor.extract_from_bytes(file_bytes)
+                if extracted_text and len(extracted_text.strip()) > 0:
+                    parsed_data = parse_resume_text(extracted_text, self._matcher)
+                    extracted_skills = parsed_data.skills
+                else:
+                    resume_status = CandidateResumeStatus.FAILED.value
+                    error_msg = "No readable text found in Word document"
+            except Exception as exc:
+                logger.warning("Failed to extract DOCX resume text: %s", exc)
+                resume_status = CandidateResumeStatus.FAILED.value
+                error_msg = str(exc)
 
         # Create record
         now_ts = utc_now()
@@ -722,7 +764,7 @@ class CandidateService:
             storage_key=storage_key,
             filename=clean_filename,
             file_size_bytes=file_size,
-            mime_type="application/pdf",
+            mime_type=mime_type,
             content_sha256=content_sha256,
             status=resume_status,
             version_number=version_number,
@@ -742,21 +784,55 @@ class CandidateService:
             filename=resume.filename,
             file_size_bytes=resume.file_size_bytes,
             content_sha256=resume.content_sha256,
+            mime_type=resume.mime_type,
             status=resume.status,
             version_number=resume.version_number,
             is_default=resume.is_default,
             is_duplicate=False,
             message="Resume uploaded and processed successfully",
+            skills_extracted=resume.skills_extracted,
+            ocr_applied=False,
+            ocr_provider="null_ocr_unconfigured",
+            malware_scan_status=malware_status,
         )
 
     async def list_resumes(self, db: AsyncSession, user_id: UUID) -> list[CandidateResumeRead]:
-        """List all resumes uploaded by the candidate."""
+        """List all resumes uploaded by the candidate, annotated with active application status."""
         res = await db.execute(
             select(CandidateResume)
             .where(CandidateResume.user_id == user_id)
             .order_by(desc(CandidateResume.version_number))
         )
-        return [CandidateResumeRead.model_validate(r) for r in res.scalars().all()]
+        resumes = res.scalars().all()
+        if not resumes:
+            return []
+
+        app_res = await db.execute(
+            select(JobApplication.resume_id, JobApplication.resume_snapshot_sha256).where(
+                JobApplication.candidate_id == user_id
+            )
+        )
+        raw_rows = app_res.all()
+        app_rows = raw_rows if isinstance(raw_rows, list) else []
+        retained_ids = {
+            r[0]
+            for r in app_rows
+            if isinstance(r, (tuple, list)) and len(r) > 0 and r[0] is not None
+        }
+        retained_shas = {
+            r[1]
+            for r in app_rows
+            if isinstance(r, (tuple, list)) and len(r) > 1 and r[1] is not None
+        }
+
+        output: list[CandidateResumeRead] = []
+        for r in resumes:
+            read_dto = CandidateResumeRead.model_validate(r)
+            read_dto.has_active_applications = (
+                r.id in retained_ids or r.content_sha256 in retained_shas
+            )
+            output.append(read_dto)
+        return output
 
     async def get_resume(
         self, db: AsyncSession, user_id: UUID, resume_id: UUID
@@ -776,23 +852,40 @@ class CandidateService:
     async def get_resume_extraction(
         self, db: AsyncSession, user_id: UUID, resume_id: UUID
     ) -> ResumeExtractionResponse:
-        """Retrieve extracted text and skills preview for candidate review."""
-        resume = await self.get_resume(db, user_id, resume_id)
-        word_count = (
-            len((resume.extracted_text or "").split()) if hasattr(resume, "extracted_text") else 0
+        """Retrieve extracted text and skills preview for candidate review with structured fields."""
+        res = await db.execute(
+            select(CandidateResume).where(
+                CandidateResume.id == resume_id,
+                CandidateResume.user_id == user_id,
+            )
         )
+        resume = res.scalar_one_or_none()
+        if not resume:
+            raise EntityNotFoundException("Resume", resume_id)
+
+        raw_text = resume.extracted_text or ""
+        word_count = len(raw_text.split())
+
+        parsed_data = parse_resume_text(raw_text, self._matcher)
+        if resume.skills_extracted:
+            parsed_data.skills = resume.skills_extracted
+
         return ResumeExtractionResponse(
             resume_id=resume.id,
             status=resume.status,
-            extracted_text=resume.extracted_text if hasattr(resume, "extracted_text") else None,
+            extracted_text=raw_text,
             skills_extracted=resume.skills_extracted,
             word_count=word_count,
+            extracted_data=parsed_data,
+            ocr_applied=False,
+            ocr_provider="null_ocr_unconfigured",
+            malware_scan_status="passed_development_mode",
         )
 
     async def update_extracted_data(
         self, db: AsyncSession, user_id: UUID, resume_id: UUID, payload: ResumeExtractedDataUpdate
     ) -> ResumeExtractionResponse:
-        """Allow candidate to edit extracted skills and text snapshot."""
+        """Allow candidate to edit extracted skills and text snapshot, optionally syncing to profile."""
         res = await db.execute(
             select(CandidateResume).where(
                 CandidateResume.id == resume_id,
@@ -808,9 +901,15 @@ class CandidateService:
         if payload.skills_extracted is not None:
             resume.skills_extracted = payload.skills_extracted
 
+        if payload.apply_to_profile and resume.skills_extracted:
+            await self.update_skills(db, user_id, resume.skills_extracted)
+
         await db.commit()
         await db.refresh(resume)
         word_count = len((resume.extracted_text or "").split())
+
+        parsed_data = parse_resume_text(resume.extracted_text or "", self._matcher)
+        parsed_data.skills = resume.skills_extracted
 
         return ResumeExtractionResponse(
             resume_id=resume.id,
@@ -818,6 +917,10 @@ class CandidateService:
             extracted_text=resume.extracted_text,
             skills_extracted=resume.skills_extracted,
             word_count=word_count,
+            extracted_data=parsed_data,
+            ocr_applied=False,
+            ocr_provider="null_ocr_unconfigured",
+            malware_scan_status="passed_development_mode",
         )
 
     async def set_default_resume(
@@ -870,7 +973,7 @@ class CandidateService:
         )
 
     async def delete_resume(self, db: AsyncSession, user_id: UUID, resume_id: UUID) -> None:
-        """Delete resume record and remove from storage."""
+        """Delete resume record and remove from storage conforming to defensibility and retention rules."""
         res = await db.execute(
             select(CandidateResume).where(
                 CandidateResume.id == resume_id,
@@ -881,10 +984,43 @@ class CandidateService:
         if not resume:
             raise EntityNotFoundException("Resume", resume_id)
 
+        # Defensibility & Retention Check:
+        # Check if this resume version is linked to any submitted job applications
+        app_res = await db.execute(
+            select(func.count(JobApplication.id)).where(
+                (JobApplication.resume_id == resume.id)
+                | (JobApplication.resume_snapshot_sha256 == resume.content_sha256)
+            )
+        )
+        raw_count = app_res.scalar()
+        app_count = int(raw_count) if isinstance(raw_count, (int, float)) else 0
+        if app_count > 0:
+            raise ValidationException(
+                f"Cannot delete resume '{resume.filename}' (version {resume.version_number}): "
+                f"This document is retained under compliance and audit rules because it is associated with "
+                f"{app_count} submitted job application(s).",
+                code="ERR_RESUME_RETAINED_FOR_APPLICATIONS",
+            )
+
+        was_default = resume.is_default
+
         # Delete from object storage
         self._storage.delete_document_object(resume.storage_key)
 
         await db.delete(resume)
+
+        # If deleted resume was default, reassign default to the most recent remaining resume
+        if was_default:
+            remaining_res = await db.execute(
+                select(CandidateResume)
+                .where(CandidateResume.user_id == user_id)
+                .order_by(desc(CandidateResume.version_number))
+                .limit(1)
+            )
+            new_default = remaining_res.scalar_one_or_none()
+            if new_default:
+                new_default.is_default = True
+
         await db.commit()
 
     # -------------------------------------------------------------------------

@@ -8,6 +8,7 @@ import { ResumeUploadDropzone } from "@/components/candidate/ResumeUploadDropzon
 import { DashboardSkeleton } from "@/components/candidate/DashboardSkeleton";
 import CandidateLayout from "@/app/candidate/layout";
 import CandidateDashboardPage from "@/app/candidate/dashboard/page";
+import CandidateResumesPage from "@/app/candidate/resumes/page";
 import { candidateApi } from "@/lib/candidateApi";
 
 // Mock next/navigation
@@ -223,6 +224,120 @@ describe("Candidate Portal Components", () => {
       expect(screen.getByText("Shortlisted")).toBeDefined();
       expect(screen.getByText("Interviews")).toBeDefined();
       expect(screen.getByText("Saved Jobs")).toBeDefined();
+    });
+  });
+
+  describe("CandidateResumesPage", () => {
+    const mockResumes = [
+      {
+        id: "res-1",
+        file_name: "jane_doe_lead_engineer.pdf",
+        file_size_bytes: 1048576,
+        mime_type: "application/pdf",
+        sha256_hash: "a1b2c3d4e5f67890abcdef1234567890abcdef12",
+        version_number: 2,
+        is_default: true,
+        extracted_skills: ["Python", "FastAPI", "PostgreSQL"],
+        extracted_text_snippet: "Jane Doe Senior Python Architect...",
+        uploaded_at: new Date().toISOString(),
+        has_active_applications: true,
+      },
+      {
+        id: "res-2",
+        file_name: "jane_doe_initial.docx",
+        file_size_bytes: 524288,
+        mime_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        sha256_hash: "f6e5d4c3b2a10987fedcba0987654321fedcba09",
+        version_number: 1,
+        is_default: false,
+        extracted_skills: ["Python", "Flask"],
+        extracted_text_snippet: "Jane Doe Software Developer...",
+        uploaded_at: new Date().toISOString(),
+        has_active_applications: false,
+      },
+    ];
+
+    it("renders resume documents with version badges and defensibility notices", async () => {
+      vi.spyOn(candidateApi, "getResumes").mockResolvedValue(mockResumes);
+
+      render(<CandidateResumesPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("jane_doe_lead_engineer.pdf")).toBeDefined();
+      });
+
+      expect(screen.getByText("v2")).toBeDefined();
+      expect(screen.getByText("v1")).toBeDefined();
+      expect(screen.getByText("Default")).toBeDefined();
+      expect(screen.getByText("Application Retained")).toBeDefined();
+      expect(screen.getByText(/Processing Pipeline Status & Capabilities/i)).toBeDefined();
+    });
+
+    it("opens application retention protection modal when deleting retained resume", async () => {
+      vi.spyOn(candidateApi, "getResumes").mockResolvedValue(mockResumes);
+
+      render(<CandidateResumesPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("jane_doe_lead_engineer.pdf")).toBeDefined();
+      });
+
+      // Find delete button for the retained resume (res-1)
+      const deleteButtons = screen.getAllByTitle(/Protected by Application Retention|Delete Resume/i);
+      expect(deleteButtons.length).toBe(2);
+
+      // Click first delete button (retained resume)
+      fireEvent.click(deleteButtons[0]);
+
+      // Retention modal appears
+      expect(screen.getByText("Application Retention Protection")).toBeDefined();
+      expect(screen.getByText(/Under compliance, audit defensibility, and record retention requirements/i)).toBeDefined();
+
+      // Close modal
+      fireEvent.click(screen.getByRole("button", { name: "Understood" }));
+      expect(screen.queryByText("Application Retention Protection")).toBeNull();
+    });
+
+    it("opens review extraction modal and allows editing skills", async () => {
+      vi.spyOn(candidateApi, "getResumes").mockResolvedValue(mockResumes);
+      vi.spyOn(candidateApi, "getResumeExtraction").mockResolvedValue({
+        resume_id: "res-1",
+        status: "COMPLETED",
+        skills_extracted: ["Python", "FastAPI", "PostgreSQL"],
+        word_count: 150,
+        ocr_applied: false,
+        ocr_provider: "null_ocr_unconfigured",
+        malware_scan_status: "passed_development_mode",
+        extracted_data: {
+          name: "Jane Doe",
+          email: "jane.doe@example.com",
+          phone: "+1 555-0199",
+          summary: "Lead Python Architect with 10+ years experience",
+          skills: ["Python", "FastAPI", "PostgreSQL"],
+          experience: [{ title: "Lead Architect", organization: "Cloud Corp" }],
+          education: [{ title: "B.S. CS", organization: "MIT" }],
+          certifications: ["AWS Certified"],
+          projects: [{ title: "AI Pipeline" }],
+        },
+      });
+
+      render(<CandidateResumesPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("jane_doe_lead_engineer.pdf")).toBeDefined();
+      });
+
+      const reviewButtons = screen.getAllByRole("button", { name: /Review Skills/i });
+      fireEvent.click(reviewButtons[0]);
+
+      await waitFor(() => {
+        expect(screen.getByText("Candidate Extraction Review & Verification")).toBeDefined();
+      });
+
+      expect(screen.getByText("Jane Doe")).toBeDefined();
+      expect(screen.getByText("jane.doe@example.com")).toBeDefined();
+      expect(screen.getByRole("button", { name: /Apply to Verified Profile/i })).toBeDefined();
+      expect(screen.getByRole("button", { name: /Save Resume Skills/i })).toBeDefined();
     });
   });
 });

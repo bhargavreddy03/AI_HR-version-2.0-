@@ -48,6 +48,7 @@ from app.modules.candidates.schemas import (
     ExperienceUpdate,
     LanguageCreate,
     ProjectCreate,
+    ResumeExtractedDataUpdate,
 )
 from app.modules.candidates.service import CandidateService, candidate_service
 from app.modules.documents.extractor import PDFExtractionResult, PDFExtractorService
@@ -929,3 +930,179 @@ async def test_candidate_creation_global_identity_decoupled() -> None:
     assert created_user.email == "candidate.bob@example.com"
     assert created_user.is_active is True
     assert created_user.is_super_admin is False
+
+
+@pytest.mark.asyncio
+async def test_resume_deletion_blocked_when_linked_to_application() -> None:
+    """Verify defensibility: a resume linked to submitted job application(s) cannot be deleted."""
+    candidate_id = uuid4()
+    resume_id = uuid4()
+    mock_db = AsyncMock()
+
+    mock_resume = MagicMock(spec=CandidateResume)
+    mock_resume.id = resume_id
+    mock_resume.user_id = candidate_id
+    mock_resume.filename = "alice_resume.pdf"
+    mock_resume.version_number = 1
+    mock_resume.storage_key = "candidates/123/resumes/alice.pdf"
+    mock_resume.content_sha256 = "dummy_sha_256"
+
+    # Query 1: return resume
+    res_resume = MagicMock()
+    res_resume.scalar_one_or_none.return_value = mock_resume
+
+    # Query 2: return application count = 2
+    res_app_count = MagicMock()
+    res_app_count.scalar.return_value = 2
+
+    mock_db.execute.side_effect = [res_resume, res_app_count]
+
+    mock_storage = MagicMock(spec=StorageService)
+    svc = CandidateService(storage=mock_storage, extractor=None, matcher=None, registry=skill_registry)
+
+    with pytest.raises(ValidationException) as exc_info:
+        await svc.delete_resume(mock_db, candidate_id, resume_id)
+
+    assert "retained under compliance" in str(exc_info.value)
+    assert exc_info.value.code == "ERR_RESUME_RETAINED_FOR_APPLICATIONS"
+    # Storage and DB delete must NOT have been called
+    mock_storage.delete_document_object.assert_not_called()
+    mock_db.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upload_docx_resume_and_extraction() -> None:
+    """Verify DOCX resume upload parses OpenXML text, extracts canonical skills, and reports accurate status."""
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"></Types>')
+        doc_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            '<w:body>'
+            '<w:p><w:r><w:t>Bob Smith</w:t></w:r></w:p>'
+            '<w:p><w:r><w:t>bob@example.com | +1 555-123-4567</w:t></w:r></w:p>'
+            '<w:p><w:r><w:t>Summary: Experienced Python and PostgreSQL backend engineer.</w:t></w:r></w:p>'
+            '</w:body></w:document>'
+        )
+        zf.writestr("word/document.xml", doc_xml)
+    docx_bytes = buf.getvalue()
+
+    candidate_id = uuid4()
+    mock_db = AsyncMock()
+
+    dup_res = MagicMock()
+    dup_res.scalar_one_or_none.return_value = None
+
+    count_res = MagicMock()
+    count_res.scalar.return_value = 0
+
+    mock_db.execute.side_effect = [dup_res, count_res]
+
+    mock_storage = MagicMock(spec=StorageService)
+    svc = CandidateService(storage=mock_storage, extractor=None, matcher=None, registry=skill_registry)
+
+    upload_file = UploadFile(
+        file=io.BytesIO(docx_bytes),
+        filename="bob_resume.docx",
+    )
+
+    resp = await svc.upload_resume(mock_db, candidate_id, upload_file)
+    assert resp.is_duplicate is False
+    assert resp.version_number == 1
+    assert resp.is_default is True
+    assert resp.ocr_applied is False
+    assert resp.ocr_provider == "null_ocr_unconfigured"
+    assert resp.malware_scan_status == "passed_development_mode"
+    mock_storage.upload_document_bytes.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_resume_extraction_structured_fields_and_ocr_status() -> None:
+    """Verify structured resume parsing extracts fields (email, phone, summary, experience) with accurate OCR status."""
+    candidate_id = uuid4()
+    resume_id = uuid4()
+    mock_db = AsyncMock()
+
+    resume_text = (
+        "Alice Candidate\n"
+        "alice.candidate@example.com\n"
+        "(555) 234-5678\n"
+        "Summary\n"
+        "Results-driven software architect with 8 years of experience building Python and FastAPI microservices.\n"
+        "Skills\n"
+        "Python, FastAPI, Docker, PostgreSQL\n"
+        "Experience\n"
+        "Lead Engineer - Acme Corp - 2021 to Present\n"
+        "Architected scalable cloud platforms and managed backend APIs.\n"
+        "Education\n"
+        "B.S. in Computer Science - Tech University - 2017 to 2021\n"
+        "Certifications\n"
+        "AWS Solutions Architect Associate\n"
+        "Projects\n"
+        "Open Source ETL Pipeline - Python data streaming tool\n"
+    )
+
+    mock_resume = MagicMock(spec=CandidateResume)
+    mock_resume.id = resume_id
+    mock_resume.user_id = candidate_id
+    mock_resume.extracted_text = resume_text
+    mock_resume.skills_extracted = ["Python", "FastAPI", "Docker", "PostgreSQL"]
+    mock_resume.status = "COMPLETED"
+
+    res_mock = MagicMock()
+    res_mock.scalar_one_or_none.return_value = mock_resume
+    mock_db.execute.return_value = res_mock
+
+    svc = CandidateService(storage=None, extractor=None, matcher=None, registry=skill_registry)
+    extraction = await svc.get_resume_extraction(mock_db, candidate_id, resume_id)
+
+    assert extraction.resume_id == resume_id
+    assert extraction.status == "COMPLETED"
+    assert extraction.ocr_applied is False
+    assert extraction.ocr_provider == "null_ocr_unconfigured"
+    assert extraction.extracted_data is not None
+    assert extraction.extracted_data.email == "alice.candidate@example.com"
+    assert extraction.extracted_data.phone is not None
+    assert "FastAPI" in extraction.extracted_data.skills
+    assert len(extraction.extracted_data.experience) >= 1
+    assert len(extraction.extracted_data.education) >= 1
+    assert "AWS Solutions Architect Associate" in extraction.extracted_data.certifications
+
+
+@pytest.mark.asyncio
+async def test_sync_resume_skills_to_profile() -> None:
+    """Verify candidate can edit extracted skills and apply them directly to verified profile."""
+    candidate_id = uuid4()
+    resume_id = uuid4()
+    mock_db = AsyncMock()
+
+    mock_resume = MagicMock(spec=CandidateResume)
+    mock_resume.id = resume_id
+    mock_resume.user_id = candidate_id
+    mock_resume.extracted_text = "Python engineer"
+    mock_resume.skills_extracted = ["Python"]
+    mock_resume.status = "COMPLETED"
+
+    mock_profile = MagicMock(spec=CandidateUserProfile)
+    mock_profile.self_declared_skills = []
+
+    res_resume = MagicMock()
+    res_resume.scalar_one_or_none.return_value = mock_resume
+    res_profile = MagicMock()
+    res_profile.scalar_one_or_none.return_value = mock_profile
+
+    # Sequence of queries: 1) fetch resume, 2) fetch profile in update_skills
+    mock_db.execute.side_effect = [res_resume, res_profile]
+
+    svc = CandidateService(storage=None, extractor=None, matcher=None, registry=skill_registry)
+
+    update_payload = ResumeExtractedDataUpdate(
+        skills_extracted=["Python", "FastAPI", "Docker"],
+        apply_to_profile=True,
+    )
+
+    resp = await svc.update_extracted_data(mock_db, candidate_id, resume_id, update_payload)
+    assert resp.skills_extracted == ["Python", "FastAPI", "Docker"]
+    assert "Python" in mock_profile.self_declared_skills

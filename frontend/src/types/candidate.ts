@@ -96,6 +96,38 @@ export interface CandidateResume {
   extracted_skills: string[];
   extracted_text_snippet?: string | null;
   uploaded_at: string;
+  has_active_applications?: boolean;
+}
+
+export interface ExtractedSectionItem {
+  title: string;
+  organization?: string | null;
+  date_range?: string | null;
+  description?: string | null;
+}
+
+export interface ExtractedProfileData {
+  name?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  summary?: string | null;
+  skills: string[];
+  experience: ExtractedSectionItem[];
+  education: ExtractedSectionItem[];
+  certifications: string[];
+  projects: ExtractedSectionItem[];
+}
+
+export interface ResumeExtractionResponse {
+  resume_id: string;
+  status: string;
+  extracted_text?: string | null;
+  skills_extracted: string[];
+  word_count: number;
+  extracted_data?: ExtractedProfileData | null;
+  ocr_applied: boolean;
+  ocr_provider: string;
+  malware_scan_status: string;
 }
 
 export interface JobPublicSummary {

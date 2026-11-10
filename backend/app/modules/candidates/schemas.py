@@ -8,7 +8,8 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from app.modules.candidates.parser import ExtractedProfileData, ExtractedSectionItem
 
 
 # -----------------------------------------------------------------------------
@@ -242,33 +243,72 @@ class CandidateProfileUpdate(BaseModel):
 # Resume Schemas
 # -----------------------------------------------------------------------------
 class CandidateResumeRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
     id: UUID
     user_id: UUID
     filename: str
+    file_name: str | None = None
     file_size_bytes: int
     content_sha256: str
+    sha256_hash: str | None = None
     mime_type: str
     status: str
     version_number: int
     is_default: bool
     skills_extracted: list[str] = Field(default_factory=list)
+    extracted_skills: list[str] = Field(default_factory=list)
+    extracted_text: str | None = None
+    extracted_text_snippet: str | None = None
     error_message: str | None = None
     created_at: datetime
+    uploaded_at: datetime | None = None
     updated_at: datetime
+    has_active_applications: bool = False
+
+    @model_validator(mode="after")
+    def populate_frontend_aliases(self) -> CandidateResumeRead:
+        if not self.file_name:
+            self.file_name = self.filename
+        if not self.sha256_hash:
+            self.sha256_hash = self.content_sha256
+        if not self.extracted_skills and self.skills_extracted:
+            self.extracted_skills = self.skills_extracted
+        if not self.uploaded_at:
+            self.uploaded_at = self.created_at
+        if not self.extracted_text_snippet and self.extracted_text:
+            self.extracted_text_snippet = self.extracted_text[:1000]
+        return self
 
 
 class ResumeUploadResponse(BaseModel):
     id: UUID
     filename: str
+    file_name: str | None = None
     file_size_bytes: int
     content_sha256: str
+    sha256_hash: str | None = None
+    mime_type: str = "application/pdf"
     status: str
     version_number: int
     is_default: bool
     is_duplicate: bool = False
-    message: str = "Resume uploaded successfully and queued for processing"
+    message: str = "Resume uploaded successfully and processed"
+    skills_extracted: list[str] = Field(default_factory=list)
+    extracted_skills: list[str] = Field(default_factory=list)
+    ocr_applied: bool = False
+    ocr_provider: str = "null_ocr_unconfigured"
+    malware_scan_status: str = "passed_development_mode"
+
+    @model_validator(mode="after")
+    def populate_aliases(self) -> ResumeUploadResponse:
+        if not self.file_name:
+            self.file_name = self.filename
+        if not self.sha256_hash:
+            self.sha256_hash = self.content_sha256
+        if not self.extracted_skills and self.skills_extracted:
+            self.extracted_skills = self.skills_extracted
+        return self
 
 
 class ResumeExtractionResponse(BaseModel):
@@ -277,11 +317,17 @@ class ResumeExtractionResponse(BaseModel):
     extracted_text: str | None = None
     skills_extracted: list[str] = Field(default_factory=list)
     word_count: int = 0
+    extracted_data: ExtractedProfileData | None = None
+    ocr_applied: bool = False
+    ocr_provider: str = "null_ocr_unconfigured"
+    malware_scan_status: str = "passed_development_mode"
 
 
 class ResumeExtractedDataUpdate(BaseModel):
     extracted_text: str | None = None
     skills_extracted: list[str] | None = None
+    extracted_data: ExtractedProfileData | None = None
+    apply_to_profile: bool = False
 
 
 class ResumeDownloadUrlResponse(BaseModel):

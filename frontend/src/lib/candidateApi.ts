@@ -8,6 +8,7 @@ import type {
   CandidateLanguage,
   CandidatePreference,
   CandidateResume,
+  ResumeExtractionResponse,
   JobPublicSummary,
   JobDetail,
   SavedJobItem,
@@ -174,10 +175,16 @@ export const candidateApi = {
     }),
   getResumeDownloadUrl: (id: string) =>
     fetchWithAuth<{ download_url: string; expires_in_seconds: number }>(`/resumes/me/${id}/download`),
+  getResumeExtraction: (id: string) =>
+    fetchWithAuth<ResumeExtractionResponse>(`/resumes/me/${id}/extraction`),
   updateResumeSkills: (id: string, skills: string[]) =>
     fetchWithAuth<CandidateResume>(`/resumes/me/${id}/skills`, {
       method: "PUT",
       body: JSON.stringify({ skills }),
+    }),
+  syncResumeSkillsToProfile: (id: string) =>
+    fetchWithAuth<{ skills: string[] }>(`/resumes/${id}/sync-profile`, {
+      method: "POST",
     }),
 
   // Jobs
