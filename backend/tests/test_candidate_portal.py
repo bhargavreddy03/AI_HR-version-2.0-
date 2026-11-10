@@ -27,8 +27,9 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import UploadFile
 
+from app.core.config import get_settings
 from app.core.database import get_db
-from app.core.errors import EntityNotFoundException, ValidationException
+from app.core.errors import AuthenticationException, EntityNotFoundException, ValidationException
 from app.core.security import SecurityContext
 from app.main import create_application
 from app.modules.auth.dependencies import require_authenticated_user
@@ -36,22 +37,29 @@ from app.modules.auth.models import CandidateUserProfile, User
 from app.modules.candidates.models import (
     CandidateNotification,
     CandidatePreference,
+    CandidatePrivacyRequest,
     CandidateResume,
     CandidateResumeStatus,
     CandidateSavedJob,
 )
 from app.modules.candidates.schemas import (
+    CandidateAccountUpdate,
     CandidatePreferenceUpdate,
     CandidateProfileRead,
     CandidateProfileUpdate,
     CertificationCreate,
+    CorrectionRequestCreate,
+    DeletionRequestCreate,
     EducationCreate,
     ExperienceCreate,
     ExperienceUpdate,
     LanguageCreate,
+    NotificationPreferencesUpdate,
+    PrivacyPreferencesUpdate,
     ProjectCreate,
     ResumeExtractedDataUpdate,
 )
+from app.modules.notifications.tasks import dispatch_candidate_email_notification
 from app.modules.candidates.service import CandidateService, candidate_service
 from app.modules.documents.extractor import PDFExtractionResult, PDFExtractorService
 from app.modules.documents.storage import StorageService
@@ -1536,3 +1544,301 @@ async def test_saved_jobs_duplicate_prevention_and_applied_status() -> None:
     assert item.job.has_applied is True
     assert item.job.is_expired is True
     assert item.job.is_saved is True
+
+
+# =============================================================================
+# Step 4.1.7: Candidate Notifications, Settings and Privacy Tests
+# =============================================================================
+@pytest.mark.asyncio
+async def test_notification_ownership_and_idor_protection() -> None:
+    """Verify that candidate B cannot mark as read or mutate notifications owned by candidate A."""
+    candidate_a = uuid4()
+    candidate_b = uuid4()
+    notif_id = uuid4()
+    mock_db = AsyncMock()
+
+    # Query searching for notification owned by candidate_b returns None
+    query_res = MagicMock()
+    query_res.scalar_one_or_none.return_value = None
+    mock_db.execute.return_value = query_res
+
+    with pytest.raises(EntityNotFoundException):
+        await candidate_service.mark_notification_read(mock_db, candidate_b, notif_id)
+
+
+@pytest.mark.asyncio
+async def test_email_notification_task_retry_and_honesty_report() -> None:
+    """Verify Celery email task executes with idempotency and honestly reports unconfigured email."""
+    notif_id = str(uuid4())
+    result = dispatch_candidate_email_notification(
+        notification_id=notif_id,
+        recipient_email="candidate@example.com",
+        subject="Interview Invitation",
+        body="You have been invited for a technical interview.",
+        idempotency_key=notif_id,
+    )
+    assert result["delivered"] is False
+    assert result["status"] == "not_configured"
+    assert "External email infrastructure is not configured" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_account_info_and_update() -> None:
+    """Verify candidate account identity retrieval and contact information update."""
+    candidate_id = uuid4()
+    mock_db = AsyncMock()
+
+    mock_user = MagicMock(spec=User)
+    mock_user.id = candidate_id
+    mock_user.email = "alex@enterprise.com"
+    mock_user.first_name = "Alex"
+    mock_user.last_name = "Morgan"
+    mock_user.phone_number = "+1-555-0199"
+    mock_user.avatar_url = None
+    mock_user.is_verified = True
+    mock_user.is_active = True
+    mock_user.mfa_enabled = False
+    mock_user.litigation_hold = False
+    mock_user.created_at = datetime.now(UTC)
+
+    res_user = MagicMock()
+    res_user.scalar_one_or_none.return_value = mock_user
+    mock_db.execute.return_value = res_user
+
+    account = await candidate_service.get_account_info(mock_db, candidate_id)
+    assert account.email == "alex@enterprise.com"
+    assert account.first_name == "Alex"
+
+    update_payload = CandidateAccountUpdate(first_name="Alexander", phone_number="+1-555-9999")
+    updated = await candidate_service.update_account_info(mock_db, candidate_id, update_payload)
+    assert updated.first_name == "Alexander"
+    assert updated.phone_number == "+1-555-9999"
+
+
+@pytest.mark.asyncio
+async def test_email_verification_request_creates_notification_and_reports_honestly() -> None:
+    """Verify email verification request creates an in-app notification and reports status honestly."""
+    candidate_id = uuid4()
+    mock_db = AsyncMock()
+
+    mock_user = MagicMock(spec=User)
+    mock_user.id = candidate_id
+    mock_user.email = "alex@enterprise.com"
+
+    res_user = MagicMock()
+    res_user.scalar_one_or_none.return_value = mock_user
+    mock_db.execute.return_value = res_user
+
+    with patch.object(candidate_service, "create_notification", new_callable=AsyncMock) as mock_create_notif:
+        res = await candidate_service.request_email_verification(mock_db, candidate_id)
+        assert res["status"] == "initiated"
+        assert res["email_service_configured"] is False
+        assert "External email delivery is currently unconfigured" in res["message"]
+        mock_create_notif.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_notification_and_privacy_preferences_lifecycle() -> None:
+    """Verify getting and updating candidate notification and privacy preferences."""
+    candidate_id = uuid4()
+    mock_db = AsyncMock()
+
+    mock_pref = MagicMock(spec=CandidatePreference)
+    mock_pref.notification_preferences = {
+        "email_application_updates": True,
+        "email_interview_alerts": True,
+        "email_job_recommendations": False,
+        "in_app_alerts": True,
+        "digest_frequency": "instant",
+    }
+    mock_pref.privacy_preferences = {
+        "profile_visibility": "applied_only",
+        "allow_ai_matching": True,
+        "data_retention_months": 24,
+    }
+
+    res_pref = MagicMock()
+    res_pref.scalar_one_or_none.return_value = mock_pref
+    mock_db.execute.return_value = res_pref
+
+    # Notification preferences
+    notif_prefs = await candidate_service.get_notification_preferences(mock_db, candidate_id)
+    assert notif_prefs.email_application_updates is True
+    assert notif_prefs.email_job_recommendations is False
+
+    updated_notif = await candidate_service.update_notification_preferences(
+        mock_db, candidate_id, NotificationPreferencesUpdate(email_job_recommendations=True, digest_frequency="weekly")
+    )
+    assert updated_notif.email_job_recommendations is True
+    assert updated_notif.digest_frequency == "weekly"
+
+    # Privacy preferences
+    priv_prefs = await candidate_service.get_privacy_preferences(mock_db, candidate_id)
+    assert priv_prefs.profile_visibility == "applied_only"
+    assert priv_prefs.allow_ai_matching is True
+
+    updated_priv = await candidate_service.update_privacy_preferences(
+        mock_db, candidate_id, PrivacyPreferencesUpdate(profile_visibility="discoverable", allow_ai_matching=False)
+    )
+    assert updated_priv.profile_visibility == "discoverable"
+    assert updated_priv.allow_ai_matching is False
+
+
+@pytest.mark.asyncio
+async def test_candidate_interview_visibility_without_fake_records() -> None:
+    """Verify candidate interview schedule surfaces real application milestones without fabricating data."""
+    candidate_id = uuid4()
+    mock_db = AsyncMock()
+
+    # 1. Candidate with no active interviews returns empty list
+    empty_res = MagicMock()
+    empty_res.all.return_value = []
+    mock_db.execute.return_value = empty_res
+
+    res_empty = await candidate_service.list_interviews(mock_db, candidate_id)
+    assert res_empty.total == 0
+    assert len(res_empty.interviews) == 0
+
+    # 2. Candidate with application in interview stage
+    mock_app = MagicMock(spec=JobApplication)
+    mock_app.id = uuid4()
+    mock_app.job_id = uuid4()
+    mock_app.candidate_status = "interviewing"
+    mock_app.applied_at = datetime(2026, 3, 1, 14, 0, tzinfo=UTC)
+    mock_app.timeline = [
+        {"status": "submitted", "changed_at": "2026-03-01T14:00:00Z"},
+        {"status": "interviewing", "changed_at": "2026-03-05T10:00:00Z", "note": "Technical screening scheduled."},
+    ]
+    mock_app.answers = {}
+
+    rows_res = MagicMock()
+    rows_res.all.return_value = [(mock_app, "Staff Cloud Architect", "Nexus Tech")]
+    mock_db.execute.return_value = rows_res
+
+    res_interviews = await candidate_service.list_interviews(mock_db, candidate_id)
+    assert res_interviews.total == 1
+    interview = res_interviews.interviews[0]
+    assert interview.job_title == "Staff Cloud Architect"
+    assert interview.organization_name == "Nexus Tech"
+    assert interview.status == "scheduled"
+    assert interview.interview_type == "technical"
+
+
+@pytest.mark.asyncio
+async def test_personal_data_export_generation_and_disclaimer() -> None:
+    """Verify machine-readable personal data export compiles complete candidate record with legal disclaimer."""
+    candidate_id = uuid4()
+    mock_db = AsyncMock()
+
+    mock_user = MagicMock(spec=User)
+    mock_user.id = candidate_id
+    mock_user.email = "alex@enterprise.com"
+    mock_user.first_name = "Alex"
+    mock_user.last_name = "Morgan"
+    mock_user.phone_number = None
+    mock_user.created_at = datetime.now(UTC)
+
+    mock_profile = MagicMock(spec=CandidateUserProfile)
+    mock_profile.headline = "Lead Engineer"
+    mock_profile.bio = "Cloud systems"
+    mock_profile.location_city = "New York"
+    mock_profile.location_country = "USA"
+    mock_profile.self_declared_skills = ["Python", "FastAPI"]
+
+    u_res = MagicMock()
+    u_res.scalar_one_or_none.return_value = mock_user
+    p_res = MagicMock()
+    p_res.scalar_one_or_none.return_value = mock_profile
+
+    # Sequence of queries for export: user, profile, exp, edu, cert, lang, resume, apps, saved
+    empty_list_res = MagicMock()
+    empty_list_res.scalars.return_value.all.return_value = []
+    empty_all_res = MagicMock()
+    empty_all_res.all.return_value = []
+
+    mock_db.execute.side_effect = [
+        u_res,           # user
+        p_res,           # profile
+        empty_list_res,  # experiences
+        empty_list_res,  # educations
+        empty_list_res,  # certifications
+        empty_list_res,  # languages
+        empty_list_res,  # resumes
+        empty_all_res,   # applications
+        u_res,           # user in get_consent_history
+        empty_all_res,   # apps in get_consent_history
+        empty_list_res,  # saved_jobs
+    ]
+
+    export = await candidate_service.generate_data_export(mock_db, candidate_id)
+    assert export.candidate_id == candidate_id
+    assert export.user_account["email"] == "alex@enterprise.com"
+    assert export.candidate_profile["headline"] == "Lead Engineer"
+    assert "Confidential internal recruiter notes" in export.disclaimer
+
+
+@pytest.mark.asyncio
+async def test_privacy_correction_request_lifecycle() -> None:
+    """Verify candidate can submit formal data correction requests tracked with audit trail."""
+    candidate_id = uuid4()
+    mock_db = AsyncMock()
+
+    payload = CorrectionRequestCreate(
+        field_name="phone_number",
+        current_value="+1-555-0000",
+        requested_correction="+1-555-1111",
+        reason="Updated primary phone number.",
+    )
+
+    with patch.object(candidate_service, "create_notification", new_callable=AsyncMock) as mock_notif:
+        resp = await candidate_service.submit_correction_request(mock_db, candidate_id, payload)
+        assert resp.status == "pending"
+        assert "Data correction request logged successfully" in resp.message
+        mock_notif.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_privacy_deletion_request_reauthentication_and_legal_hold() -> None:
+    """Verify deletion request enforces password reauthentication, blocks on legal holds, and provides statutory retention notices."""
+    candidate_id = uuid4()
+    mock_db = AsyncMock()
+    settings = get_settings()
+
+    mock_user = MagicMock(spec=User)
+    mock_user.id = candidate_id
+    mock_user.password_hash = "mock_hash"
+    mock_user.litigation_hold = False
+    mock_user.is_active = True
+
+    u_res = MagicMock()
+    u_res.scalar_one_or_none.return_value = mock_user
+    mock_db.execute.return_value = u_res
+
+    # 1. Invalid password rejection
+    with patch("app.modules.candidates.service.verify_password", return_value=False):
+        with pytest.raises(AuthenticationException) as exc_info:
+            await candidate_service.submit_deletion_request(
+                mock_db, candidate_id, DeletionRequestCreate(password="wrongpass"), settings
+            )
+        assert "Invalid password" in str(exc_info.value)
+
+    # 2. Rejection when litigation hold is active
+    mock_user.litigation_hold = True
+    with patch("app.modules.candidates.service.verify_password", return_value=True):
+        with pytest.raises(ValidationException) as exc_info:
+            await candidate_service.submit_deletion_request(
+                mock_db, candidate_id, DeletionRequestCreate(password="correctpass"), settings
+            )
+        assert exc_info.value.code == "ERR_LEGAL_HOLD_ACTIVE"
+
+    # 3. Successful account erasure request with statutory retention notice
+    mock_user.litigation_hold = False
+    with patch("app.modules.candidates.service.verify_password", return_value=True):
+        resp = await candidate_service.submit_deletion_request(
+            mock_db, candidate_id, DeletionRequestCreate(password="correctpass", reason="Leaving platform"), settings
+        )
+        assert resp.status == "pending"
+        assert mock_user.is_active is False
+        assert "EEOC 29 C.F.R. § 1602" in resp.disclaimer
+        assert "Do not claim legal compliance solely because these interfaces exist" in resp.disclaimer
+

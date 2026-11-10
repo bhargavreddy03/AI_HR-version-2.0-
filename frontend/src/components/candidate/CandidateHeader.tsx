@@ -54,7 +54,7 @@ export function CandidateHeader({
   const handleMarkAllRead = async () => {
     try {
       const baseUrl = getApiBaseUrl();
-      await fetch(`${baseUrl}/candidates/me/notifications/mark-all-read`, {
+      await fetch(`${baseUrl}/candidates/me/notifications/read-all`, {
         method: "POST",
         credentials: "include",
       });
@@ -63,6 +63,25 @@ export function CandidateHeader({
     } catch {
       setNotifications((prev) => prev.map((n) => ({ ...n, is_read: true })));
       setUnreadCount(0);
+    }
+  };
+
+  const handleMarkOneRead = async (id: string) => {
+    try {
+      const baseUrl = getApiBaseUrl();
+      await fetch(`${baseUrl}/candidates/me/notifications/${id}/read`, {
+        method: "PATCH",
+        credentials: "include",
+      });
+      setNotifications((prev) =>
+        prev.map((n) => (n.id === id ? { ...n, is_read: true } : n))
+      );
+      setUnreadCount((prev) => Math.max(0, prev - 1));
+    } catch {
+      setNotifications((prev) =>
+        prev.map((n) => (n.id === id ? { ...n, is_read: true } : n))
+      );
+      setUnreadCount((prev) => Math.max(0, prev - 1));
     }
   };
 
@@ -146,10 +165,11 @@ export function CandidateHeader({
                   notifications.map((notif) => (
                     <div
                       key={notif.id}
-                      className={`p-3 text-xs transition-colors ${
+                      onClick={() => !notif.is_read && handleMarkOneRead(notif.id)}
+                      className={`p-3 text-xs transition-colors cursor-pointer ${
                         notif.is_read
                           ? "bg-white opacity-70 dark:bg-slate-900"
-                          : "bg-blue-50/50 dark:bg-blue-950/20"
+                          : "bg-blue-50/50 dark:bg-blue-950/20 hover:bg-blue-50"
                       }`}
                     >
                       <p className="font-semibold text-slate-900 dark:text-white">

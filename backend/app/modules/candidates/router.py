@@ -11,10 +11,15 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, Response, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings, get_settings
 from app.core.database import get_db
 from app.core.security import SecurityContext
 from app.modules.auth.dependencies import require_authenticated_user
 from app.modules.candidates.schemas import (
+    CandidateAccountRead,
+    CandidateAccountUpdate,
+    CandidateInterviewRead,
+    CandidateInterviewsResponse,
     CandidateNotificationsResponse,
     CandidatePreferenceRead,
     CandidatePreferenceUpdate,
@@ -25,6 +30,12 @@ from app.modules.candidates.schemas import (
     CandidateSkillsUpdate,
     CertificationCreate,
     CertificationRead,
+    ConsentHistoryItem,
+    ConsentHistoryResponse,
+    CorrectionRequestCreate,
+    CorrectionRequestResponse,
+    DeletionRequestCreate,
+    DeletionRequestResponse,
     EducationCreate,
     EducationRead,
     EducationUpdate,
@@ -33,6 +44,11 @@ from app.modules.candidates.schemas import (
     ExperienceUpdate,
     LanguageCreate,
     LanguageRead,
+    NotificationPreferencesRead,
+    NotificationPreferencesUpdate,
+    PersonalDataExportResponse,
+    PrivacyPreferencesRead,
+    PrivacyPreferencesUpdate,
     ProjectCreate,
     ProjectRead,
     ResumeDownloadUrlResponse,
@@ -422,20 +438,38 @@ async def withdraw_application(
 @candidate_router.get(
     "/me/notifications",
     response_model=CandidateNotificationsResponse,
-    summary="Retrieve candidate notifications",
+    summary="Retrieve candidate notifications with optional category and read status filters",
 )
 async def get_notifications(
+    category: str | None = None,
+    is_read: bool | None = None,
+    limit: int = 50,
+    offset: int = 0,
     db: AsyncSession = Depends(get_db),
     sec: SecurityContext = Depends(require_authenticated_user),
 ) -> CandidateNotificationsResponse:
-    return await candidate_service.list_notifications(db, sec.user_id)
+    return await candidate_service.list_notifications(
+        db, sec.user_id, category=category, is_read=is_read, limit=limit, offset=offset
+    )
+
+
+@candidate_router.get(
+    "/me/notifications/unread-count",
+    summary="Retrieve count of unread candidate notifications",
+)
+async def get_unread_notifications_count(
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+) -> dict[str, int]:
+    count = await candidate_service.get_unread_notifications_count(db, sec.user_id)
+    return {"unread_count": count}
 
 
 @candidate_router.patch(
     "/me/notifications/{notification_id}/read",
     status_code=status.HTTP_204_NO_CONTENT,
     response_class=Response,
-    summary="Mark notification as read",
+    summary="Mark notification as read with ownership validation",
 )
 async def mark_notification_read(
     notification_id: UUID,
@@ -452,12 +486,177 @@ async def mark_notification_read(
     response_class=Response,
     summary="Mark all notifications as read",
 )
+@candidate_router.post(
+    "/me/notifications/mark-all-read",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    summary="Mark all notifications as read (alias)",
+)
 async def mark_all_notifications_read(
     db: AsyncSession = Depends(get_db),
     sec: SecurityContext = Depends(require_authenticated_user),
 ) -> Response:
     await candidate_service.mark_all_notifications_read(db, sec.user_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# =============================================================================
+# Candidate Interview Visibility Endpoints
+# =============================================================================
+@candidate_router.get(
+    "/me/interviews",
+    response_model=CandidateInterviewsResponse,
+    summary="Retrieve candidate-facing interview schedules and details",
+)
+async def get_candidate_interviews(
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+) -> CandidateInterviewsResponse:
+    return await candidate_service.list_interviews(db, sec.user_id)
+
+
+# =============================================================================
+# Account & Security Settings Endpoints
+# =============================================================================
+@candidate_router.get(
+    "/me/account",
+    response_model=CandidateAccountRead,
+    summary="Retrieve candidate account identity and security information",
+)
+async def get_candidate_account(
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+) -> CandidateAccountRead:
+    return await candidate_service.get_account_info(db, sec.user_id)
+
+
+@candidate_router.patch(
+    "/me/account",
+    response_model=CandidateAccountRead,
+    summary="Update candidate account personal contact details",
+)
+async def update_candidate_account(
+    payload: CandidateAccountUpdate,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+) -> CandidateAccountRead:
+    return await candidate_service.update_account_info(db, sec.user_id, payload)
+
+
+@candidate_router.post(
+    "/me/request-email-verification",
+    summary="Request a verification email with system delivery status",
+)
+async def request_email_verification(
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+) -> dict:
+    return await candidate_service.request_email_verification(db, sec.user_id)
+
+
+@candidate_router.get(
+    "/me/notification-preferences",
+    response_model=NotificationPreferencesRead,
+    summary="Retrieve candidate notification preferences",
+)
+async def get_notification_preferences(
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+) -> NotificationPreferencesRead:
+    return await candidate_service.get_notification_preferences(db, sec.user_id)
+
+
+@candidate_router.put(
+    "/me/notification-preferences",
+    response_model=NotificationPreferencesRead,
+    summary="Update candidate notification preferences",
+)
+async def update_notification_preferences(
+    payload: NotificationPreferencesUpdate,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+) -> NotificationPreferencesRead:
+    return await candidate_service.update_notification_preferences(db, sec.user_id, payload)
+
+
+@candidate_router.get(
+    "/me/privacy-preferences",
+    response_model=PrivacyPreferencesRead,
+    summary="Retrieve candidate privacy preferences",
+)
+async def get_privacy_preferences(
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+) -> PrivacyPreferencesRead:
+    return await candidate_service.get_privacy_preferences(db, sec.user_id)
+
+
+@candidate_router.put(
+    "/me/privacy-preferences",
+    response_model=PrivacyPreferencesRead,
+    summary="Update candidate privacy preferences",
+)
+async def update_privacy_preferences(
+    payload: PrivacyPreferencesUpdate,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+) -> PrivacyPreferencesRead:
+    return await candidate_service.update_privacy_preferences(db, sec.user_id, payload)
+
+
+# =============================================================================
+# GDPR / CCPA Data Subject Rights Endpoints
+# =============================================================================
+@candidate_router.get(
+    "/me/privacy/export",
+    response_model=PersonalDataExportResponse,
+    summary="Download complete machine-readable personal data export (GDPR Art. 15 / CCPA)",
+)
+async def export_personal_data(
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+) -> PersonalDataExportResponse:
+    return await candidate_service.generate_data_export(db, sec.user_id)
+
+
+@candidate_router.post(
+    "/me/privacy/correction-request",
+    response_model=CorrectionRequestResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Submit a formal data correction request",
+)
+async def submit_correction_request(
+    payload: CorrectionRequestCreate,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+) -> CorrectionRequestResponse:
+    return await candidate_service.submit_correction_request(db, sec.user_id, payload)
+
+
+@candidate_router.post(
+    "/me/privacy/deletion-request",
+    response_model=DeletionRequestResponse,
+    summary="Submit an account erasure request with password verification and statutory safeguards",
+)
+async def submit_deletion_request(
+    payload: DeletionRequestCreate,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+) -> DeletionRequestResponse:
+    settings = get_settings()
+    return await candidate_service.submit_deletion_request(db, sec.user_id, payload, settings)
+
+
+@candidate_router.get(
+    "/me/privacy/consent-history",
+    response_model=ConsentHistoryResponse,
+    summary="Retrieve candidate consent records history",
+)
+async def get_consent_history(
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+) -> ConsentHistoryResponse:
+    return await candidate_service.get_consent_history(db, sec.user_id)
 
 
 # =============================================================================

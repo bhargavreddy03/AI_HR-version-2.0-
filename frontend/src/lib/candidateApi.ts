@@ -17,6 +17,16 @@ import type {
   CandidateApplicationDetail,
   ApplicationSubmitResponse,
   CandidateNotification,
+  CandidateAccount,
+  NotificationPreferences,
+  PrivacyPreferences,
+  CandidateInterview,
+  PersonalDataExport,
+  CorrectionRequestPayload,
+  CorrectionRequestResponse,
+  DeletionRequestPayload,
+  DeletionRequestResponse,
+  ConsentHistoryItem,
 } from "@/types/candidate";
 
 async function fetchWithAuth<T>(
@@ -151,7 +161,9 @@ export const candidateApi = {
     }),
 
   // Preferences
-  updatePreferences: (data: CandidatePreference) =>
+  getPreferences: () =>
+    fetchWithAuth<CandidatePreference>("/candidates/me/preferences"),
+  updatePreferences: (data: Partial<CandidatePreference>) =>
     fetchWithAuth<CandidatePreference>("/candidates/me/preferences", {
       method: "PUT",
       body: JSON.stringify(data),
@@ -276,15 +288,78 @@ export const candidateApi = {
     }),
 
   // Notifications
-  getNotifications: () => fetchWithAuth<CandidateNotification[]>("/candidates/me/notifications"),
+  getNotifications: (params?: { category?: string; is_read?: boolean }) => {
+    const qs = new URLSearchParams();
+    if (params?.category) qs.append("category", params.category);
+    if (params?.is_read !== undefined) qs.append("is_read", String(params.is_read));
+    const query = qs.toString();
+    return fetchWithAuth<CandidateNotification[]>(`/candidates/me/notifications${query ? `?${query}` : ""}`);
+  },
   getUnreadNotificationCount: () =>
     fetchWithAuth<{ unread_count: number }>("/candidates/me/notifications/unread-count"),
   markNotificationRead: (id: string) =>
     fetchWithAuth<void>(`/candidates/me/notifications/${id}/read`, {
-      method: "PUT",
+      method: "PATCH",
     }),
   markAllNotificationsRead: () =>
-    fetchWithAuth<void>("/candidates/me/notifications/mark-all-read", {
+    fetchWithAuth<void>("/candidates/me/notifications/read-all", {
       method: "POST",
     }),
+
+  // Account & Security Settings
+  getAccountInfo: () =>
+    fetchWithAuth<CandidateAccount>("/candidates/me/account"),
+  updateAccountInfo: (data: { first_name?: string; last_name?: string; phone_number?: string }) =>
+    fetchWithAuth<CandidateAccount>("/candidates/me/account", {
+      method: "PATCH",
+      body: JSON.stringify(data),
+    }),
+  changePassword: (data: { current_password: string; new_password: string }) =>
+    fetchWithAuth<{ message: string }>("/auth/password/change", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  requestEmailVerification: () =>
+    fetchWithAuth<{ status: string; email: string; message: string; email_service_configured: boolean }>(
+      "/candidates/me/request-email-verification",
+      { method: "POST" }
+    ),
+
+  // Notification Preferences
+  getNotificationPreferences: () =>
+    fetchWithAuth<NotificationPreferences>("/candidates/me/notification-preferences"),
+  updateNotificationPreferences: (data: Partial<NotificationPreferences>) =>
+    fetchWithAuth<NotificationPreferences>("/candidates/me/notification-preferences", {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
+
+  // Privacy Preferences
+  getPrivacyPreferences: () =>
+    fetchWithAuth<PrivacyPreferences>("/candidates/me/privacy-preferences"),
+  updatePrivacyPreferences: (data: Partial<PrivacyPreferences>) =>
+    fetchWithAuth<PrivacyPreferences>("/candidates/me/privacy-preferences", {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
+
+  // Candidate Interview Visibility
+  getInterviews: () =>
+    fetchWithAuth<{ interviews: CandidateInterview[]; total: number }>("/candidates/me/interviews"),
+
+  // Data Privacy Subject Rights (GDPR / CCPA)
+  getDataExport: () =>
+    fetchWithAuth<PersonalDataExport>("/candidates/me/privacy/export"),
+  submitCorrectionRequest: (data: CorrectionRequestPayload) =>
+    fetchWithAuth<CorrectionRequestResponse>("/candidates/me/privacy/correction-request", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  submitDeletionRequest: (data: DeletionRequestPayload) =>
+    fetchWithAuth<DeletionRequestResponse>("/candidates/me/privacy/deletion-request", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  getConsentHistory: () =>
+    fetchWithAuth<{ consents: ConsentHistoryItem[]; total: number }>("/candidates/me/privacy/consent-history"),
 };

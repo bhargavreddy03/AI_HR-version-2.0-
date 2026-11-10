@@ -64,10 +64,15 @@ export interface CandidateLanguage {
 export interface CandidatePreference {
   desired_salary_min?: number | null;
   desired_salary_currency?: string;
-  desired_role_levels: string[];
-  remote_preference?: "remote" | "hybrid" | "onsite" | "any";
-  open_to_relocation: boolean;
+  desired_role_levels?: string[];
+  remote_preference?: "remote" | "hybrid" | "onsite" | "flexible" | "any";
+  open_to_relocation?: boolean;
   notice_period_days?: number | null;
+  desired_job_titles?: string[];
+  desired_locations?: string[];
+  employment_types?: string[];
+  minimum_salary?: number | null;
+  currency?: string;
 }
 
 export interface CandidateFullProfile {
@@ -227,10 +232,117 @@ export interface ApplicationSubmitResponse {
 
 export interface CandidateNotification {
   id: string;
+  user_id?: string;
   title: string;
-  body: string;
-  notification_type: string;
+  message: string;
+  body?: string;
+  category: string;
+  notification_type?: string;
+  event_type?: string | null;
+  payload?: Record<string, any> | null;
+  action_url?: string | null;
   link_url?: string | null;
   is_read: boolean;
+  email_sent?: boolean;
+  email_status?: string;
   created_at: string;
+}
+
+export interface NotificationPreferences {
+  email_application_updates: boolean;
+  email_interview_alerts: boolean;
+  email_job_recommendations: boolean;
+  in_app_alerts: boolean;
+  digest_frequency: "instant" | "daily" | "weekly" | "none" | string;
+}
+
+export interface PrivacyPreferences {
+  profile_visibility: "applied_only" | "discoverable" | "anonymous" | string;
+  allow_ai_matching: boolean;
+  data_retention_months: number;
+}
+
+export interface CandidateAccount {
+  id: string;
+  email: string;
+  first_name: string;
+  last_name: string;
+  phone_number?: string | null;
+  avatar_url?: string | null;
+  is_verified: boolean;
+  is_active: boolean;
+  mfa_enabled: boolean;
+  litigation_hold: boolean;
+  created_at: string;
+}
+
+export interface CandidateInterview {
+  id: string;
+  application_id: string;
+  job_id: string;
+  job_title: string;
+  organization_name: string;
+  scheduled_at: string;
+  duration_minutes: number;
+  timezone: string;
+  interview_type: "technical" | "screening" | "panel" | "behavioral" | "executive" | string;
+  status: "scheduled" | "rescheduled" | "cancelled" | "completed" | string;
+  meeting_instructions?: string | null;
+  meeting_url?: string | null;
+  interviewer_name?: string | null;
+  interviewer_role?: string | null;
+  rescheduled_reason?: string | null;
+  cancellation_reason?: string | null;
+}
+
+export interface PersonalDataExport {
+  candidate_id: string;
+  export_timestamp: string;
+  user_account: Record<string, any>;
+  candidate_profile?: Record<string, any> | null;
+  experiences: Record<string, any>[];
+  educations: Record<string, any>[];
+  certifications: Record<string, any>[];
+  languages: Record<string, any>[];
+  resumes: Record<string, any>[];
+  applications: Record<string, any>[];
+  saved_jobs: Record<string, any>[];
+  consent_history: ConsentHistoryItem[];
+  disclaimer: string;
+}
+
+export interface CorrectionRequestPayload {
+  field_name: string;
+  current_value?: string;
+  requested_correction: string;
+  reason: string;
+}
+
+export interface CorrectionRequestResponse {
+  request_id: string;
+  status: string;
+  message: string;
+  created_at: string;
+}
+
+export interface DeletionRequestPayload {
+  password: string;
+  reason?: string;
+}
+
+export interface DeletionRequestResponse {
+  request_id: string;
+  status: string;
+  message: string;
+  disclaimer: string;
+}
+
+export interface ConsentHistoryItem {
+  consent_id: string;
+  consent_type: string;
+  title: string;
+  description: string;
+  granted_at: string;
+  source: string;
+  ip_address?: string | null;
 }

@@ -15,6 +15,7 @@ const ROUTE_LABELS: Record<string, string> = {
   jobs: "Find Jobs",
   "saved-jobs": "Saved Jobs",
   applications: "My Applications",
+  interviews: "Interview Schedule",
   settings: "Account Settings & Privacy",
 };
 

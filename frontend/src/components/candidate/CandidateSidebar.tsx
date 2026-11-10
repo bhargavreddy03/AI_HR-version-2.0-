@@ -10,6 +10,7 @@ import {
   Briefcase,
   Bookmark,
   SendHorizontal,
+  Calendar,
   Settings,
   X,
 } from "lucide-react";
@@ -49,6 +50,11 @@ const NAV_ITEMS = [
     name: "My Applications",
     href: "/candidate/applications",
     icon: SendHorizontal,
+  },
+  {
+    name: "Interviews",
+    href: "/candidate/interviews",
+    icon: Calendar,
   },
   {
     name: "Settings & Privacy",

@@ -172,6 +172,26 @@ class CandidatePreference(Base, TimestampMixin):
     )  # full_time, part_time, contract, internship
     minimum_salary: Mapped[int | None] = mapped_column(Integer, nullable=True)
     currency: Mapped[str] = mapped_column(String(10), nullable=False, default="USD")
+    notification_preferences: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: {
+            "email_application_updates": True,
+            "email_interview_alerts": True,
+            "email_job_recommendations": False,
+            "in_app_alerts": True,
+            "digest_frequency": "instant",
+        },
+    )
+    privacy_preferences: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: {
+            "profile_visibility": "applied_only",
+            "allow_ai_matching": True,
+            "data_retention_months": 24,
+        },
+    )
 
 
 class CandidateResume(Base, TimestampMixin):
@@ -256,6 +276,38 @@ class CandidateNotification(Base, TimestampMixin):
     message: Mapped[str] = mapped_column(Text, nullable=False)
     category: Mapped[str] = mapped_column(
         String(50), nullable=False, default="general"
-    )  # application_update, job_alert, general
+    )  # application_update, interview_alert, job_alert, general
+    event_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     is_read: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
     action_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    email_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    email_status: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="not_configured"
+    )
+
+
+class CandidatePrivacyRequest(Base, TimestampMixin):
+    """Formal GDPR/CCPA candidate privacy and data subject rights requests."""
+
+    __tablename__ = "candidate_privacy_requests"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        default=generate_uuid7,
+    )
+    user_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    request_type: Mapped[str] = mapped_column(
+        String(50), nullable=False, index=True
+    )  # export, correction, deletion, consent_revocation
+    status: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="pending", index=True
+    )  # pending, processing, completed, rejected
+    details: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    resolution_notes: Mapped[str | None] = mapped_column(Text, nullable=True)

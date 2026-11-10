@@ -14,6 +14,8 @@ import CandidateJobDetailPage from "@/app/candidate/jobs/[id]/page";
 import CandidateSavedJobsPage from "@/app/candidate/saved-jobs/page";
 import CandidateApplicationsPage from "@/app/candidate/applications/page";
 import CandidateApplicationDetailPage from "@/app/candidate/applications/[id]/page";
+import CandidateSettingsPage from "@/app/candidate/settings/page";
+import CandidateInterviewsPage from "@/app/candidate/interviews/page";
 import { ApplicationSubmitModal } from "@/components/candidate/ApplicationSubmitModal";
 import { candidateApi } from "@/lib/candidateApi";
 
@@ -85,6 +87,7 @@ describe("Candidate Portal Components", () => {
       expect(screen.getByText("Find Jobs")).toBeDefined();
       expect(screen.getByText("Saved Jobs")).toBeDefined();
       expect(screen.getByText("My Applications")).toBeDefined();
+      expect(screen.getByText("Interviews")).toBeDefined();
       expect(screen.getByText("Settings & Privacy")).toBeDefined();
     });
 
@@ -908,6 +911,181 @@ describe("Candidate Portal Components", () => {
 
       await waitFor(() => {
         expect(withdrawSpy).toHaveBeenCalledWith("app-1", "Timing not aligned");
+      });
+    });
+  });
+
+  describe("CandidateInterviewsPage", () => {
+    it("renders empty state cleanly when no interviews are scheduled", async () => {
+      vi.spyOn(candidateApi, "getInterviews").mockResolvedValue({
+        interviews: [],
+        total: 0,
+      });
+
+      render(<CandidateInterviewsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("No Scheduled Interviews")).toBeDefined();
+        expect(screen.getByText(/scheduled sessions, video conference links/i)).toBeDefined();
+      });
+    });
+
+    it("renders scheduled interviews with date, type badge, interviewer, and meeting link", async () => {
+      vi.spyOn(candidateApi, "getInterviews").mockResolvedValue({
+        interviews: [
+          {
+            id: "int-1",
+            application_id: "app-101",
+            job_title: "Staff Platform Engineer",
+            organization_name: "Acme Cloud Corp",
+            interview_type: "technical",
+            scheduled_at: "2026-11-20T14:00:00Z",
+            duration_minutes: 60,
+            timezone: "America/New_York",
+            status: "scheduled",
+            meeting_url: "https://meet.example.com/interview-123",
+            meeting_instructions: "Please join with webcam enabled and repo ready.",
+            interviewer_name: "Sarah Chen, VP Engineering",
+            interviewer_role: "VP Engineering",
+            rescheduled_reason: null,
+            cancellation_reason: null,
+          },
+        ],
+        total: 1,
+      });
+
+      render(<CandidateInterviewsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("Staff Platform Engineer")).toBeDefined();
+        expect(screen.getByText("Acme Cloud Corp")).toBeDefined();
+      });
+
+      expect(screen.getByText("technical")).toBeDefined();
+      expect(screen.getByText(/Sarah Chen, VP Engineering/i)).toBeDefined();
+      expect(screen.getByText(/Please join with webcam enabled/i)).toBeDefined();
+      expect(screen.getByRole("link", { name: /Join Video Call/i })).toBeDefined();
+    });
+  });
+
+  describe("CandidateSettingsPage", () => {
+    const mockAccount = {
+      id: "usr-candidate-1",
+      email: "candidate@example.com",
+      first_name: "Alex",
+      last_name: "Rivera",
+      phone_number: "+1 555-0199",
+      email_verified: true,
+      last_login_at: "2026-11-09T10:00:00Z",
+      mfa_enabled: false,
+    };
+
+    const mockNotifPrefs = {
+      in_app_alerts: true,
+      email_application_updates: true,
+      email_interview_alerts: true,
+      email_job_recommendations: false,
+      digest_frequency: "instant" as const,
+    };
+
+    const mockPrivacyPrefs = {
+      profile_visibility: "applied_only" as const,
+      allow_ai_matching: true,
+      data_retention_months: 24,
+    };
+
+    const mockCareerPrefs = {
+      desired_job_titles: ["Lead Backend Engineer"],
+      desired_locations: ["Remote", "New York, NY"],
+      remote_preference: "remote" as const,
+      employment_types: ["full_time"],
+      minimum_salary: 175000,
+      currency: "USD",
+    };
+
+    const mockConsentHistory = {
+      consents: [
+        {
+          consent_type: "terms_of_service",
+          granted: true,
+          recorded_at: "2026-11-01T09:00:00Z",
+          ip_address: "192.168.1.1",
+          version: "v2.0",
+        },
+      ],
+      total: 1,
+    };
+
+    it("renders account information and email verification status", async () => {
+      vi.spyOn(candidateApi, "getAccountInfo").mockResolvedValue(mockAccount);
+      vi.spyOn(candidateApi, "getNotificationPreferences").mockResolvedValue(mockNotifPrefs);
+      vi.spyOn(candidateApi, "getPrivacyPreferences").mockResolvedValue(mockPrivacyPrefs);
+      vi.spyOn(candidateApi, "getPreferences").mockResolvedValue(mockCareerPrefs);
+      vi.spyOn(candidateApi, "getConsentHistory").mockResolvedValue(mockConsentHistory);
+
+      render(<CandidateSettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("candidate@example.com")).toBeDefined();
+        expect(screen.getByText("Verified Account")).toBeDefined();
+      });
+
+      expect(screen.getByDisplayValue("Alex")).toBeDefined();
+      expect(screen.getByDisplayValue("Rivera")).toBeDefined();
+    });
+
+    it("switches to Notification Preferences tab and saves changes", async () => {
+      vi.spyOn(candidateApi, "getAccountInfo").mockResolvedValue(mockAccount);
+      vi.spyOn(candidateApi, "getNotificationPreferences").mockResolvedValue(mockNotifPrefs);
+      vi.spyOn(candidateApi, "getPrivacyPreferences").mockResolvedValue(mockPrivacyPrefs);
+      vi.spyOn(candidateApi, "getPreferences").mockResolvedValue(mockCareerPrefs);
+      vi.spyOn(candidateApi, "getConsentHistory").mockResolvedValue(mockConsentHistory);
+      const updateNotifSpy = vi.spyOn(candidateApi, "updateNotificationPreferences").mockResolvedValue({
+        ...mockNotifPrefs,
+        email_job_recommendations: true,
+      });
+
+      render(<CandidateSettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("candidate@example.com")).toBeDefined();
+      });
+
+      const notifTab = screen.getByRole("button", { name: /Notifications/i });
+      fireEvent.click(notifTab);
+
+      await waitFor(() => {
+        expect(screen.getByText("In-App Notification Alerts")).toBeDefined();
+      });
+
+      const saveBtn = screen.getByRole("button", { name: /Save Notification Preferences/i });
+      fireEvent.click(saveBtn);
+
+      await waitFor(() => {
+        expect(updateNotifSpy).toHaveBeenCalled();
+      });
+    });
+
+    it("displays statutory retention warnings on account erasure section", async () => {
+      vi.spyOn(candidateApi, "getAccountInfo").mockResolvedValue(mockAccount);
+      vi.spyOn(candidateApi, "getNotificationPreferences").mockResolvedValue(mockNotifPrefs);
+      vi.spyOn(candidateApi, "getPrivacyPreferences").mockResolvedValue(mockPrivacyPrefs);
+      vi.spyOn(candidateApi, "getPreferences").mockResolvedValue(mockCareerPrefs);
+      vi.spyOn(candidateApi, "getConsentHistory").mockResolvedValue(mockConsentHistory);
+
+      render(<CandidateSettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("candidate@example.com")).toBeDefined();
+      });
+
+      const rightsTab = screen.getByRole("button", { name: /Data Subject Rights/i });
+      fireEvent.click(rightsTab);
+
+      await waitFor(() => {
+        expect(screen.getByText("Mandatory Legal Recordkeeping Notice")).toBeDefined();
+        expect(screen.getByText(/EEOC/i)).toBeDefined();
+        expect(screen.getByText("Request Account Erasure")).toBeDefined();
       });
     });
   });

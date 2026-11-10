@@ -60,6 +60,7 @@ AUTODISCOVER_MODULES: list[str] = [
     "app.modules.embeddings",
     "app.modules.screening",
     "app.modules.reporting",
+    "app.modules.notifications",
 ]
 
 
