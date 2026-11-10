@@ -489,3 +489,106 @@ export interface BulkRecruiterAssignResponse {
   recruiter_name: string;
 }
 
+// ----------------------------------------------------------------------
+// Recruitment Pipeline & Stage Management Interfaces (Step 4.2.6)
+// ----------------------------------------------------------------------
+
+export interface PipelineStageConfig {
+  id: string;
+  label: string;
+  order: number;
+  is_terminal?: boolean;
+  color?: string | null;
+}
+
+export interface PipelineCardItem {
+  application_id: string;
+  candidate_id: string;
+  candidate_name: string;
+  candidate_email: string;
+  candidate_headline?: string | null;
+  candidate_avatar_url?: string | null;
+  job_id: string;
+  job_title: string;
+  job_department: string;
+  stage: string;
+  stage_version: number;
+  applied_at: string;
+  last_activity_at: string;
+  recruiter_id?: string | null;
+  recruiter_name?: string | null;
+  skills: string[];
+  resume_available: boolean;
+}
+
+export interface PipelineStageColumn {
+  id: string;
+  label: string;
+  order: number;
+  is_terminal: boolean;
+  count: number;
+  cards: PipelineCardItem[];
+}
+
+export interface PipelineBoardResponse {
+  tenant_id: string;
+  stages: PipelineStageColumn[];
+  total_candidates: number;
+  active_filters: Record<string, unknown>;
+}
+
+export interface StageTransitionRequest {
+  target_stage: string;
+  expected_stage_version?: number | null;
+  reason?: string | null;
+  notes?: string | null;
+}
+
+export interface StageTransitionResponse {
+  application_id: string;
+  previous_stage: string;
+  new_stage: string;
+  stage_version: number;
+  candidate_status: string;
+  changed_at: string;
+  actor_name?: string | null;
+  actor_role?: string | null;
+  reason?: string | null;
+}
+
+export interface BulkStageMoveRequest {
+  application_ids: string[];
+  target_stage: string;
+  reason?: string | null;
+}
+
+export interface BulkStageMoveSkippedItem {
+  application_id: string;
+  candidate_name?: string | null;
+  current_stage: string;
+  reason: string;
+}
+
+export interface BulkStageMoveResponse {
+  target_stage: string;
+  total_requested: number;
+  updated_count: number;
+  updated_ids: string[];
+  skipped_count: number;
+  skipped: BulkStageMoveSkippedItem[];
+}
+
+export interface ApplicationStageHistoryItem {
+  id: string;
+  application_id: string;
+  previous_stage: string;
+  new_stage: string;
+  actor_id?: string | null;
+  actor_name?: string | null;
+  actor_role?: string | null;
+  reason?: string | null;
+  audit_metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+

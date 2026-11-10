@@ -194,9 +194,17 @@ class JobApplication(Base, TenantScopedMixin, TimestampMixin):
     )
     withdrawn_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     withdrawal_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stage_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Relationships
     job: Mapped[Job] = relationship("Job", back_populates="applications")
+    stage_history: Mapped[list[ApplicationStageHistory]] = relationship(
+        "ApplicationStageHistory",
+        back_populates="application",
+        cascade="all, delete-orphan",
+        order_by="desc(ApplicationStageHistory.created_at)",
+    )
 
 
 class JobLifecycleHistory(Base, TenantScopedMixin):
@@ -238,4 +246,45 @@ class JobLifecycleHistory(Base, TenantScopedMixin):
     # Relationships
     job: Mapped[Job] = relationship("Job", back_populates="lifecycle_history")
     actor: Mapped[User | None] = relationship("User", foreign_keys=[actor_id], lazy="selectin")
+
+
+class ApplicationStageHistory(Base, TenantScopedMixin):
+    """Immutable audit trail of all candidate application recruitment pipeline stage transitions."""
+
+    __tablename__ = "application_stage_history"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        default=generate_uuid7,
+        index=True,
+    )
+    application_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("job_applications.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    previous_stage: Mapped[str] = mapped_column(String(50), nullable=False)
+    new_stage: Mapped[str] = mapped_column(String(50), nullable=False)
+    actor_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    actor_role: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    audit_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=utc_now,
+        index=True,
+    )
+
+    # Relationships
+    application: Mapped[JobApplication] = relationship("JobApplication", back_populates="stage_history")
+    actor: Mapped[User | None] = relationship("User", foreign_keys=[actor_id], lazy="selectin")
+
 

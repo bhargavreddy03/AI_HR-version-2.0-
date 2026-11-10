@@ -2,8 +2,11 @@ import { getApiBaseUrl } from "./api";
 import type {
   ApplicantFilterParams,
   ApplicantListResponse,
+  ApplicationStageHistoryItem,
   BulkRecruiterAssignRequest,
   BulkRecruiterAssignResponse,
+  BulkStageMoveRequest,
+  BulkStageMoveResponse,
   CandidateComparisonRequest,
   CandidateComparisonResponse,
   CandidateDetailResponse,
@@ -19,7 +22,11 @@ import type {
   JobRequisitionFilterParams,
   JobRequisitionListResponse,
   JobRequisitionUpdateInput,
+  PipelineBoardResponse,
+  PipelineStageConfig,
   ResumeSignedUrlResponse,
+  StageTransitionRequest,
+  StageTransitionResponse,
   TeamMemberOption,
 } from "@/types/hr";
 
@@ -288,6 +295,72 @@ export const hrApi = {
           recruiter_id: recruiterId,
         }),
       }
+    );
+  },
+
+  /**
+   * Retrieve configured recruitment pipeline stages for the organization.
+   */
+  async getPipelineStages(): Promise<PipelineStageConfig[]> {
+    return fetchWithAuth<PipelineStageConfig[]>("/hr/pipeline/stages");
+  },
+
+  /**
+   * Retrieve recruitment pipeline Kanban board grouped by stage with optional filters.
+   */
+  async getPipelineBoard(params?: {
+    job_id?: string;
+    recruiter_id?: string;
+    search?: string;
+    limit_per_stage?: number;
+  }): Promise<PipelineBoardResponse> {
+    const sp = new URLSearchParams();
+    if (params?.job_id) sp.append("job_id", params.job_id);
+    if (params?.recruiter_id) sp.append("recruiter_id", params.recruiter_id);
+    if (params?.search) sp.append("search", params.search);
+    if (params?.limit_per_stage)
+      sp.append("limit_per_stage", params.limit_per_stage.toString());
+
+    const qs = sp.toString() ? `?${sp.toString()}` : "";
+    return fetchWithAuth<PipelineBoardResponse>(`/hr/pipeline/board${qs}`);
+  },
+
+  /**
+   * Move an individual application to a permitted pipeline stage with optimistic concurrency.
+   */
+  async transitionApplicationStage(
+    applicationId: string,
+    payload: StageTransitionRequest
+  ): Promise<StageTransitionResponse> {
+    return fetchWithAuth<StageTransitionResponse>(
+      `/hr/applications/${applicationId}/stage`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }
+    );
+  },
+
+  /**
+   * Bulk move selected applications to target stage with validation.
+   */
+  async bulkStageMove(
+    payload: BulkStageMoveRequest
+  ): Promise<BulkStageMoveResponse> {
+    return fetchWithAuth<BulkStageMoveResponse>("/hr/pipeline/bulk-stage-move", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  /**
+   * Retrieve complete audit trail of stage transitions for an application.
+   */
+  async getApplicationStageHistory(
+    applicationId: string
+  ): Promise<ApplicationStageHistoryItem[]> {
+    return fetchWithAuth<ApplicationStageHistoryItem[]>(
+      `/hr/applications/${applicationId}/stage/history`
     );
   },
 };

@@ -36,6 +36,16 @@ from app.modules.hr.lifecycle_schemas import (
     JobLifecycleTransitionResponse,
 )
 from app.modules.hr.lifecycle_service import hr_job_lifecycle_service
+from app.modules.hr.pipeline_schemas import (
+    ApplicationStageHistoryItem,
+    BulkStageMoveRequest,
+    BulkStageMoveResponse,
+    PipelineBoardResponse,
+    PipelineStageConfig,
+    StageTransitionRequest,
+    StageTransitionResponse,
+)
+from app.modules.hr.pipeline_service import hr_pipeline_service
 from app.modules.hr.requisition_schemas import (
     CanonicalSkillSuggestion,
     JobRequisitionCreate,
@@ -471,4 +481,118 @@ async def bulk_assign_recruiter(
         recruiter_id=request.recruiter_id,
         actor_id=sec.user_id,
     )
+
+
+# ----------------------------------------------------------------------
+# Recruitment Pipeline & Stage Management Endpoints (Step 4.2.6)
+# ----------------------------------------------------------------------
+
+
+@hr_router.get(
+    "/pipeline/stages",
+    response_model=list[PipelineStageConfig],
+    summary="Retrieve organization-configured recruitment pipeline stages",
+)
+async def get_pipeline_stages(
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> list[PipelineStageConfig]:
+    """Retrieve organization workflow stages or defaults."""
+    return await hr_pipeline_service.get_configured_stages(db=db, tenant_id=tenant_id)
+
+
+@hr_router.get(
+    "/pipeline/board",
+    response_model=PipelineBoardResponse,
+    summary="Retrieve recruitment pipeline Kanban board grouped by stage",
+)
+async def get_pipeline_board(
+    job_id: UUID | None = Query(None, description="Filter pipeline by job requisition"),
+    recruiter_id: UUID | None = Query(None, description="Filter pipeline by assigned recruiter"),
+    search: str | None = Query(None, description="Search candidate name, email, or role"),
+    limit_per_stage: int = Query(25, ge=5, le=100, description="Max cards to load per column"),
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> PipelineBoardResponse:
+    """Retrieve Kanban-style pipeline cards grouped by workflow stages with filters."""
+    return await hr_pipeline_service.get_pipeline_board(
+        db=db,
+        tenant_id=tenant_id,
+        job_id=job_id,
+        recruiter_id=recruiter_id,
+        search=search,
+        limit_per_stage=limit_per_stage,
+    )
+
+
+@hr_router.post(
+    "/applications/{application_id}/stage",
+    response_model=StageTransitionResponse,
+    summary="Move candidate application to a permitted pipeline stage",
+)
+async def transition_application_stage(
+    application_id: UUID,
+    request: StageTransitionRequest,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> StageTransitionResponse:
+    """Validate FSM transition rules, concurrency, mandatory reasons, and persist stage history."""
+    actor_role = sec.roles[0] if sec.roles else "recruiter"
+    return await hr_pipeline_service.transition_stage(
+        db=db,
+        tenant_id=tenant_id,
+        application_id=application_id,
+        target_stage=request.target_stage,
+        actor_id=sec.user_id,
+        actor_role=actor_role,
+        actor_name=getattr(sec, "user_name", "Recruiter"),
+        reason=request.reason,
+        expected_stage_version=request.expected_stage_version,
+        notes=request.notes,
+    )
+
+
+@hr_router.post(
+    "/pipeline/bulk-stage-move",
+    response_model=BulkStageMoveResponse,
+    summary="Bulk move candidate applications to target stage with transition verification",
+)
+async def bulk_stage_move(
+    request: BulkStageMoveRequest,
+    db: AsyncSession = Depends(get_db),
+    sec: SecurityContext = Depends(require_authenticated_user),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> BulkStageMoveResponse:
+    """Move multiple applications while enforcing transition rules and recording immutable history."""
+    actor_role = sec.roles[0] if sec.roles else "recruiter"
+    return await hr_pipeline_service.bulk_stage_move(
+        db=db,
+        tenant_id=tenant_id,
+        application_ids=request.application_ids,
+        target_stage=request.target_stage,
+        actor_id=sec.user_id,
+        actor_role=actor_role,
+        actor_name=getattr(sec, "user_name", "Recruiter"),
+        reason=request.reason,
+    )
+
+
+@hr_router.get(
+    "/applications/{application_id}/stage/history",
+    response_model=list[ApplicationStageHistoryItem],
+    summary="Retrieve immutable chronological stage history for an application",
+)
+async def get_application_stage_history(
+    application_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(resolve_hr_tenant_context),
+) -> list[ApplicationStageHistoryItem]:
+    """Retrieve immutable chronological audit trail of all recruitment pipeline stage transitions."""
+    return await hr_pipeline_service.get_stage_history(
+        db=db,
+        tenant_id=tenant_id,
+        application_id=application_id,
+    )
+
 

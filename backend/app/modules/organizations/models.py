@@ -4,7 +4,7 @@ from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import Boolean, ForeignKey, Integer, String, UniqueConstraint
-from sqlalchemy.dialects.postgresql import TIMESTAMP
+from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -26,6 +26,7 @@ class Organization(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(
         String(50), nullable=False, default="active", server_default="active"
     )
+    pipeline_stages: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
 
     # Relationships
     memberships: Mapped[list["OrganizationMembership"]] = relationship(
